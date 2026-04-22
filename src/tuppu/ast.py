@@ -51,7 +51,19 @@ class TypePointer:
     line: int = _pos()
     col:  int = _pos()
 
-TypeExpr = Union[TypeName, TypeArray, TypeTablets, TypePointer]
+@dataclass
+class TypeHandle:
+    """`tablet T` — a handle into some `tablets[N]T`. A single-slot
+    reference; in runtime terms a pointer to the element slot inside
+    a tablets chunk. Obtained by `tablets.push(...)` (returns the
+    handle to the newly pushed element). Compared for equality with
+    `==` / `!=`. The special value `lost` represents "no tablet"
+    (internally a null pointer)."""
+    element: "TypeExpr"
+    line: int = _pos()
+    col:  int = _pos()
+
+TypeExpr = Union[TypeName, TypeArray, TypeTablets, TypePointer, TypeHandle]
 
 
 # --- expressions -------------------------------------------------------------
@@ -97,6 +109,14 @@ class CharLit:
 @dataclass
 class BoolLit:
     value: bool
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class LostLit:
+    """The null handle — `lost` in source. Types to `tablet T` for any
+    T via implicit coercion; standalone it has a fresh open type that
+    gets unified at its use site."""
     line: int = _pos()
     col:  int = _pos()
 
@@ -174,7 +194,7 @@ class IfExpr:
     col:  int = _pos()
 
 Expr = Union[
-    IntLit, SexLit, StringLit, CharLit, BoolLit, Ident,
+    IntLit, SexLit, StringLit, CharLit, BoolLit, LostLit, Ident,
     Unary, Binary, Call, Index, Field, Cast, StructLit,
     Block, IfExpr,
 ]

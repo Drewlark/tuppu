@@ -432,3 +432,79 @@ def test_non_lvalue_assignment_rejected():
             "  0\n"
             "}\n"
         )
+
+
+# --- tablet handles + recursive structs ------------------------------------
+
+def test_linked_list_basic(tmp_path):
+    # Build a linked list via tablets.push returning a handle, walk via
+    # auto-deref on `cur.value` / `cur.next`, terminate on `cur == lost`.
+    src = (
+        "seal Node { value: i64, next: tablet Node }\n"
+        "fn main() -> i32 {\n"
+        "  mut lib: tablets[16]Node\n"
+        "  mut head: tablet Node = lost\n"
+        "  head = lib.push(Node { value: 3, next: head })\n"
+        "  head = lib.push(Node { value: 2, next: head })\n"
+        "  head = lib.push(Node { value: 1, next: head })\n"
+        "  mut cur: tablet Node = head\n"
+        "  while cur != lost {\n"
+        "    println(cur.value)\n"
+        "    cur = cur.next\n"
+        "  }\n"
+        "  release lib\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"1\n2\n3\n"
+
+
+def test_mutually_recursive_structs(tmp_path):
+    # A references B via tablet B and vice versa — identified types
+    # resolve both forward references cleanly.
+    src = (
+        "seal Even { v: i64, down: tablet Odd }\n"
+        "seal Odd  { v: i64, down: tablet Even }\n"
+        "fn main() -> i32 {\n"
+        "  mut pool_e: tablets[8]Even\n"
+        "  mut pool_o: tablets[8]Odd\n"
+        "  step e0: tablet Even = pool_e.push(Even { v: 0, down: lost })\n"
+        "  step o1: tablet Odd  = pool_o.push(Odd  { v: 1, down: e0 })\n"
+        "  step e2: tablet Even = pool_e.push(Even { v: 2, down: o1 })\n"
+        "  println(e2.v)\n"
+        "  println(e2.down.v)\n"
+        "  println(e2.down.down.v)\n"
+        "  release pool_e\n"
+        "  release pool_o\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"2\n1\n0\n"
+
+
+def test_lost_equality(tmp_path):
+    src = (
+        "seal N { v: i64, next: tablet N }\n"
+        "fn main() -> i32 {\n"
+        "  mut lib: tablets[4]N\n"
+        "  step a: tablet N = lost\n"
+        "  step b: tablet N = lib.push(N { v: 7, next: lost })\n"
+        "  if a == lost { println(1) } else { println(0) }\n"
+        "  if b == lost { println(0) } else { println(1) }\n"
+        "  if a == b    { println(0) } else { println(1) }\n"
+        "  release lib\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"1\n1\n1\n"
+
+
+def test_recursive_struct_without_pointer_rejected():
+    with pytest.raises(CompileError, match="recursively contained without pointer indirection"):
+        compile_to_ir(
+            "seal Node { v: i64, child: Node }\n"
+            "fn main() -> i32 { 0 }\n"
+        )

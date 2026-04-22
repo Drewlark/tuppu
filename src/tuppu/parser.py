@@ -217,6 +217,12 @@ class Parser:
             self.eat(Tok.RBRACKET)
             element = self.parse_type()
             return _at(t, A.TypeTablets(size=size, element=element))
+        if t.kind is Tok.TABLET:
+            # `tablet T` — a handle into some `tablets[N]T`. Runtime
+            # footprint is a pointer; you get one from `tablets.push`.
+            self.advance()
+            element = self.parse_type()
+            return _at(t, A.TypeHandle(element=element))
         if t.kind is Tok.LBRACKET:
             self.advance()
             size = self.eat(Tok.INT, "array size (integer)").value
@@ -368,6 +374,8 @@ class Parser:
             self.advance(); return _at(t, A.BoolLit(value=True))
         if t.kind is Tok.FALSE:
             self.advance(); return _at(t, A.BoolLit(value=False))
+        if t.kind is Tok.LOST:
+            self.advance(); return _at(t, A.LostLit())
         if t.kind is Tok.IDENT:
             # `Name { field : ...` is a struct literal. The 3-token lookahead
             # (LBRACE IDENT COLON) avoids colliding with block expressions or

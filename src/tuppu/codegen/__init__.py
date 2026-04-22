@@ -233,6 +233,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         if isinstance(t, A.TypePointer):
             elem = self._lower_type(t.element)
             return elem.as_pointer()
+        if isinstance(t, A.TypeHandle):
+            # `tablet T` — runtime is a pointer to T, distinct from
+            # `*T` at the source level but same LLVM representation.
+            elem = self._lower_type(t.element)
+            return elem.as_pointer()
         raise CodegenError(
             f"complex types not supported in this stage: {type(t).__name__}"
         )
@@ -361,6 +366,15 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
             if tw < sw:
                 return self.builder.trunc(value, target_ty)
             return value
+        # Pointer-to-pointer bitcasts handle `lost` → any `tablet T`
+        # and any handle-handle coercion at the LLVM level. Typecheck
+        # has already verified the source was `lost` or a compatible
+        # handle before we land here.
+        if (
+            isinstance(value.type, ir.PointerType)
+            and isinstance(target_ty, ir.PointerType)
+        ):
+            return self.builder.bitcast(value, target_ty)
         line, col = self._current_loc
         raise CodegenError(
             f"cannot coerce {value.type} to {target_ty}", line, col,
@@ -672,6 +686,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
             return ir.Constant(I8, e.value)
         if isinstance(e, A.BoolLit):
             return ir.Constant(I1, 1 if e.value else 0)
+        if isinstance(e, A.LostLit):
+            # Lowered as a typed-but-generic null — an `i8*` null that
+            # `_coerce` bitcasts to the actual `tablet T` pointer type
+            # at every use site.
+            return ir.Constant(I8.as_pointer(), None)
         if isinstance(e, A.StringLit):
             return self._gen_string_lit(e.value)
         if isinstance(e, A.SexLit):
@@ -895,6 +914,17 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
                 target = lhs.type if lhs.type.width >= rhs.type.width else rhs.type
                 lhs = self._coerce(lhs, target)
                 rhs = self._coerce(rhs, target)
+            # Tablet handle / pointer equality: either side may be the
+            # generic `lost` (i8* null) and need bitcasting to the other
+            # side's pointer type for icmp to accept.
+            if op in ("==", "!=") and (
+                isinstance(lhs.type, ir.PointerType)
+                or isinstance(rhs.type, ir.PointerType)
+            ):
+                if isinstance(lhs.type, ir.PointerType) and isinstance(rhs.type, ir.PointerType):
+                    if lhs.type != rhs.type:
+                        rhs = self._coerce(rhs, lhs.type)
+                    return self.builder.icmp_unsigned(op, lhs, rhs)
             if lhs.type != rhs.type or not isinstance(lhs.type, ir.IntType):
                 raise CodegenError(
                     f"comparison requires matching types, got {lhs.type} and {rhs.type}"
@@ -1071,6 +1101,23 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         target = self._gen_expr(e.target)
         if target is None:
             raise CodegenError("field access target has no value")
+        # Tablet handle: auto-deref. The handle is a pointer to the
+        # underlying struct; GEP into it to the field slot, then load.
+        if isinstance(target.type, ir.PointerType):
+            pointee = target.type.pointee
+            struct_name = self._struct_name_for(pointee)
+            if struct_name is not None:
+                for i, (fname, _fty) in enumerate(self._struct_fields[struct_name]):
+                    if fname == e.name:
+                        field_ptr = self.builder.gep(
+                            target,
+                            [ir.Constant(I32, 0), ir.Constant(I32, i)],
+                            inbounds=True,
+                        )
+                        return self.builder.load(field_ptr)
+                raise CodegenError(
+                    f"struct {struct_name!r} has no field {e.name!r}"
+                )
         # Check user-defined structs BEFORE rat: a `struct P { x: i64, y: i64 }`
         # is structurally equal to RAT at the LLVM level, but identity
         # comparison against _struct_types distinguishes them correctly.

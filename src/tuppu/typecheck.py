@@ -80,6 +80,23 @@ class TyPtr:
     def __str__(self) -> str: return f"*{self.element}"
 
 @dataclass(frozen=True)
+class TyHandle:
+    """`tablet T` — a handle into some `tablets[N]T` storage. At
+    runtime a pointer to T; at the type level it's distinct from
+    `*T` so we can restrict how it's obtained (only through
+    `tablets.push`, not `&x`) and what operations it supports
+    (auto-deref field access, equality, `lost` comparison)."""
+    element: "Ty"
+    def __str__(self) -> str: return f"tablet {self.element}"
+
+@dataclass(frozen=True)
+class TyLost:
+    """The bare `lost` literal's type — coerces to any `tablet T`.
+    Never appears in a type annotation; only as the transient type
+    of a `LostLit` expression that hasn't been placed yet."""
+    def __str__(self) -> str: return "lost"
+
+@dataclass(frozen=True)
 class TyUnit:
     def __str__(self) -> str: return "()"
 
@@ -121,6 +138,7 @@ Ty = object  # structural union; actual nodes listed above
 I8  = TyInt(8);  I16 = TyInt(16); I32 = TyInt(32); I64 = TyInt(64)
 U8  = TyInt(8, False); U16 = TyInt(16, False); U32 = TyInt(32, False); U64 = TyInt(64, False)
 BOOL = TyBool(); RAT = TyRat(); DISH = TyDish(); UNIT = TyUnit(); DIV = TyDiverge()
+LOST = TyLost()
 
 PRIM_TYPES: dict[str, Ty] = {
     "i8": I8, "i16": I16, "i32": I32, "i64": I64,
@@ -161,6 +179,13 @@ def _coerces_to(src: Ty, dst: Ty) -> bool:
         return True
     if _is_int(src) and isinstance(dst, TyDish):
         return True
+    # Tablet handles: `lost` coerces to any `tablet T`. Two handle
+    # types are compatible only when their element types match
+    # (nominal, no subtyping — a tablet Node isn't a tablet Tree).
+    if isinstance(src, TyLost) and isinstance(dst, TyHandle):
+        return True
+    if isinstance(src, TyHandle) and isinstance(dst, TyHandle):
+        return src.element == dst.element
     return False
 
 
@@ -339,6 +364,9 @@ class Checker:
         if isinstance(t, A.TypePointer):
             inner = self._resolve_type(t.element, f"{where} element")
             return TyPtr(element=inner)
+        if isinstance(t, A.TypeHandle):
+            inner = self._resolve_type(t.element, f"{where} element")
+            return TyHandle(element=inner)
         raise CheckError(
             f"{where}: unsupported type expression",
             getattr(t, "line", 0), getattr(t, "col", 0),
@@ -490,6 +518,7 @@ class Checker:
         if isinstance(e, A.IntLit):    return I64
         if isinstance(e, A.CharLit):   return U8
         if isinstance(e, A.BoolLit):   return BOOL
+        if isinstance(e, A.LostLit):   return LOST
         if isinstance(e, A.SexLit):    return DISH
         if isinstance(e, A.StringLit):
             if "str" not in self.structs:
@@ -599,6 +628,16 @@ class Checker:
             # is cheap to compare via rat, no warning necessary.
             if dish_involved and _coerces_to(lhs, RAT) and _coerces_to(rhs, RAT):
                 return BOOL
+            # Tablet handles: == / != only (ordering isn't meaningful).
+            # Either both are `tablet T` with matching T, or one side
+            # is `lost` which coerces to any handle type.
+            if op in ("==", "!="):
+                handle_involved = isinstance(lhs, (TyHandle, TyLost)) or isinstance(rhs, (TyHandle, TyLost))
+                if handle_involved and (
+                    (isinstance(lhs, TyHandle) and isinstance(rhs, TyHandle) and lhs.element == rhs.element)
+                    or isinstance(lhs, TyLost) or isinstance(rhs, TyLost)
+                ):
+                    return BOOL
             raise CheckError(
                 f"{op} requires matching comparable operands, got {lhs} and {rhs}",
                 e.line, e.col,
@@ -698,7 +737,9 @@ class Checker:
                         f"element type is {recv_ty.element}",
                         e.line, e.col,
                     )
-                return UNIT
+                # push returns a handle to the newly-pushed element —
+                # discarded automatically in statement position.
+                return TyHandle(element=recv_ty.element)
             raise CheckError(
                 f"tablets has no method {method!r}", e.line, e.col,
             )
@@ -710,6 +751,12 @@ class Checker:
 
     def _tc_field(self, e: A.Field) -> Ty:
         target_ty = self._tc_expr(e.target)
+        # Tablet handle: auto-deref for field access on `tablet T`
+        # where T is a struct. `h.value` is shorthand for "load the
+        # T this handle points to and take its `value` field." Rest
+        # of the method treats it as if the user wrote on T directly.
+        if isinstance(target_ty, TyHandle):
+            target_ty = target_ty.element
         # Dish shares fields (.num, .den) with rat at runtime.
         if isinstance(target_ty, (TyRat, TyDish)):
             if e.name in ("num", "den"):

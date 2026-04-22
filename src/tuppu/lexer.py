@@ -45,6 +45,7 @@ class Tok(Enum):
     TABLETS = auto()
     RELEASE = auto()
     STRUCT = auto()
+    LOST = auto()
 
     # type keywords (value: str — "i64", "bool", etc.)
     TYPE_KW = auto()
@@ -109,6 +110,7 @@ KEYWORDS: dict[str, Tok] = {
     # were the native metaphor for nominal identity — a named, composite
     # design pressed into clay to yield distinct impressions.
     "seal": Tok.STRUCT,
+    "lost": Tok.LOST,
     "true": Tok.TRUE,
     "false": Tok.FALSE,
 }

@@ -27,8 +27,10 @@ class TabletsMixin:
             if val is None:
                 raise CodegenError("tablets.push argument has no value")
             val = self._coerce(val, info.elem_ty)
-            self.builder.call(info.push, [ptr, val])
-            return None
+            # Push returns a pointer to the just-written slot — this is
+            # the `tablet T` handle the user sees. Callers in statement
+            # position ignore it.
+            return self.builder.call(info.push, [ptr, val])
         raise CodegenError(f"tablets has no method {method!r}")
 
     def _gen_tablets_field(self, var: Variable, field_name: str) -> ir.Value:
@@ -137,9 +139,11 @@ class TabletsMixin:
         node_ty: ir.IdentifiedStructType, tablets_ty: ir.LiteralStructType,
         suffix: str,
     ) -> ir.Function:
+        # Returns a pointer to the just-pushed element slot — this is
+        # the `tablet T` handle the user sees from `tablets.push(...)`.
         fn = ir.Function(
             self.module,
-            ir.FunctionType(ir.VoidType(), [tablets_ty.as_pointer(), elem_ty]),
+            ir.FunctionType(elem_ty.as_pointer(), [tablets_ty.as_pointer(), elem_ty]),
             name=f"__tuppu_tbls_{suffix}_push",
         )
         fn.args[0].name = "t"
@@ -209,7 +213,7 @@ class TabletsMixin:
         b.store(b.add(cur_used, ir.Constant(I64, 1)), used_addr)
         cur_len = b.load(len_addr)
         b.store(b.add(cur_len, ir.Constant(I64, 1)), len_addr)
-        b.ret_void()
+        b.ret(slot)
 
         return fn
 
