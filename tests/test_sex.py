@@ -378,6 +378,86 @@ def test_native_sex_round_trip_via_rat(tmp_path):
     assert out == b"1;50\n11/6\n"
 
 
+def test_int_to_sex_zero(tmp_path):
+    # An int literal in a sex context decomposes to digit form.
+    src = (
+        "fn main() -> i32 {\n"
+        "  step s: sex = 0\n"
+        "  println(s)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"0\n"
+
+
+def test_int_to_sex_small(tmp_path):
+    # 42 is less than 60, so it's one digit.
+    src = (
+        "fn main() -> i32 {\n"
+        "  step s: sex = 42\n"
+        "  println(s)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"42\n"
+
+
+def test_int_to_sex_two_digits(tmp_path):
+    # 123 = 2*60 + 3 → `2 3`
+    src = (
+        "fn main() -> i32 {\n"
+        "  step s: sex = 123\n"
+        "  println(s)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"2 3\n"
+
+
+def test_int_to_sex_negative(tmp_path):
+    src = (
+        "fn main() -> i32 {\n"
+        "  step s: sex = -123\n"
+        "  println(s)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"-2 3\n"
+
+
+def test_int_to_sex_in_struct_field(tmp_path):
+    # The scratch-file motivating case: integer literal at a sex field
+    # slot should decompose via int→sex, not error out.
+    src = (
+        "seal Point { x: sex, y: sex }\n"
+        "fn main() -> i32 {\n"
+        "  step p = Point { x: 0, y: 0 }\n"
+        "  println(p.x)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"0\n"
+
+
+def test_rat_to_sex_still_rejected_with_location():
+    # rat → sex is deferred; ensure the error now reports where.
+    from tuppu.errors import CompileError
+    with pytest.raises(CompileError, match=r"\d+:\d+:.*sex"):
+        compile_to_ir(
+            "seal P { x: sex }\n"
+            "fn main() -> i32 {\n"
+            "  step r: rat = 1;30\n"
+            "  step p = P { x: r }\n"
+            "  0\n"
+            "}\n"
+        )
+
+
 def test_sex_as_function_param_and_return(tmp_path):
     # Passing sex through a function preserves the digit sequence.
     src = (

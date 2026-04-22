@@ -21,7 +21,14 @@ from .errors import CompileError
 
 
 class CodegenError(CompileError):
-    pass
+    def __init__(self, message: str, line: int = 0, col: int = 0) -> None:
+        if line:
+            super().__init__(f"{line}:{col}: {message}")
+        else:
+            super().__init__(message)
+        self.message = message
+        self.line = line
+        self.col = col
 
 
 I1 = ir.IntType(1)
@@ -97,6 +104,7 @@ class Codegen:
         self._sex_print: ir.Function | None = None
         self._sex_add: ir.Function | None = None
         self._sex_cmp: ir.Function | None = None
+        self._int_to_sex: ir.Function | None = None
         self._trap: ir.Function | None = None
         # table name -> (global array, length, lo bound, element LLVM type)
         self._tables: dict[str, tuple[ir.GlobalVariable, int, int, ir.Type]] = {}
@@ -105,6 +113,10 @@ class Codegen:
         # User-defined structs: name -> LLVM struct type + ordered fields.
         self._struct_types: dict[str, ir.LiteralStructType] = {}
         self._struct_fields: dict[str, list[tuple[str, ir.Type]]] = {}
+        # Most-recent AST source location, updated as we walk statements
+        # and expressions. Used to attach line:col to codegen errors that
+        # don't otherwise carry one.
+        self._current_loc: tuple[int, int] = (0, 0)
         self._init_runtime_externs()
 
     def _init_runtime_externs(self) -> None:
@@ -334,10 +346,19 @@ class Codegen:
                 as_rat = self._coerce(value, RAT)
                 return self._coerce(as_rat, target_ty)
         if target_ty == SEX:
-            # For now we refuse implicit construction of sex from numeric
-            # types. A future phase will add regularity-checked rat → sex.
+            # int → sex: decompose into base-60 digits via a runtime helper.
+            # Always lands in integer form (no fractional digits).
+            if isinstance(value.type, ir.IntType):
+                n_i64 = self._coerce(value, I64)
+                return self.builder.call(self._get_int_to_sex(), [n_i64])
+            # rat → sex is deferred — requires a regularity check to know
+            # whether the rational terminates in sexagesimal.
+            line, col = self._current_loc
             raise CodegenError(
-                f"converting {value.type} to sex is not yet supported"
+                f"converting {value.type} to sex is not yet supported "
+                f"(only integer types can convert to sex for now; "
+                f"rat → sex needs regularity-check work — see SPEC §4.3)",
+                line, col,
             )
 
         # Rat conversions.
@@ -364,7 +385,10 @@ class Codegen:
             if tw < sw:
                 return self.builder.trunc(value, target_ty)
             return value
-        raise CodegenError(f"cannot coerce {value.type} to {target_ty}")
+        line, col = self._current_loc
+        raise CodegenError(
+            f"cannot coerce {value.type} to {target_ty}", line, col,
+        )
 
     # --- scope / bindings ---
 
@@ -392,6 +416,7 @@ class Codegen:
     # --- statements ---
 
     def _gen_stmt(self, s: A.Stmt) -> None:
+        self._current_loc = (getattr(s, "line", 0), getattr(s, "col", 0))
         if isinstance(s, A.Binding):
             self._gen_binding(s); return
         if isinstance(s, A.Assign):
@@ -623,6 +648,10 @@ class Codegen:
         """Generate code for an expression. Returns None if the expression
         diverges (e.g. a block where all paths yield) or has no value (e.g.
         an `if` without `else`, which produces unit)."""
+        line = getattr(e, "line", 0)
+        col = getattr(e, "col", 0)
+        if line:
+            self._current_loc = (line, col)
         if isinstance(e, A.IntLit):
             return ir.Constant(I64, e.value)
         if isinstance(e, A.CharLit):
@@ -1781,6 +1810,131 @@ class Codegen:
         b.ret(result)
 
         self._sex_to_rat = fn
+        return fn
+
+    def _get_int_to_sex(self) -> ir.Function:
+        """Emit `__tuppu_int_to_sex(i64) -> sex` — decompose a 64-bit
+        integer into its sexagesimal digit sequence. Result is always
+        in integer form (no fractional digits). i64 max fits in 11
+        base-60 digits, well under SEX_MAX_DIGITS."""
+        if self._int_to_sex is not None:
+            return self._int_to_sex
+
+        fn = ir.Function(
+            self.module,
+            ir.FunctionType(SEX, [I64]),
+            name="__tuppu_int_to_sex",
+        )
+        fn.args[0].name = "n"
+        n_arg = fn.args[0]
+
+        arr16_ty = ir.ArrayType(I8, SEX_MAX_DIGITS)
+        vec16 = ir.VectorType(I8, SEX_MAX_DIGITS)
+        ZERO_I32 = ir.Constant(I32, 0)
+
+        entry        = fn.append_basic_block("entry")
+        is_zero_bb   = fn.append_basic_block("is.zero")
+        neg_bb       = fn.append_basic_block("negate")
+        decomp_hdr   = fn.append_basic_block("decomp.hdr")
+        decomp_body  = fn.append_basic_block("decomp.body")
+        copy_hdr     = fn.append_basic_block("copy.hdr")
+        copy_body    = fn.append_basic_block("copy.body")
+        pack         = fn.append_basic_block("pack")
+
+        b = ir.IRBuilder(entry)
+        tmp = b.alloca(arr16_ty)
+        tmp.align = SEX_MAX_DIGITS
+        out_buf = b.alloca(arr16_ty)
+        out_buf.align = SEX_MAX_DIGITS
+        zero_vec = ir.Constant(vec16, [0] * SEX_MAX_DIGITS)
+        for buf in (tmp, out_buf):
+            st = b.store(zero_vec, b.bitcast(buf, vec16.as_pointer()))
+            st.align = SEX_MAX_DIGITS
+
+        n_is_zero = b.icmp_signed("==", n_arg, ir.Constant(I64, 0))
+        b.cbranch(n_is_zero, is_zero_bb, neg_bb)
+
+        # Zero path — single digit 0, integer form, sign 0.
+        b.position_at_end(is_zero_bb)
+        zero_result: ir.Value = ir.Constant(SEX, ir.Undefined)
+        zero_result = b.insert_value(
+            zero_result,
+            ir.Constant(arr16_ty, [0] * SEX_MAX_DIGITS),
+            SEX_IDX_DIGITS,
+        )
+        zero_result = b.insert_value(zero_result, ir.Constant(I8, 1), SEX_IDX_RADIX)
+        zero_result = b.insert_value(zero_result, ir.Constant(I8, 1), SEX_IDX_COUNT)
+        zero_result = b.insert_value(zero_result, ir.Constant(I8, 0), SEX_IDX_SIGN)
+        zero_result = b.insert_value(zero_result, ir.Constant(I8, 0), 4)
+        b.ret(zero_result)
+
+        # Negate if needed. Sign byte = 1 iff the input was negative.
+        b.position_at_end(neg_bb)
+        is_neg = b.icmp_signed("<", n_arg, ir.Constant(I64, 0))
+        abs_n = b.select(is_neg, b.neg(n_arg), n_arg)
+        sign_byte = b.select(is_neg, ir.Constant(I8, 1), ir.Constant(I8, 0))
+        b.branch(decomp_hdr)
+
+        # Decompose into base-60 digits, MSB first in `tmp[]`, written
+        # from the right (index = start_idx..15) so we know how many
+        # digits we used.
+        b.position_at_end(decomp_hdr)
+        n_phi = b.phi(I64, "n")
+        idx_phi = b.phi(I32, "idx")
+        n_phi.add_incoming(abs_n, neg_bb)
+        idx_phi.add_incoming(ir.Constant(I32, SEX_MAX_DIGITS - 1), neg_bb)
+        done = b.icmp_signed("==", n_phi, ir.Constant(I64, 0))
+        b.cbranch(done, copy_hdr, decomp_body)
+
+        b.position_at_end(decomp_body)
+        digit = b.trunc(b.srem(n_phi, ir.Constant(I64, 60)), I8)
+        next_n = b.sdiv(n_phi, ir.Constant(I64, 60))
+        b.store(digit, b.gep(
+            tmp, [ZERO_I32, b.sext(idx_phi, I64)], inbounds=True,
+        ))
+        n_phi.add_incoming(next_n, decomp_body)
+        idx_phi.add_incoming(b.sub(idx_phi, ir.Constant(I32, 1)), decomp_body)
+        b.branch(decomp_hdr)
+
+        # Copy tmp[start_idx+1 .. 16) to out_buf[0 .. digit_count).
+        b.position_at_end(copy_hdr)
+        start_idx = b.add(idx_phi, ir.Constant(I32, 1))
+        digit_count = b.sub(ir.Constant(I32, SEX_MAX_DIGITS), start_idx)
+        b.branch(copy_body)
+
+        copy_body_hdr = fn.append_basic_block("copy.body.hdr")
+        copy_body_step = fn.append_basic_block("copy.body.step")
+        b.position_at_end(copy_body)
+        b.branch(copy_body_hdr)
+
+        b.position_at_end(copy_body_hdr)
+        j_phi = b.phi(I32, "j")
+        j_phi.add_incoming(ZERO_I32, copy_body)
+        j_done = b.icmp_signed(">=", j_phi, digit_count)
+        b.cbranch(j_done, pack, copy_body_step)
+
+        b.position_at_end(copy_body_step)
+        src_idx = b.add(start_idx, j_phi)
+        src_byte = b.load(b.gep(
+            tmp, [ZERO_I32, b.sext(src_idx, I64)], inbounds=True,
+        ))
+        b.store(src_byte, b.gep(
+            out_buf, [ZERO_I32, b.sext(j_phi, I64)], inbounds=True,
+        ))
+        j_phi.add_incoming(b.add(j_phi, ir.Constant(I32, 1)), copy_body_step)
+        b.branch(copy_body_hdr)
+
+        b.position_at_end(pack)
+        final_digits = b.load(out_buf)
+        result: ir.Value = ir.Constant(SEX, ir.Undefined)
+        result = b.insert_value(result, final_digits, SEX_IDX_DIGITS)
+        result = b.insert_value(result, b.trunc(digit_count, I8), SEX_IDX_RADIX)
+        result = b.insert_value(result, b.trunc(digit_count, I8), SEX_IDX_COUNT)
+        result = b.insert_value(result, sign_byte, SEX_IDX_SIGN)
+        result = b.insert_value(result, ir.Constant(I8, 0), 4)
+        b.ret(result)
+
+        self._int_to_sex = fn
         return fn
 
     def _get_sex_add(self) -> ir.Function:
