@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **398 tests passing.**
+- **411 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -30,6 +30,22 @@ What works:
   survive). Stdlib `str_eq`/`str_starts_with`/`str_ends_with`/
   `str_is_empty`/`str_index_of`.
 - Raw pointer type `*T` — type-only, no expression-level ops.
+- **Recursive structs** via identified LLVM types. `seal Node {
+  next: tablet Node }` works, including mutually-recursive pairs.
+  Direct (no-indirection) cycles are rejected with a clear fix hint.
+- **Tablet handles** — `tablet T` is a handle into some
+  `tablets[N]T`. Obtained from `tablets.push(x)`, compared with
+  `==` / `!=`, auto-dereffed on `.field`. `lost` is the null handle.
+- **Auto-release** on `mut tablets[N]T` at scope exit — codegen
+  inserts the release call; explicit `release` still works for
+  early release and is de-duplicated against the auto path. Covers
+  fall-through and `yield` (early-return) paths.
+- **Escape check** rejects returning a `tablet T` whose underlying
+  tablets is declared locally — the common UAF pattern. Parameters
+  and `lost` are safe to return.
+- **Mut parameters** — `fn f(mut x: T)` allocas the param so methods
+  work on it. For `tablets[N]T` specifically the param is passed by
+  pointer so mutations persist to the caller's storage.
 - **Char literals** `'a'`, `'\n'`, etc. — type `u8`.
 - **Multi-arg `print`/`println`** — `println("x=", x, " y=", y)`.
 - **Augmented assignment** `+= -= *= /= %=` (parser-desugared).
@@ -37,6 +53,8 @@ What works:
   `else if`, both forms still parse.
 - **Did-you-mean suggestions** on undefined name, unknown function,
   unknown struct, and unknown struct-field errors.
+- **`colophon` reserved keyword** — no semantics yet, held for a
+  future use (file-level metadata preamble or tablets debug-name).
 - **`for name in iter { ... }`** — works over `str` (u8 bytes),
   `tablets[N]T`, and comptime tables. Loop variable is step-bound.
 - **Mixed-width int comparisons** promote to the wider type (matches

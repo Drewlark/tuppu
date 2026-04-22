@@ -57,6 +57,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         # Tablets monomorphizations: key is (N, str(elem_type)).
         self._tablets_types: dict[tuple[int, str], "TabletsInfo"] = {}
         # User-defined structs: name -> LLVM struct type + ordered fields.
+        # Per-block stack of cleanups (just tablets releases for now).
+        # Each entry: (release_fn, ptr, source_name). Pushed at block
+        # entry, popped at block exit (emitting releases along the way).
+        # Mirrors the scope stack — same push/pop cadence.
+        self._cleanup_frames: list[list[tuple[ir.Function, ir.Value, str]]] = []
         self._struct_types: dict[str, ir.LiteralStructType] = {}
         self._struct_fields: dict[str, list[tuple[str, ir.Type]]] = {}
         # Most-recent AST source location, updated as we walk statements
@@ -164,7 +169,16 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
             )
         if fn.name in self.functions:
             raise CodegenError(f"duplicate function {fn.name!r}")
-        param_types = [self._lower_type(p.type) for p in fn.params]
+        param_types = []
+        for p in fn.params:
+            t = self._lower_type(p.type)
+            # Mut tablets params are passed by reference so mutations
+            # (push, release) persist to the caller's storage. Without
+            # this the caller's tablets header (head/tail/len) stays
+            # unchanged and any chunks the callee allocated would leak.
+            if p.is_mut and self._tablets_info_for(t) is not None:
+                t = t.as_pointer()
+            param_types.append(t)
         ret_type = self._lower_type(fn.return_type) if fn.return_type else ir.VoidType()
         fn_type = ir.FunctionType(ret_type, param_types)
         llvm_fn = ir.Function(self.module, fn_type, name=fn.name)
@@ -182,12 +196,37 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         self.builder = ir.IRBuilder(entry)
         self.scopes = [{}]
 
-        # Parameters: bound like step bindings — immutable, direct SSA refs.
+        # Parameters: step-bound (direct SSA ref) unless the user wrote
+        # `mut` — in which case we alloca + store the incoming arg and
+        # bind the alloca, so methods requiring a mut binding (notably
+        # `tablets.push`) work on the parameter. No auto-release is
+        # registered here — the caller owns the storage.
+        #
+        # Special case: mut tablets params arrive already as a pointer
+        # to the caller's storage (see `_declare_fn`). We bind the
+        # incoming pointer directly as the Variable's ir_ref — no
+        # alloca+store — so method dispatch gets a stable pointer to
+        # the caller's tablets and mutations persist.
         for i, p in enumerate(fn.params):
             arg = llvm_fn.args[i]
-            self.scopes[-1][p.name] = Variable(
-                is_mut=False, ir_ref=arg, value_ty=arg.type,
+            param_decl_ty = self._lower_type(p.type)
+            is_mut_tablets = (
+                p.is_mut and self._tablets_info_for(param_decl_ty) is not None
             )
+            if is_mut_tablets:
+                self.scopes[-1][p.name] = Variable(
+                    is_mut=True, ir_ref=arg, value_ty=param_decl_ty,
+                )
+            elif p.is_mut:
+                slot = self._alloca_entry(arg.type, p.name)
+                self.builder.store(arg, slot)
+                self.scopes[-1][p.name] = Variable(
+                    is_mut=True, ir_ref=slot, value_ty=arg.type,
+                )
+            else:
+                self.scopes[-1][p.name] = Variable(
+                    is_mut=False, ir_ref=arg, value_ty=arg.type,
+                )
 
         value = self._gen_expr(fn.body)
 
@@ -432,6 +471,15 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
             raise CodegenError(f"cannot release step-bound tablets {s.name!r}")
         assert self.builder is not None
         self.builder.call(info.release, [var.ir_ref])
+        # Remove this variable from its cleanup frame so the auto-
+        # release at scope exit doesn't double-free. We walk frames
+        # outermost-in since explicit release can target an outer
+        # binding shadowed by an inner one (unusual but legal).
+        for frame in reversed(self._cleanup_frames):
+            for i, (_fn, _ptr, name) in enumerate(frame):
+                if name == s.name:
+                    frame.pop(i)
+                    return
 
     def _gen_for(self, f: A.ForStmt) -> None:
         """Generate a `for name in iter { body }` loop.
@@ -587,6 +635,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         assert self.builder is not None
         ret_ty = self.builder.function.ftype.return_type
         if y.value is None:
+            self._emit_all_cleanups_for_early_return()
             if isinstance(ret_ty, ir.VoidType):
                 self.builder.ret_void()
             else:
@@ -595,7 +644,21 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         val = self._gen_expr(y.value)
         if val is None:
             raise CodegenError("yield value diverged")
-        self.builder.ret(self._coerce(val, ret_ty))
+        coerced = self._coerce(val, ret_ty)
+        # Unwind every live cleanup frame (inner-to-outer) before the
+        # ret. The return value has already been captured into `coerced`
+        # so it doesn't matter if the cleanup invalidates heap memory
+        # — escape analysis rejects programs that return handles into
+        # soon-released tablets.
+        self._emit_all_cleanups_for_early_return()
+        self.builder.ret(coerced)
+
+    def _emit_all_cleanups_for_early_return(self) -> None:
+        """Emit release calls for every live cleanup frame in the
+        current function, innermost first. Used by yield to unwind
+        before the ret."""
+        for frame in reversed(self._cleanup_frames):
+            self._emit_frame_cleanups(frame)
 
     def _gen_binding(self, b: A.Binding) -> None:
         # Uninitialized mut binding with explicit type: zero-initialize.
@@ -606,6 +669,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
             assert self.builder is not None
             self.builder.store(ir.Constant(ty, None), slot)
             self._bind(b.name, Variable(is_mut=True, ir_ref=slot, value_ty=ty))
+            self._maybe_register_cleanup(b.name, ty, slot)
             return
 
         init_val = self._gen_expr(b.init)
@@ -619,8 +683,19 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
             assert self.builder is not None
             self.builder.store(init_val, slot)
             self._bind(b.name, Variable(is_mut=True, ir_ref=slot, value_ty=init_val.type))
+            self._maybe_register_cleanup(b.name, init_val.type, slot)
         else:
             self._bind(b.name, Variable(is_mut=False, ir_ref=init_val, value_ty=init_val.type))
+
+    def _maybe_register_cleanup(
+        self, name: str, value_ty: ir.Type, slot: ir.Value,
+    ) -> None:
+        """If `value_ty` is a cleanup-having type (currently: tablets),
+        record a release call for the innermost cleanup frame so it
+        fires automatically at scope exit."""
+        info = self._tablets_info_for(value_ty)
+        if info is not None and self._cleanup_frames:
+            self._cleanup_frames[-1].append((info.release, slot, name))
 
     def _gen_assign(self, a: A.Assign) -> None:
         assert self.builder is not None
@@ -804,6 +879,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         """Evaluate a block. Returns the value of its trailing expression, or
         None if the block has no tail or diverged before reaching it."""
         self.scopes.append({})
+        self._cleanup_frames.append([])
         try:
             for stmt in b.stmts:
                 if self._is_terminated():
@@ -812,10 +888,27 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
             if self._is_terminated():
                 return None
             if b.tail is None:
-                return None
-            return self._gen_expr(b.tail)
+                tail_val: ir.Value | None = None
+            else:
+                tail_val = self._gen_expr(b.tail)
+            # Emit cleanups for this frame on fall-through (not on early
+            # return — yield emits its own chain before the ret).
+            if not self._is_terminated():
+                self._emit_frame_cleanups(self._cleanup_frames[-1])
+            return tail_val
         finally:
             self.scopes.pop()
+            self._cleanup_frames.pop()
+
+    def _emit_frame_cleanups(
+        self, frame: list[tuple[ir.Function, ir.Value, str]],
+    ) -> None:
+        """Emit release calls for the given cleanup frame, in reverse
+        declaration order — matches C++ RAII / Rust Drop ordering so
+        references between bindings unwind safely."""
+        assert self.builder is not None
+        for release_fn, ptr, _name in reversed(frame):
+            self.builder.call(release_fn, [ptr])
 
     def _gen_unary(self, e: A.Unary) -> ir.Value:
         assert self.builder is not None
@@ -976,10 +1069,27 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         assert self.builder is not None
         call_args = []
         for i, arg in enumerate(e.args):
+            expected_ty = fn.args[i].type
+            # Mut tablets param: callee expects a pointer to the caller's
+            # tablets storage. If the arg is an Ident naming a mut
+            # tablets binding, pass its alloca directly (no load).
+            if (
+                isinstance(expected_ty, ir.PointerType)
+                and self._tablets_info_for(expected_ty.pointee) is not None
+                and isinstance(arg, A.Ident)
+            ):
+                var = self._lookup(arg.name)
+                if var.is_mut and self._tablets_info_for(var.value_ty) is not None:
+                    call_args.append(var.ir_ref)
+                    continue
+                raise CodegenError(
+                    f"argument {i} of {name!r}: mut tablets parameter "
+                    f"requires a mut tablets argument, got {var.value_ty}"
+                )
             v = self._gen_expr(arg)
             if v is None:
                 raise CodegenError(f"argument {i} of call to {name} has no value")
-            call_args.append(self._coerce(v, fn.args[i].type))
+            call_args.append(self._coerce(v, expected_ty))
         return self.builder.call(fn, call_args)
 
     # --- intrinsics: stdlib I/O -----------------------------------------

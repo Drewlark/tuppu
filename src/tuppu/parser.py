@@ -132,10 +132,14 @@ class Parser:
 
     def parse_param(self) -> A.Param:
         start = self.peek()
+        is_mut = False
+        if self.check(Tok.MUT):
+            self.advance()
+            is_mut = True
         name = self.eat(Tok.IDENT, "parameter name").value
         self.eat(Tok.COLON)
         ty = self.parse_type()
-        return _at(start, A.Param(name=name, type=ty))
+        return _at(start, A.Param(name=name, type=ty, is_mut=is_mut))
 
     def parse_struct_decl(self) -> A.StructDecl:
         start = self.eat(Tok.STRUCT)

@@ -214,6 +214,12 @@ class Checker:
         self.scopes: list[dict[str, Ty]] = [{}]
         self.current_fn: str = "<top>"
         self.warnings: list[CompileWarning] = []
+        # Escape tracking: name → True if this binding holds a handle
+        # (or a tablets) whose storage is rooted in a mut tablets
+        # declared inside the current function. Returning such a value
+        # is a use-after-free and gets rejected.
+        self._local_tablets: set[str] = set()
+        self._tainted: dict[str, bool] = {}
 
     def _warn(self, message: str, line: int = 0, col: int = 0) -> None:
         self.warnings.append(CompileWarning(message=message, line=line, col=col))
@@ -331,6 +337,8 @@ class Checker:
     def _check_fn_body(self, fn: A.FnDecl) -> None:
         self.current_fn = fn.name
         self.scopes = [{}]
+        self._local_tablets = set()
+        self._tainted = {}
         fn_ty = self.fns[fn.name]
         for param, pty in zip(fn.params, fn_ty.params):
             self.scopes[0][param.name] = pty
@@ -339,6 +347,16 @@ class Checker:
         if not _coerces_to(body_ty, expected) and not isinstance(body_ty, TyDiverge):
             raise CheckError(
                 f"in fn {fn.name!r}: body produces {body_ty}, expected {expected}",
+                fn.line, fn.col,
+            )
+        # Trailing-expression return (no yield): apply escape check.
+        if isinstance(expected, TyHandle) and self._expr_escapes(fn.body):
+            raise CheckError(
+                f"in fn {fn.name!r}: cannot return a tablet handle whose "
+                f"tablets is declared locally — auto-release at scope "
+                f"exit would free the storage while the caller still "
+                f"holds the handle. Take the tablets as a parameter "
+                f"instead.",
                 fn.line, fn.col,
             )
 
@@ -424,6 +442,10 @@ class Checker:
         if b.init is None:
             assert declared is not None  # parser enforces this
             self._bind(b.name, declared, b.line, b.col)
+            if isinstance(declared, TyTablets) and b.is_mut:
+                self._local_tablets.add(b.name)
+            if isinstance(declared, TyHandle):
+                self._tainted[b.name] = False
             return
         init_ty = self._tc_expr(b.init)
         if declared is not None:
@@ -434,8 +456,16 @@ class Checker:
                     b.line, b.col,
                 )
             self._bind(b.name, declared, b.line, b.col)
+            final_ty = declared
         else:
             self._bind(b.name, init_ty, b.line, b.col)
+            final_ty = init_ty
+        # Track provenance for handles and locally-declared tablets so
+        # the escape check at function return can reject UAFs.
+        if isinstance(final_ty, TyTablets) and b.is_mut:
+            self._local_tablets.add(b.name)
+        if isinstance(final_ty, TyHandle):
+            self._tainted[b.name] = self._expr_escapes(b.init)
 
     def _tc_assign(self, a: A.Assign) -> None:
         # Type-check the target as an expression: this both validates
@@ -449,6 +479,12 @@ class Checker:
                 f"value has type {value_ty}",
                 a.line, a.col,
             )
+        # Taint propagation for mut handle bindings: once tainted,
+        # always tainted (covers the case `head = lib.push(...)` where
+        # `head` later gets returned).
+        if isinstance(target_ty, TyHandle) and isinstance(a.target, A.Ident):
+            if self._expr_escapes(a.value):
+                self._tainted[a.target.name] = True
 
     def _tc_for(self, f: A.ForStmt) -> None:
         # Resolve element type before we look at the body so errors about
@@ -503,6 +539,66 @@ class Checker:
                 f"returns {expected}",
                 y.line, y.col,
             )
+        if isinstance(expected, TyHandle) and self._expr_escapes(y.value):
+            raise CheckError(
+                f"yield: cannot return a tablet handle whose tablets "
+                f"is declared locally — auto-release at scope exit "
+                f"would free the storage while the caller still holds "
+                f"the handle. Take the tablets as a parameter instead.",
+                y.line, y.col,
+            )
+
+    def _expr_escapes(self, e: A.Expr) -> bool:
+        """Would returning `e` hand the caller a handle into a tablets
+        that the current function owns (and will therefore auto-release
+        before control returns to the caller)?
+
+        Conservative analysis: walk the expression, find its root. If
+        the root is a locally-declared mut tablets (or an already-
+        tainted handle binding), the answer is yes. Parameters and
+        `lost` are safe; calls to other user functions trust the
+        callee's own escape check."""
+        if isinstance(e, A.LostLit):
+            return False
+        if isinstance(e, A.Ident):
+            if e.name in self._local_tablets:
+                return True
+            return self._tainted.get(e.name, False)
+        if isinstance(e, A.Field):
+            return self._expr_escapes(e.target)
+        if isinstance(e, A.Call):
+            # tablets.push(...) — root is the tablets receiver.
+            if (
+                isinstance(e.callee, A.Field)
+                and isinstance(e.callee.target, A.Ident)
+                and e.callee.name == "push"
+            ):
+                return self._expr_escapes(e.callee.target)
+            # Plain function call: trust the callee's own escape check.
+            return False
+        if isinstance(e, A.IfExpr):
+            # Either arm could produce the returned value; taint is
+            # the OR of both (a conservative-but-sound approximation).
+            then_esc = any(
+                self._expr_escapes(s.expr) if isinstance(s, A.ExprStmt) else False
+                for s in [*e.then.stmts, *([A.ExprStmt(expr=e.then.tail)] if e.then.tail else [])]
+            ) if e.then.tail else False
+            if e.then.tail is not None:
+                then_esc = self._expr_escapes(e.then.tail)
+            else:
+                then_esc = False
+            if e.else_ is None:
+                return then_esc
+            if isinstance(e.else_, A.IfExpr):
+                else_esc = self._expr_escapes(e.else_)
+            elif e.else_.tail is not None:
+                else_esc = self._expr_escapes(e.else_.tail)
+            else:
+                else_esc = False
+            return then_esc or else_esc
+        if isinstance(e, A.Block):
+            return self._expr_escapes(e.tail) if e.tail is not None else False
+        return False
 
     def _tc_release(self, r: A.ReleaseStmt) -> None:
         ty = self._lookup(r.name, r.line, r.col)

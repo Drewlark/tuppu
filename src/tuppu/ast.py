@@ -265,6 +265,7 @@ Stmt = Union[Binding, Assign, While, ForStmt, YieldStmt, ReleaseStmt, ExprStmt]
 class Param:
     name: str
     type: TypeExpr
+    is_mut: bool = False
     line: int = _pos()
     col:  int = _pos()
 

@@ -46,6 +46,7 @@ class Tok(Enum):
     RELEASE = auto()
     STRUCT = auto()
     LOST = auto()
+    COLOPHON = auto()    # reserved; no semantics yet (see NEXT.md)
 
     # type keywords (value: str — "i64", "bool", etc.)
     TYPE_KW = auto()
@@ -111,6 +112,11 @@ KEYWORDS: dict[str, Tok] = {
     # design pressed into clay to yield distinct impressions.
     "seal": Tok.STRUCT,
     "lost": Tok.LOST,
+    # `colophon` is reserved for a future use (file-level metadata
+    # preamble, tablets debug-name, something along those lines) — the
+    # Babylonian colophon being the scribe's tag at the end of a tablet.
+    # Reserving the word now so users can't accidentally claim it.
+    "colophon": Tok.COLOPHON,
     "true": Tok.TRUE,
     "false": Tok.FALSE,
 }

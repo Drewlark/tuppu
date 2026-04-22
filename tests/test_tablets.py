@@ -222,3 +222,86 @@ def test_tablets_unknown_field():
         compile_to_ir(
             "fn main() -> i32 { mut t: tablets[4]i64\n println(t.capacity)\n 0 }"
         )
+
+
+# --- auto-release at scope exit --------------------------------------------
+
+def test_auto_release_on_fn_exit(tmp_path):
+    # No explicit `release lib`, yet the IR must contain exactly one
+    # release call (inserted by codegen at scope exit).
+    src = (
+        "fn main() -> i32 {\n"
+        "  mut xs: tablets[4]i64\n"
+        "  xs.push(1)\n"
+        "  xs.push(2)\n"
+        "  println(xs.len)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out = run(src, tmp_path)
+    assert out == b"2\n"
+    from tuppu.driver import compile_to_ir
+    ir = compile_to_ir(src)
+    release_calls = [l for l in str(ir).splitlines() if "_release" in l and "call " in l]
+    assert len(release_calls) == 1, release_calls
+
+
+def test_explicit_release_not_doubled(tmp_path):
+    # Explicit `release xs` should still produce exactly one release —
+    # auto-release must unregister the binding on explicit release.
+    src = (
+        "fn main() -> i32 {\n"
+        "  mut xs: tablets[4]i64\n"
+        "  xs.push(9)\n"
+        "  release xs\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out = run(src, tmp_path)
+    assert out == b""
+    from tuppu.driver import compile_to_ir
+    ir = compile_to_ir(src)
+    release_calls = [l for l in str(ir).splitlines() if "_release" in l and "call " in l]
+    assert len(release_calls) == 1, release_calls
+
+
+def test_auto_release_fires_on_yield(tmp_path):
+    # Early return via `yield` must still emit the release — cleanup is
+    # part of the unwind chain, not just the fall-through exit.
+    src = (
+        "fn main() -> i32 {\n"
+        "  mut xs: tablets[4]i64\n"
+        "  xs.push(1)\n"
+        "  if xs.len > 0 { yield 0 }\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, _ = run(src, tmp_path)
+    assert rc == 0
+    from tuppu.driver import compile_to_ir
+    ir = compile_to_ir(src)
+    release_calls = [l for l in str(ir).splitlines() if "_release" in l and "call " in l]
+    # At minimum one release — could emit on both the yield path and
+    # the fall-through path. Both must free `xs`.
+    assert len(release_calls) >= 1, release_calls
+
+
+def test_auto_release_inner_block_only(tmp_path):
+    # A mut tablets declared in a nested block should release at that
+    # block's end, independent of the outer function.
+    src = (
+        "fn main() -> i32 {\n"
+        "  mut outer: tablets[4]i64\n"
+        "  if true {\n"
+        "    mut inner: tablets[4]i64\n"
+        "    inner.push(1)\n"
+        "  }\n"
+        "  outer.push(2)\n"
+        "  0\n"
+        "}\n"
+    )
+    from tuppu.driver import compile_to_ir
+    ir = compile_to_ir(src)
+    release_calls = [l for l in str(ir).splitlines() if "_release" in l and "call " in l]
+    # One for inner (at if-block exit), one for outer (at fn exit).
+    assert len(release_calls) == 2, release_calls

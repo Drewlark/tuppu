@@ -508,3 +508,88 @@ def test_recursive_struct_without_pointer_rejected():
             "seal Node { v: i64, child: Node }\n"
             "fn main() -> i32 { 0 }\n"
         )
+
+
+# --- escape check: no returning local-rooted handles -----------------------
+
+def test_escape_rejects_return_of_local_push():
+    with pytest.raises(CompileError, match="cannot return a tablet handle"):
+        compile_to_ir(
+            "seal Node { value: i64, next: tablet Node }\n"
+            "fn build() -> tablet Node {\n"
+            "  mut lib: tablets[8]Node\n"
+            "  lib.push(Node { value: 1, next: lost })\n"
+            "}\n"
+            "fn main() -> i32 { 0 }\n"
+        )
+
+
+def test_escape_rejects_return_of_tainted_binding():
+    with pytest.raises(CompileError, match="cannot return a tablet handle"):
+        compile_to_ir(
+            "seal Node { value: i64, next: tablet Node }\n"
+            "fn build() -> tablet Node {\n"
+            "  mut lib: tablets[8]Node\n"
+            "  step h: tablet Node = lib.push(Node { value: 1, next: lost })\n"
+            "  h\n"
+            "}\n"
+            "fn main() -> i32 { 0 }\n"
+        )
+
+
+def test_escape_rejects_yielded_local_handle():
+    with pytest.raises(CompileError, match="cannot return a tablet handle"):
+        compile_to_ir(
+            "seal Node { value: i64, next: tablet Node }\n"
+            "fn build() -> tablet Node {\n"
+            "  mut lib: tablets[8]Node\n"
+            "  yield lib.push(Node { value: 1, next: lost })\n"
+            "}\n"
+            "fn main() -> i32 { 0 }\n"
+        )
+
+
+def test_escape_accepts_lost_return(tmp_path):
+    # `lost` has no provenance — always safe to return.
+    src = (
+        "seal Node { value: i64, next: tablet Node }\n"
+        "fn empty() -> tablet Node { lost }\n"
+        "fn main() -> i32 {\n"
+        "  step h: tablet Node = empty()\n"
+        "  if h == lost { println(1) } else { println(0) }\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"1\n"
+
+
+# --- mut tablets params (by-ref semantics) --------------------------------
+
+def test_mut_tablets_param_pass_through(tmp_path):
+    # Callee pushes into caller's tablets — mutations must persist so
+    # the eventual release actually frees the chunks allocated here.
+    src = (
+        "seal Node { value: i64, next: tablet Node }\n"
+        "fn push_front(mut store: tablets[16]Node, head: tablet Node, v: i64) -> tablet Node {\n"
+        "  store.push(Node { value: v, next: head })\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  mut lib: tablets[16]Node\n"
+        "  mut head: tablet Node = lost\n"
+        "  head = push_front(lib, head, 3)\n"
+        "  head = push_front(lib, head, 2)\n"
+        "  head = push_front(lib, head, 1)\n"
+        "  println(lib.len)\n"
+        "  mut cur: tablet Node = head\n"
+        "  while cur != lost {\n"
+        "    println(cur.value)\n"
+        "    cur = cur.next\n"
+        "  }\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    # lib.len should reflect all three pushes (by-ref), and the walk
+    # prints 1, 2, 3.
+    assert out == b"3\n1\n2\n3\n"
