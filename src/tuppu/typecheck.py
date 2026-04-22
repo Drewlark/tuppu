@@ -532,15 +532,19 @@ class Checker:
                 return lhs
             if isinstance(lhs, TyRat) and isinstance(rhs, TyRat):
                 return RAT
-            # Native sex arithmetic: addition and subtraction stay in
-            # digit form when both operands are sex. Result is sex.
+            # Native sex arithmetic:
+            #   +, -    stay in digit form end-to-end (Phase 2).
+            #   *       goes through rat internally but the result is
+            #           reconstructed as sex via __tuppu_rat_to_sex,
+            #           which traps at runtime on non-regular results
+            #           (Phase 3a). Result type is sex — no warning.
             if (
                 isinstance(lhs, TyDish) and isinstance(rhs, TyDish)
-                and op in ("+", "-")
+                and op in ("+", "-", "*")
             ):
                 return DISH
             # Remaining sex-involved ops still lower to rat and warn —
-            # native multiplication and division come in a later phase.
+            # native division and mod come in a later phase.
             if dish_involved and _coerces_to(lhs, RAT) and _coerces_to(rhs, RAT):
                 self._warn(
                     f"sex {op} lowers to rat (native digit-form "

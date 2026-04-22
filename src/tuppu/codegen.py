@@ -105,6 +105,7 @@ class Codegen:
         self._sex_add: ir.Function | None = None
         self._sex_cmp: ir.Function | None = None
         self._int_to_sex: ir.Function | None = None
+        self._rat_to_sex: ir.Function | None = None
         self._trap: ir.Function | None = None
         # table name -> (global array, length, lo bound, element LLVM type)
         self._tables: dict[str, tuple[ir.GlobalVariable, int, int, ir.Type]] = {}
@@ -351,15 +352,12 @@ class Codegen:
             if isinstance(value.type, ir.IntType):
                 n_i64 = self._coerce(value, I64)
                 return self.builder.call(self._get_int_to_sex(), [n_i64])
-            # rat → sex is deferred — requires a regularity check to know
-            # whether the rational terminates in sexagesimal.
-            line, col = self._current_loc
-            raise CodegenError(
-                f"converting {value.type} to sex is not yet supported "
-                f"(only integer types can convert to sex for now; "
-                f"rat → sex needs regularity-check work — see SPEC §4.3)",
-                line, col,
-            )
+            # rat → sex: regularity-checked reconstruction. Traps at
+            # runtime if the denominator isn't 2^a·3^b·5^c (non-
+            # terminating sexagesimal), or if it would need more than
+            # SEX_MAX_DIGITS fractional digits.
+            if value.type == RAT:
+                return self.builder.call(self._get_rat_to_sex(), [value])
 
         # Rat conversions.
         if value.type == RAT and isinstance(target_ty, ir.IntType):
@@ -825,6 +823,15 @@ class Codegen:
                 flipped = self.builder.xor(rhs_sign, ir.Constant(I8, 1))
                 rhs = self.builder.insert_value(rhs, flipped, SEX_IDX_SIGN)
             return self.builder.call(self._get_sex_add(), [lhs, rhs])
+
+        # Native sex*sex: lower through rat, then reconstruct a sex
+        # via the regularity-checked helper. Traps at runtime if the
+        # product isn't a regular number (den not 2^a·3^b·5^c).
+        if lhs.type == SEX and rhs.type == SEX and op == "*":
+            lhs_rat = self._coerce(lhs, RAT)
+            rhs_rat = self._coerce(rhs, RAT)
+            product = self._gen_rat_binary("*", lhs_rat, rhs_rat)
+            return self.builder.call(self._get_rat_to_sex(), [product])
 
         # Everything else still lowers sex to rat — the warning path the
         # type checker announced. Phase 3 will replace more of this with
@@ -1935,6 +1942,244 @@ class Codegen:
         b.ret(result)
 
         self._int_to_sex = fn
+        return fn
+
+    def _get_rat_to_sex(self) -> ir.Function:
+        """Emit `__tuppu_rat_to_sex(rat) -> sex` — convert a reduced rat
+        to its Babylonian digit form.
+
+        Regularity check: the denominator must factor as 2^a·3^b·5^c
+        (a "regular number" in Old Babylonian terms). Non-regular rats
+        have no terminating sexagesimal representation — we trap.
+
+        Algorithm:
+          1. If num == 0, return zero-sex.
+          2. Sign = (num < 0); work with |num|.
+          3. Regularity check: strip 2s, 3s, 5s from den; trap if not
+             reduced to 1.
+          4. Decompose |num|/den into integer digits (base-60, MSB-first)
+             via repeated (%60, /60).
+          5. Extract fractional digits via iterated (rem*60)/den, until
+             rem == 0 (regular: guaranteed) or SEX_MAX_DIGITS hit (trap).
+          6. Pack.
+        """
+        if self._rat_to_sex is not None:
+            return self._rat_to_sex
+
+        fn = ir.Function(
+            self.module,
+            ir.FunctionType(SEX, [RAT]),
+            name="__tuppu_rat_to_sex",
+        )
+        fn.args[0].name = "r"
+        r_arg = fn.args[0]
+
+        arr16_ty = ir.ArrayType(I8, SEX_MAX_DIGITS)
+        vec16 = ir.VectorType(I8, SEX_MAX_DIGITS)
+        ZERO_I32 = ir.Constant(I32, 0)
+
+        entry          = fn.append_basic_block("entry")
+        zero_path      = fn.append_basic_block("zero.path")
+        sign_bb        = fn.append_basic_block("sign")
+        reg_hdr        = fn.append_basic_block("reg.hdr")
+        reg_try2       = fn.append_basic_block("reg.try2")
+        reg_div2       = fn.append_basic_block("reg.div2")
+        reg_try3       = fn.append_basic_block("reg.try3")
+        reg_div3       = fn.append_basic_block("reg.div3")
+        reg_try5       = fn.append_basic_block("reg.try5")
+        reg_div5       = fn.append_basic_block("reg.div5")
+        reg_trap       = fn.append_basic_block("reg.trap")
+        reg_ok         = fn.append_basic_block("reg.ok")
+        int_hdr        = fn.append_basic_block("int.hdr")
+        int_body       = fn.append_basic_block("int.body")
+        int_copy_prep  = fn.append_basic_block("int.copy.prep")
+        int_copy_hdr   = fn.append_basic_block("int.copy.hdr")
+        int_copy_body  = fn.append_basic_block("int.copy.body")
+        int_force_zero = fn.append_basic_block("int.force.zero")
+        int_done       = fn.append_basic_block("int.done")
+        frac_hdr       = fn.append_basic_block("frac.hdr")
+        frac_ov_trap   = fn.append_basic_block("frac.ov.trap")
+        frac_body      = fn.append_basic_block("frac.body")
+        pack           = fn.append_basic_block("pack")
+
+        b = ir.IRBuilder(entry)
+        num = b.extract_value(r_arg, 0)
+        den = b.extract_value(r_arg, 1)
+        is_zero = b.icmp_signed("==", num, ir.Constant(I64, 0))
+        b.cbranch(is_zero, zero_path, sign_bb)
+
+        # Zero path — single int digit 0, sign 0.
+        b.position_at_end(zero_path)
+        zero_result: ir.Value = ir.Constant(SEX, ir.Undefined)
+        zero_result = b.insert_value(
+            zero_result,
+            ir.Constant(arr16_ty, [0] * SEX_MAX_DIGITS),
+            SEX_IDX_DIGITS,
+        )
+        zero_result = b.insert_value(zero_result, ir.Constant(I8, 1), SEX_IDX_RADIX)
+        zero_result = b.insert_value(zero_result, ir.Constant(I8, 1), SEX_IDX_COUNT)
+        zero_result = b.insert_value(zero_result, ir.Constant(I8, 0), SEX_IDX_SIGN)
+        zero_result = b.insert_value(zero_result, ir.Constant(I8, 0), 4)
+        b.ret(zero_result)
+
+        # Sign extraction.
+        b.position_at_end(sign_bb)
+        is_neg = b.icmp_signed("<", num, ir.Constant(I64, 0))
+        abs_num = b.select(is_neg, b.neg(num), num)
+        sign_byte = b.select(is_neg, ir.Constant(I8, 1), ir.Constant(I8, 0))
+        b.branch(reg_hdr)
+
+        # Regularity check: strip factors of 2, 3, 5 until d == 1 (ok) or
+        # none divide (trap).
+        b.position_at_end(reg_hdr)
+        d_phi = b.phi(I64, "d")
+        d_phi.add_incoming(den, sign_bb)
+        d_eq_1 = b.icmp_signed("==", d_phi, ir.Constant(I64, 1))
+        b.cbranch(d_eq_1, reg_ok, reg_try2)
+
+        b.position_at_end(reg_try2)
+        r2 = b.srem(d_phi, ir.Constant(I64, 2))
+        r2_zero = b.icmp_signed("==", r2, ir.Constant(I64, 0))
+        b.cbranch(r2_zero, reg_div2, reg_try3)
+        b.position_at_end(reg_div2)
+        d_next_2 = b.sdiv(d_phi, ir.Constant(I64, 2))
+        d_phi.add_incoming(d_next_2, reg_div2)
+        b.branch(reg_hdr)
+
+        b.position_at_end(reg_try3)
+        r3 = b.srem(d_phi, ir.Constant(I64, 3))
+        r3_zero = b.icmp_signed("==", r3, ir.Constant(I64, 0))
+        b.cbranch(r3_zero, reg_div3, reg_try5)
+        b.position_at_end(reg_div3)
+        d_next_3 = b.sdiv(d_phi, ir.Constant(I64, 3))
+        d_phi.add_incoming(d_next_3, reg_div3)
+        b.branch(reg_hdr)
+
+        b.position_at_end(reg_try5)
+        r5 = b.srem(d_phi, ir.Constant(I64, 5))
+        r5_zero = b.icmp_signed("==", r5, ir.Constant(I64, 0))
+        b.cbranch(r5_zero, reg_div5, reg_trap)
+        b.position_at_end(reg_div5)
+        d_next_5 = b.sdiv(d_phi, ir.Constant(I64, 5))
+        d_phi.add_incoming(d_next_5, reg_div5)
+        b.branch(reg_hdr)
+
+        b.position_at_end(reg_trap)
+        b.call(self._get_trap(), [])
+        b.unreachable()
+
+        # Regularity established. Separate integer quotient and remainder.
+        b.position_at_end(reg_ok)
+        int_quot = b.sdiv(abs_num, den)
+        frac_rem0 = b.srem(abs_num, den)
+        tmp = b.alloca(arr16_ty)
+        tmp.align = SEX_MAX_DIGITS
+        out_buf = b.alloca(arr16_ty)
+        out_buf.align = SEX_MAX_DIGITS
+        zero_vec = ir.Constant(vec16, [0] * SEX_MAX_DIGITS)
+        for buf in (tmp, out_buf):
+            st = b.store(zero_vec, b.bitcast(buf, vec16.as_pointer()))
+            st.align = SEX_MAX_DIGITS
+        b.branch(int_hdr)
+
+        # Int decomposition: write digits MSB-first into tmp[15..start_idx]
+        # by walking right-to-left from index 15. Same shape as
+        # __tuppu_int_to_sex.
+        b.position_at_end(int_hdr)
+        n_phi = b.phi(I64, "n")
+        idx_phi = b.phi(I32, "idx")
+        n_phi.add_incoming(int_quot, reg_ok)
+        idx_phi.add_incoming(ir.Constant(I32, SEX_MAX_DIGITS - 1), reg_ok)
+        n_zero = b.icmp_signed("==", n_phi, ir.Constant(I64, 0))
+        b.cbranch(n_zero, int_copy_prep, int_body)
+
+        b.position_at_end(int_body)
+        digit_i = b.trunc(b.srem(n_phi, ir.Constant(I64, 60)), I8)
+        next_n = b.sdiv(n_phi, ir.Constant(I64, 60))
+        b.store(digit_i, b.gep(
+            tmp, [ZERO_I32, b.sext(idx_phi, I64)], inbounds=True,
+        ))
+        n_phi.add_incoming(next_n, int_body)
+        idx_phi.add_incoming(b.sub(idx_phi, ir.Constant(I32, 1)), int_body)
+        b.branch(int_hdr)
+
+        # Copy tmp[start_idx..16) left-aligned into out_buf[0..int_count).
+        # If int_quot was 0, int_count will be 0 — force a single 0 digit.
+        b.position_at_end(int_copy_prep)
+        start_idx = b.add(idx_phi, ir.Constant(I32, 1))
+        int_digits_count = b.sub(ir.Constant(I32, SEX_MAX_DIGITS), start_idx)
+        has_int = b.icmp_signed(">", int_digits_count, ZERO_I32)
+        b.cbranch(has_int, int_copy_hdr, int_force_zero)
+
+        b.position_at_end(int_force_zero)
+        b.store(ir.Constant(I8, 0), b.gep(
+            out_buf, [ZERO_I32, ir.Constant(I64, 0)], inbounds=True,
+        ))
+        b.branch(int_done)
+
+        b.position_at_end(int_copy_hdr)
+        j_phi = b.phi(I32, "j")
+        j_phi.add_incoming(ZERO_I32, int_copy_prep)
+        j_done = b.icmp_signed(">=", j_phi, int_digits_count)
+        b.cbranch(j_done, int_done, int_copy_body)
+
+        b.position_at_end(int_copy_body)
+        src_idx = b.add(start_idx, j_phi)
+        src_byte = b.load(b.gep(
+            tmp, [ZERO_I32, b.sext(src_idx, I64)], inbounds=True,
+        ))
+        b.store(src_byte, b.gep(
+            out_buf, [ZERO_I32, b.sext(j_phi, I64)], inbounds=True,
+        ))
+        j_phi.add_incoming(b.add(j_phi, ir.Constant(I32, 1)), int_copy_body)
+        b.branch(int_copy_hdr)
+
+        b.position_at_end(int_done)
+        # int_count: 1 if we forced a zero, else int_digits_count.
+        int_count = b.phi(I32, "int_count")
+        int_count.add_incoming(ir.Constant(I32, 1), int_force_zero)
+        int_count.add_incoming(int_digits_count, int_copy_hdr)
+        b.branch(frac_hdr)
+
+        # Fractional digits: while rem > 0, write (rem*60)/den to
+        # out_buf[write_idx]; rem = (rem*60) % den. Regularity => this
+        # terminates. Trap if we'd exceed SEX_MAX_DIGITS anyway (e.g.
+        # den = 2^30 needs > 16 frac digits).
+        b.position_at_end(frac_hdr)
+        rem_phi = b.phi(I64, "rem")
+        write_idx = b.phi(I32, "write_idx")
+        rem_phi.add_incoming(frac_rem0, int_done)
+        write_idx.add_incoming(int_count, int_done)
+        rem_is_zero = b.icmp_signed("==", rem_phi, ir.Constant(I64, 0))
+        b.cbranch(rem_is_zero, pack, frac_ov_trap)
+
+        b.position_at_end(frac_ov_trap)
+        at_cap = b.icmp_signed(">=", write_idx, ir.Constant(I32, SEX_MAX_DIGITS))
+        b.cbranch(at_cap, reg_trap, frac_body)
+
+        b.position_at_end(frac_body)
+        rem_scaled = b.mul(rem_phi, ir.Constant(I64, 60))
+        digit_f = b.trunc(b.sdiv(rem_scaled, den), I8)
+        next_rem = b.srem(rem_scaled, den)
+        b.store(digit_f, b.gep(
+            out_buf, [ZERO_I32, b.sext(write_idx, I64)], inbounds=True,
+        ))
+        rem_phi.add_incoming(next_rem, frac_body)
+        write_idx.add_incoming(b.add(write_idx, ir.Constant(I32, 1)), frac_body)
+        b.branch(frac_hdr)
+
+        # Pack.
+        b.position_at_end(pack)
+        final_digits = b.load(out_buf)
+        result: ir.Value = ir.Constant(SEX, ir.Undefined)
+        result = b.insert_value(result, final_digits, SEX_IDX_DIGITS)
+        result = b.insert_value(result, b.trunc(int_count, I8), SEX_IDX_RADIX)
+        result = b.insert_value(result, b.trunc(write_idx, I8), SEX_IDX_COUNT)
+        result = b.insert_value(result, sign_byte, SEX_IDX_SIGN)
+        result = b.insert_value(result, ir.Constant(I8, 0), 4)
+        b.ret(result)
+
+        self._rat_to_sex = fn
         return fn
 
     def _get_sex_add(self) -> ir.Function:

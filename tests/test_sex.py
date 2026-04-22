@@ -444,18 +444,21 @@ def test_int_to_sex_in_struct_field(tmp_path):
     assert out == b"0\n"
 
 
-def test_rat_to_sex_still_rejected_with_location():
-    # rat → sex is deferred; ensure the error now reports where.
-    from tuppu.errors import CompileError
-    with pytest.raises(CompileError, match=r"\d+:\d+:.*sex"):
-        compile_to_ir(
-            "seal P { x: sex }\n"
-            "fn main() -> i32 {\n"
-            "  step r: rat = 1;30\n"
-            "  step p = P { x: r }\n"
-            "  0\n"
-            "}\n"
-        )
+def test_rat_to_sex_coerces_regular(tmp_path):
+    # rat → sex is now supported for regular numbers (den = 2^a·3^b·5^c).
+    # Storing a rat in a sex-typed field should reconstruct the Babylonian
+    # digit form and print 1;30.
+    src = (
+        "seal P { x: sex }\n"
+        "fn main() -> i32 {\n"
+        "  step r: rat = rat(3, 2)\n"
+        "  step p = P { x: r }\n"
+        "  println(p.x)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"1;30\n"
 
 
 def test_sex_as_function_param_and_return(tmp_path):
@@ -471,17 +474,146 @@ def test_sex_as_function_param_and_return(tmp_path):
     assert out == b"1;24 51 10\n"
 
 
+# --- Phase 3a: native sex * and rat → sex with regularity check -----------
+
+def test_rat_to_sex_pure_integer(tmp_path):
+    # rat(5, 1) → sex is integer-form 5, prints "5".
+    src = (
+        "fn main() -> i32 {\n"
+        "  step r: rat = rat(5, 1)\n"
+        "  step s: sex = r\n"
+        "  println(s)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"5\n"
+
+
+def test_rat_to_sex_pure_fraction(tmp_path):
+    # 1/3 → 0;20 (single leading-zero int digit).
+    src = (
+        "fn main() -> i32 {\n"
+        "  step r: rat = rat(1, 3)\n"
+        "  step s: sex = r\n"
+        "  println(s)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"0;20\n"
+
+
+def test_rat_to_sex_multi_frac(tmp_path):
+    # 1/8 = 0;7 30. (den = 8 = 2^3; rem path emits 7 then 30.)
+    src = (
+        "fn main() -> i32 {\n"
+        "  step r: rat = rat(1, 8)\n"
+        "  step s: sex = r\n"
+        "  println(s)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"0;7 30\n"
+
+
+def test_rat_to_sex_negative(tmp_path):
+    # -3/2 → -1;30. Sign byte propagates.
+    src = (
+        "fn main() -> i32 {\n"
+        "  step r: rat = rat(0, 1) - rat(3, 2)\n"
+        "  step s: sex = r\n"
+        "  println(s)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"-1;30\n"
+
+
+def test_rat_to_sex_nonregular_traps(tmp_path):
+    # 1/7 is not regular (7 isn't 2^a·3^b·5^c). Runtime trap.
+    src = (
+        "fn main() -> i32 {\n"
+        "  step r: rat = rat(1, 7)\n"
+        "  step s: sex = r\n"
+        "  println(s)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, _, _ = run(src, tmp_path)
+    assert rc != 0
+
+
+def test_sex_mul_native(tmp_path):
+    # 3/2 · 1/3 = 1/2 → 0;30 in digit form, no warning.
+    src = (
+        "fn main() -> i32 {\n"
+        "  println(1;30 * 0;20)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"0;30\n"
+
+
+def test_sex_mul_integer_form(tmp_path):
+    # 1 2 (= 62) · 1 3 (= 63) = 3906 = 1 5 6 in base 60.
+    src = (
+        "fn main() -> i32 {\n"
+        "  println(1 2 * 1 3)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"1 5 6\n"
+
+
+def test_sex_mul_no_warning(tmp_path):
+    # sex*sex now stays in digit form — no Phase 2-style warning anymore.
+    src_path = tmp_path / "mul.tpu"
+    src_path.write_text(
+        "fn main() -> i32 {\n"
+        "  println(1;30 * 0;20)\n"
+        "  0\n"
+        "}\n"
+    )
+    r = subprocess.run(
+        [sys.executable, "-m", "tuppu", "run", str(src_path), "--no-stdlib"],
+        capture_output=True,
+    )
+    assert r.returncode == 0
+    assert b"warning" not in r.stderr.lower()
+
+
+def test_sex_mul_round_trip_via_int(tmp_path):
+    # Integer sex times integer sex should equal the i64 product. 7·8=56,
+    # which in base-60 is a single digit "56".
+    src = (
+        "fn main() -> i32 {\n"
+        "  step a: sex = 7\n"
+        "  step b: sex = 8\n"
+        "  step c = a * b\n"
+        "  println(c)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"56\n"
+
+
 # --- CLI emits warnings to stderr ------------------------------------------
 
-def test_cli_sex_mul_warning(tmp_path):
-    # Multiplication still lowers to rat and warns until Phase 3 lands
-    # a native digit-form multiply.
+def test_cli_sex_div_warning(tmp_path):
+    # Division still lowers to rat and warns. (Multiplication now stays
+    # in digit form — see test_sex_mul_native.)
     src = tmp_path / "warn.tpu"
     src.write_text(
         "fn main() -> i32 {\n"
         "  step a = 1;30\n"
         "  step b = 0;20\n"
-        "  println(a * b)\n"
+        "  println(a / b)\n"
         "  0\n"
         "}\n"
     )
@@ -490,5 +622,5 @@ def test_cli_sex_mul_warning(tmp_path):
         capture_output=True,
     )
     assert r.returncode == 0
-    assert r.stdout == b"1/2\n"
+    assert r.stdout == b"9/2\n"
     assert b"warning" in r.stderr.lower()

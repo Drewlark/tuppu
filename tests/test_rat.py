@@ -95,8 +95,12 @@ def test_rat_sub(tmp_path):
 
 
 def test_rat_mul(tmp_path):
-    # 3/2 * 1/3 = 1/2
-    _, out = run('fn main() -> i32 { println(1;30 * 0;20)\n 0 }', tmp_path)
+    # 3/2 * 1/3 = 1/2. Cast to rat: sex*sex now stays in digit form
+    # and would print 0;30 instead of the rat form 1/2.
+    _, out = run(
+        'fn main() -> i32 { println((1;30) as rat * (0;20) as rat)\n 0 }',
+        tmp_path,
+    )
     assert out == b"1/2\n"
 
 

@@ -253,8 +253,9 @@ Conversions:
 ```
 sex  as rat    // real work: reconstruct num/den, reduce via gcd
 sex  as i64    // reduces to rat then truncates toward zero
-rat  as sex    // not yet supported (regularity check required — v0.2)
-i64  as sex    // not yet supported (wrap as one-digit — v0.2)
+rat  as sex    // regularity-checked reconstruction — traps at runtime
+               //   if den isn't 2^a·3^b·5^c (non-terminating sexagesimal)
+i64  as sex    // decompose into base-60 digits (integer form)
 sex  as f64    // deferred: "f64 not yet supported"
 ```
 
@@ -262,16 +263,24 @@ Sex values coerce silently to `rat` at typed binding sites
 (`step x: rat = 1;30` works) — the conversion happens implicitly at
 the coercion point.
 
-**Native digit-form arithmetic** (Phase 2):
+**Native digit-form arithmetic:**
 
-- `sex + sex` and `sex - sex` stay in digit form. No warning, no rat
-  lowering. The runtime helper aligns radix points, SIMD-adds the
-  16-lane digit buffer, then propagates base-60 carries. Mixed signs
-  dispatch to a magnitude compare + borrow-propagating subtract.
-- Remaining ops (`*`, `/`, `%`) still lower to rat and emit a
-  compile-time warning for the moment — native digit-form
-  multiplication, division with regularity checks, and escape-analysis
-  rat-fallback specialization are planned for Phase 3.
+- `sex + sex` and `sex - sex` (Phase 2) stay in digit form end-to-end.
+  No warning, no rat lowering. The runtime helper aligns radix points,
+  SIMD-adds the 16-lane digit buffer, then propagates base-60 carries.
+  Mixed signs dispatch to a magnitude compare + borrow-propagating
+  subtract.
+- `sex * sex` (Phase 3a) computes the product through rat internally
+  (`(a as rat) * (b as rat)`), then reconstructs the sex digit form
+  via `__tuppu_rat_to_sex` — which runs the regularity check and
+  traps on non-terminating products. No compile-time warning; result
+  type is sex. The integer ≤ 14-digit headroom covers any i64 · i64
+  product (max 22 digits reduced is well within our 16-digit buffer
+  because regular denominators cap frac digits sharply).
+- `sex / sex` and `sex % sex` still lower to rat and emit a compile-
+  time warning for the moment — native digit-form division is Phase
+  3b. Escape-analysis rat-fallback specialization (where rat-only sex
+  values skip the digit-form runtime entirely) is Phase 3c.
 
 Field access: `x.num` and `x.den` are still allowed on sex (the
 compiler reduces to rat first), but prefer an explicit `as rat`

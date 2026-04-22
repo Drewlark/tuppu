@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **365 tests passing.**
+- **374 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -35,16 +35,23 @@ What works:
   `tablets[N]T`, and comptime tables. Loop variable is step-bound.
 - **Mixed-width int comparisons** promote to the wider type (matches
   `if`-arm unification).
-- **Sex/dish Phase 1 + 2:**
+- **Sex/dish Phases 1–3a:**
   - Distinct 20-byte runtime `{ [16]u8 digits, u8 radix, u8 count,
     i8 sign, u8 pad }`.
   - Native Babylonian printing (`1;30`, `1;24 51 10`, `-1;30`).
   - `sex as rat` is a real reduce; `sex as i64` truncates via rat.
   - `int → sex` decomposes an i64 into base-60 digits (integer form).
     So `Point { x: 0, y: 0 }` with sex fields works.
+  - `rat → sex` via `__tuppu_rat_to_sex` — regularity check (den =
+    2^a·3^b·5^c), integer-digit decomposition + fractional-digit
+    extraction. Runtime trap on non-regular denominators or digit-
+    buffer overflow.
   - Native `sex + sex` and `sex - sex` via `__tuppu_sex_add` — radix
     alignment, 16-lane SIMD digit add, scalar carry, mixed-sign via
     magnitude compare + borrow-propagating subtract. No warning.
+  - Native `sex * sex` via the rat path: `(a as rat) * (b as rat)` →
+    `__tuppu_rat_to_sex`. Result stays dish-typed. Traps at runtime
+    on non-regular products.
   - Unary `-` is a free sign-byte flip.
 - `step` (SSA) and `mut` (alloca) bindings; assignment.
 - `if`/`else` as expression; `while`; `yield` early-return.
@@ -57,9 +64,12 @@ What works:
 - Compile-time warning infrastructure.
 
 What doesn't yet:
-- Native sex `*`, `/`, `%` (still warn-lower to rat — **Phase 3**).
-- `rat → sex` (needs regularity check — Phase 3 too).
+- Native sex `/`, `%` (still warn-lower to rat — **Phase 3b**).
+- Escape-analysis rat-fallback for rat-only sex values (**Phase 3c**
+  — the big compiler-learning chunk).
 - Imports / namespacing.
+- Mixed-type sex × int / sex × rat operations (today you have to cast
+  to a common type first). Pre-existing, not Phase-3a-specific.
 - Dynamic string ops (concat, slice, case) — needs tablets-backed
   alloc plus a lifetime/ownership story.
 - `read_line() -> str` — same blocker.
@@ -83,10 +93,16 @@ What doesn't yet:
    Babylonian printing + `sex as rat` as a real reduce helper.
 5. ~~**Sex/dish Phase 2**~~ — **done.** Native `sex + sex` / `-`,
    int→sex, error location tracking. See `__tuppu_sex_add`.
-6. **Sex/dish Phase 3** — **Next.** Native `*` and `/` with
-   Babylonian regularity check, plus the escape-analysis pass for
-   rat-fallback specialization. See §3 below for the full design.
-7. **Imports** — cleanup; pay when stdlib grows enough to need
+6. ~~**Sex/dish Phase 3a**~~ — **done.** `__tuppu_rat_to_sex` with
+   regularity check, `rat → sex` coercion, native `sex * sex` via the
+   rat path. See `tests/test_sex.py::test_rat_to_sex_*` and
+   `::test_sex_mul_*`.
+7. **Sex/dish Phase 3b** — **Next.** Native `sex / sex` on top of
+   the rat path (chains `__tuppu_rat_to_sex` after `rat_div`, same
+   regularity-trap semantics).
+8. **Sex/dish Phase 3c** — escape-analysis pass for rat-fallback
+   specialization. See §3 below.
+9. **Imports** — cleanup; pay when stdlib grows enough to need
    namespaces. After sex Phase 3.
 
 ## 1. Future: `impress` reinterpret cast
@@ -143,53 +159,44 @@ When the driver sees `use stdlib/rat` it resolves the file:
 - Migration: existing stdlib functions marked `pub`; examples add
   `use stdlib/rat` / `use stdlib/sex` at top.
 
-## 3. Sex Phase 3 — native *, /, and escape analysis
+## 3. Sex Phase 3 — /, escape analysis (3a done)
 
-The remaining sex/dish work. Three sub-tasks, all worth doing in the
-order listed; multiplication is the most visible win, escape analysis
-is the learning chunk.
+### 3a. ~~Native `sex * sex`~~ — **done.**
 
-### 3a. Native `sex * sex`
+Shipped via the rat path: `sex * sex → (a as rat) * (b as rat) →
+__tuppu_rat_to_sex`. `__tuppu_rat_to_sex` lives in codegen.py, runs
+the regularity check (strip 2s, 3s, 5s from den), decomposes the
+integer quotient into base-60 digits, then iteratively extracts
+fractional digits until rem == 0 or we hit SEX_MAX_DIGITS (trap).
 
-Two implementation paths to choose between:
+This also implemented `rat → sex` as a coercion. Tests:
+`tests/test_sex.py::test_rat_to_sex_*`, `test_sex_mul_*`.
 
-- **Via rat (easy).** `sex * sex → (sex as rat) * rat → rat`. The
-  digit form is lost in the result — but you can reduce back via a
-  new `__tuppu_rat_to_sex` helper that runs a regularity check first
-  (denominator must be 2^a · 3^b · 5^c) and decomposes into
-  fractional digits via repeated × 60 / den. This also implements
-  `rat as sex`. Good first cut; covers the regular-number case
-  exactly, errors on non-regular.
-- **Digit-cross-product (hard).** O(n·m) digit multiplications, each
-  in base 60, each producing a partial sum with a carry. Handle sign
-  separately. Alignment is simpler than add (just shift the radix by
-  the sum of frac counts). No SIMD easy path here because of the
-  carry chain across partial sums.
+Future-precision note: if the 16-digit buffer starts cramping real
+workloads, the "digit cross-product" alternative would let sex*sex
+exceed i64·i64 precision by staying in digit space — but that needs
+sign handling, alignment via radix-shift, and a non-SIMD carry chain
+across partial sums. Not on the roadmap unless someone asks.
 
-**Recommend: path 1 first.** It gives `rat → sex` and native-ish
-multiplication in one shot. Path 2 can come later if the precision
-ceiling bites.
+### 3b. Native `sex / sex` — **Next.**
 
-**New helper:** `__tuppu_rat_to_sex(rat) -> sex`. Algorithm:
-1. Extract num, den. Handle sign.
-2. Factor den to check regularity: repeatedly divide by 2, 3, 5
-   until den == 1 (regular) or none of those divide (not regular).
-3. If not regular, **runtime trap** (or emit `CompileError` at
-   compile time for literal operands — we know at codegen-time).
-4. If regular, produce digits:
-   - int_digits = Horner-decompose (num / den) into base 60.
-   - For fractional, repeatedly multiply remainder by 60 and divide
-     by den to extract the next frac digit, until remainder is 0.
-   - Track digit counts; trap on SEX_MAX_DIGITS overflow.
+With 3a's helpers in hand, `sex / sex` is a thin wrapper:
+`(a as rat) / (b as rat) → __tuppu_rat_to_sex`. Trap semantics are
+identical to `*`. Estimated ~10 lines in codegen.py and a couple of
+typecheck tweaks (dispatch `/` through the same DISH-returning branch
+as `*`). One subtlety: `rat_div` already traps on divisor-zero via
+`_get_rat_reduce`, so we don't need a separate zero check.
 
-Regularity check can also be done at compile time for literal
-operands — cleaner UX since the user sees the error immediately.
+**Files to touch:**
+- `src/tuppu/typecheck.py` — extend the `op in ("+", "-", "*")`
+  sex-stays-sex branch to include `"/"`.
+- `src/tuppu/codegen.py` — mirror the sex*sex dispatch for `/`.
+- `tests/test_sex.py` — add div happy-path (0;30 / 0;20 = 1;30),
+  non-regular divisor trap, div by zero trap, integer form
+  (1 0 / 3 = 20).
 
-### 3b. Native `sex / sex`
-
-Once 3a lands, `sex / sex` is (sex as rat) / rat → rat → sex. Same
-regularity check applies and errors the same way. Write it as a
-small helper that chains `__tuppu_rat_to_sex` and `rat_div`.
+Remaining: `%` could follow the same shape but is arguably less
+useful for sex; defer unless needed.
 
 ### 3c. Escape-analysis rat-fallback
 
@@ -282,12 +289,17 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 365 passing.
-3. `git log --oneline -6` — timeline: initial import, bundled v0.1
+2. `.venv/bin/pytest` — expect 374 passing.
+3. `git log --oneline -8` — timeline: initial import, bundled v0.1
    features, untrack fun.tpu, sex Phase 1 + ergonomics, sex Phase 2,
-   int→sex + error locations.
+   int→sex + error locations, Phase 3a (rat→sex + native sex*).
 4. Read `SPEC.md` §4.3 for the current sex spec, §14 for non-goals.
-5. **Agreed next task: sex Phase 3.** Start with 3a (`rat → sex`
-   with regularity check, then native `*` built on top of it), then
-   3b (`/`), then 3c (escape analysis — the big compiler-learning
-   chunk). See §3 in this file for the design.
+5. **Agreed next task: sex Phase 3b.** Native `sex / sex` on top of
+   the rat path — same shape as `sex * sex`, chains `__tuppu_rat_to_sex`
+   after `rat_div`. See §3b in this file for the design and the list
+   of files to touch. Then 3c (escape analysis — the big compiler-
+   learning chunk). See §3 in this file for the overall design.
+6. `FUTURE_OPTIMIZATIONS.md` (gitignored) captures a perf discussion
+   from 2026-04-22: shrink SEX from 20 → 16 bytes (option 1: 14 digit
+   slots), `alwaysinline` on hot helpers, SIMD carry in sex_add.
+   Don't forget on the next perf pass.
