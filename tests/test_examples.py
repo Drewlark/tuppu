@@ -82,6 +82,16 @@ EXPECTED: dict[str, dict] = {
             b"ends with '.tpu': false\n"
         ),
     },
+    "linked_list.tpu":       {
+        "exit": 0,
+        "stdout": (
+            b"length: 5\n"
+            b"sum:    15\n"
+            b"items:\n"
+            b"1\n2\n3\n4\n5\n"
+            b"found 3; its successor is 4\n"
+        ),
+    },
     "reciprocal_table.tpu":  {
         "exit": 0,
         "stdout": (

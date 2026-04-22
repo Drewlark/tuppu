@@ -1,0 +1,36 @@
+// Linked list: a singly-linked chain of i64 nodes, all allocated into
+// a tablets-backed arena. Demonstrates recursive structs, tablet
+// handles, auto-release, and mut-tablets pass-through.
+//
+// The stdlib module `stdlib/list.tpu` supplies `int_list_push`,
+// `int_list_len`, `int_list_sum`, `int_list_find`, `int_list_contains`,
+// and `int_list_print` — all in pure Tuppu, no compiler magic.
+
+fn main() -> i32 {
+  // `store` is the tablets that owns every IntNode we push. When
+  // main returns, auto-release frees every chunk — no explicit free.
+  mut store: tablets[16]IntNode
+  mut head: tablet IntNode = lost
+
+  // Push 5, 4, 3, 2, 1 to the front. Each push returns the new head.
+  head = int_list_push(store, head, 5)
+  head = int_list_push(store, head, 4)
+  head = int_list_push(store, head, 3)
+  head = int_list_push(store, head, 2)
+  head = int_list_push(store, head, 1)
+
+  // The list now reads 1 → 2 → 3 → 4 → 5 → lost.
+  println("length: ", int_list_len(head))
+  println("sum:    ", int_list_sum(head))
+  println("items:")
+  int_list_print(head)
+
+  // Search returns a handle to the matching node, or `lost`.
+  step maybe_three: tablet IntNode = int_list_find(head, 3)
+  if maybe_three != lost {
+    println("found 3; its successor is ", maybe_three.next.value)
+  }
+
+  0
+  // `store` auto-releases here — every pushed node's storage is freed.
+}
