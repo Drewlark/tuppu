@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Convenience wrapper — invokes the Tuppu CLI without needing to source
+# the venv. Works from any shell, any cwd.
+set -e
+HERE="$(cd "$(dirname "$0")" && pwd)"
+exec "$HERE/.venv/bin/python" -m tuppu "$@"

@@ -1,0 +1,16 @@
+// Iterative factorial using a while loop and a mut accumulator.
+// main returns fact(5) = 120 as the process exit code.
+
+fn fact(n: i64) -> i64 {
+  mut result = 1
+  mut i = 1
+  while i <= n {
+    result = result * i
+    i = i + 1
+  }
+  result
+}
+
+fn main() -> i32 {
+  fact(5)
+}

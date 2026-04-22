@@ -1,0 +1,31 @@
+// Babylonian-style reciprocal table, computed at COMPILE TIME.
+//
+// The `table recip[...]: rat = reciprocal` declaration tells the Tuppu
+// compiler to evaluate `reciprocal(i)` for each i in 1..10 at build time,
+// and bake the results into the binary as a static array. At runtime,
+// `recip[i]` is a direct array load — no function call, no arithmetic.
+//
+// Babylonian mathematicians maintained tables exactly like this: precompute
+// once, look up forever.
+//
+// Compile with:  python -m tuppu run examples/reciprocal_table.tpu
+
+fn reciprocal(n: i64) -> rat {
+  rat(1, n)
+}
+
+table recip[1..10]: rat = reciprocal
+
+fn main() -> i32 {
+  print("The Babylonian reciprocal table (1 through 9):")
+  println("")
+  mut i: i64 = 1
+  while i < 10 {
+    print("  1/")
+    print(i)
+    print(" = ")
+    println(recip[i])
+    i = i + 1
+  }
+  0
+}

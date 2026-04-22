@@ -1,0 +1,10 @@
+// Recursive factorial.
+// main returns fact(5) = 120 as the process exit code.
+
+fn fact(n: i64) -> i64 {
+  if n < 2 { 1 } else { n * fact(n - 1) }
+}
+
+fn main() -> i32 {
+  fact(5)
+}

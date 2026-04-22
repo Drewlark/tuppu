@@ -1,0 +1,6 @@
+// The obligatory greeting.
+
+fn main() -> i32 {
+  println("Hello, Tuppu!")
+  0
+}

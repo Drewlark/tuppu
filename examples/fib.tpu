@@ -1,0 +1,10 @@
+// Fibonacci sequence, recursive definition.
+// main returns fib(10) = 55 as the process exit code.
+
+fn fib(n: i64) -> i64 {
+  if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+fn main() -> i32 {
+  fib(10)
+}

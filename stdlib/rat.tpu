@@ -1,0 +1,41 @@
+// stdlib/rat.tpu — utilities for the rat type.
+//
+// Tuppu's rat is always stored reduced with positive denominator, so these
+// functions don't worry about normalization — the rat() constructor and
+// arithmetic ops do that for us.
+
+fn rat_neg(x: rat) -> rat {
+  rat(-x.num, x.den)
+}
+
+fn rat_abs(x: rat) -> rat {
+  if x.num < 0 { rat(-x.num, x.den) } else { x }
+}
+
+fn rat_reciprocal(x: rat) -> rat {
+  rat(x.den, x.num)   // rat() constructor will flip signs if num was negative
+}
+
+fn rat_min(a: rat, b: rat) -> rat {
+  if a < b { a } else { b }
+}
+
+fn rat_max(a: rat, b: rat) -> rat {
+  if a > b { a } else { b }
+}
+
+fn rat_mean(a: rat, b: rat) -> rat {
+  (a + b) / rat(2, 1)
+}
+
+fn rat_half(x: rat) -> rat {
+  x / rat(2, 1)
+}
+
+fn rat_is_zero(x: rat) -> bool {
+  x.num == 0
+}
+
+fn rat_is_negative(x: rat) -> bool {
+  x.num < 0
+}

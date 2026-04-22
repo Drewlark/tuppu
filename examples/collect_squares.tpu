@@ -1,0 +1,37 @@
+// Collect the first N squares into a tablets container, then print them.
+// Each tablet holds 4 elements, so 10 squares allocate 3 linked chunks.
+//
+// Demonstrates the full tablets lifecycle: zero-init via `mut x: T` (no
+// initializer), repeated `.push(v)` with automatic chunk allocation, O(i/N)
+// indexed access, and explicit `release` of the whole chain.
+
+fn squares_up_to(n: i64) -> i64 {
+  mut xs: tablets[4]i64
+  mut i: i64 = 0
+  while i < n {
+    xs.push(i * i)
+    i = i + 1
+  }
+
+  mut total: i64 = 0
+  mut k: i64 = 0
+  while k < xs.len {
+    print("  ")
+    print(k)
+    print("^2 = ")
+    println(xs[k])
+    total = total + xs[k]
+    k = k + 1
+  }
+  release xs
+  total
+}
+
+fn main() -> i32 {
+  print("squares 0..9:")
+  println("")
+  step total: i64 = squares_up_to(10)
+  print("sum = ")
+  println(total)
+  0
+}

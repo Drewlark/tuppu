@@ -1,0 +1,231 @@
+"""Tuppu AST node definitions.
+
+Every node carries optional `line` and `col` attributes (source position)
+as keyword-only fields. They default to 0 and are excluded from equality,
+so existing structural comparisons in tests still work as before.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Union
+
+
+# Shared position field spec. kw_only=True keeps positional constructors
+# working. compare=False keeps equality based on semantic content only.
+def _pos():
+    return field(default=0, kw_only=True, compare=False, repr=False)
+
+
+# --- types in source ---------------------------------------------------------
+
+@dataclass
+class TypeName:
+    name: str                        # "i64", "bool", "rat", or a struct name
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class TypeArray:
+    size: int
+    element: "TypeExpr"
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class TypeTablets:
+    size: int
+    element: "TypeExpr"
+    line: int = _pos()
+    col:  int = _pos()
+
+TypeExpr = Union[TypeName, TypeArray, TypeTablets]
+
+
+# --- expressions -------------------------------------------------------------
+
+@dataclass
+class IntLit:
+    value: int
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class SexLit:
+    """A sexagesimal literal — preserves the original Babylonian digit
+    sequence and pre-reduces it to rat form for arithmetic.
+
+    int_digits: pre-radix digits (may be empty for literals like `;30`,
+        though the current lexer requires a leading digit).
+    frac_digits: post-radix digits, or None for pure integer-form sex
+        (e.g. `1 30` with no `;`).
+    num / den: the exact rational this literal denotes (lexer pre-reduces).
+    """
+    int_digits: list[int]
+    frac_digits: list[int] | None
+    num: int
+    den: int
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class StringLit:
+    value: bytes
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class BoolLit:
+    value: bool
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class Ident:
+    name: str
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class Unary:
+    op: str                          # "-" or "!"
+    operand: "Expr"
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class Binary:
+    op: str
+    lhs: "Expr"
+    rhs: "Expr"
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class Call:
+    callee: "Expr"
+    args: list["Expr"]
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class Index:
+    target: "Expr"
+    index: "Expr"
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class Field:
+    target: "Expr"
+    name: str
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class Cast:
+    value: "Expr"
+    type: TypeExpr
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class Block:
+    stmts: list["Stmt"] = field(default_factory=list)
+    tail: "Expr | None" = None
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class IfExpr:
+    cond: "Expr"
+    then: Block
+    else_: "Block | IfExpr | None" = None
+    line: int = _pos()
+    col:  int = _pos()
+
+Expr = Union[
+    IntLit, SexLit, StringLit, BoolLit, Ident,
+    Unary, Binary, Call, Index, Field, Cast,
+    Block, IfExpr,
+]
+
+
+# --- statements --------------------------------------------------------------
+
+@dataclass
+class Binding:
+    is_mut: bool
+    name: str
+    type_ann: TypeExpr | None
+    init: Expr | None
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class Assign:
+    name: str
+    value: Expr
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class While:
+    cond: Expr
+    body: Block
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class YieldStmt:
+    value: Expr | None
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class ReleaseStmt:
+    name: str
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class ExprStmt:
+    expr: Expr
+    line: int = _pos()
+    col:  int = _pos()
+
+Stmt = Union[Binding, Assign, While, YieldStmt, ReleaseStmt, ExprStmt]
+
+
+# --- top level --------------------------------------------------------------
+
+@dataclass
+class Param:
+    name: str
+    type: TypeExpr
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class FnDecl:
+    name: str
+    params: list[Param]
+    return_type: TypeExpr | None
+    body: Block
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class TableDecl:
+    name: str
+    lo: Expr
+    hi: Expr
+    element_type: TypeExpr
+    generator: Expr
+    line: int = _pos()
+    col:  int = _pos()
+
+Decl = Union[FnDecl, TableDecl]
+
+@dataclass
+class Program:
+    decls: list[Decl] = field(default_factory=list)

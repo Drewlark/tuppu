@@ -1,0 +1,38 @@
+// stdlib/sex.tpu — sexagesimal-flavored time and angle conversions.
+//
+// A Tuppu program's "killer app" is exact arithmetic on base-60 fractions.
+// These helpers cover the common conversions that f64 cannot do exactly:
+// time (hours/minutes/seconds) and angles (degrees/arcminutes/arcseconds).
+
+// Convert H:M:S to a rat in hours, exactly.
+//   hms_to_rat_hours(3, 30, 0)  -> rat(7, 2)     // 3.5 hours
+//   hms_to_rat_hours(0, 20, 0)  -> rat(1, 3)     // 20 minutes = 1/3 hour
+fn hms_to_rat_hours(h: i64, m: i64, s: i64) -> rat {
+  rat(h * 3600 + m * 60 + s, 3600)
+}
+
+// Convert rat hours to integer seconds (truncates toward zero).
+//   rat_hours_to_seconds(rat(7, 2)) -> 12600
+fn rat_hours_to_seconds(h: rat) -> i64 {
+  (h * rat(3600, 1)) as i64
+}
+
+// Convert rat hours to integer minutes.
+fn rat_hours_to_minutes(h: rat) -> i64 {
+  (h * rat(60, 1)) as i64
+}
+
+// Convert D°M'S" to a rat in degrees, exactly (D/M/S in the same sense
+// as H/M/S but applied to angles).
+fn dms_to_rat_degrees(d: i64, m: i64, s: i64) -> rat {
+  rat(d * 3600 + m * 60 + s, 3600)
+}
+
+// A full turn is 360°, so:
+fn degrees_to_rat_turns(d: rat) -> rat {
+  d / rat(360, 1)
+}
+
+fn rat_turns_to_degrees(t: rat) -> rat {
+  t * rat(360, 1)
+}

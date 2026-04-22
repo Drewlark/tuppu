@@ -1,0 +1,16 @@
+// Discriminant of a quadratic, using single-assignment `step` bindings.
+// Each `step` is a named SSA value in the emitted IR — no alloca or load/store.
+//
+// disc(a, b, c) = b*b - 4ac
+// main returns disc(1, 5, 6) = 25 - 24 = 1.
+
+fn disc(a: i64, b: i64, c: i64) -> i64 {
+  step bsq = b * b
+  step ac = a * c
+  step four_ac = 4 * ac
+  bsq - four_ac
+}
+
+fn main() -> i32 {
+  disc(1, 5, 6)
+}

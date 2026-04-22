@@ -1,0 +1,15 @@
+// FizzBuzz for 1..15.
+// Exercises: while, mut, % operator, if/else-if chains, and
+// overloaded println on both strings and integers.
+
+fn main() -> i32 {
+  mut i = 1
+  while i <= 15 {
+    if i % 15 == 0 { println("FizzBuzz") }
+    else if i % 3 == 0 { println("Fizz") }
+    else if i % 5 == 0 { println("Buzz") }
+    else { println(i) }
+    i = i + 1
+  }
+  0
+}

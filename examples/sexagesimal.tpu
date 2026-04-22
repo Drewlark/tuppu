@@ -1,0 +1,44 @@
+// Sexagesimal (sex/dish) literals + exact rational arithmetic.
+// Compile with: `python -m tuppu run examples/sexagesimal.tpu`
+//
+// A sex literal is a Babylonian digit sequence. `;` marks the radix,
+// spaces separate digits. `1;30` = 3/2. `0;20` = exactly 1/3.
+// `1;24 51 10` is YBC 7289's √2 approximation.
+//
+// Sex silently coerces to rat at typed binding sites. Stdlib helpers
+// (rat_mean, rat_abs, etc.) live in stdlib/rat.tpu and stdlib/sex.tpu.
+
+fn main() -> i32 {
+  step a: rat = 1;30     // 3/2
+  step b: rat = 0;20     // 1/3 — exact, not 0.3333...
+
+  print("1;30 = ")
+  println(a)
+  print("0;20 = ")
+  println(b)
+
+  print("sum = ")
+  println(a + b)         // 11/6
+  print("mean = ")
+  println(rat_mean(a, b))  // ((3/2) + (1/3)) / 2 = 11/12
+
+  print("|-5/3| = ")
+  println(rat_abs(rat(-5, 3)))           // 5/3
+  print("reciprocal of 0;20 = ")
+  println(rat_reciprocal(b))             // 3
+
+  // Sexagesimal time: 3h30m0s and its round-trip to seconds.
+  step t: rat = hms_to_rat_hours(3, 30, 0)
+  print("3:30:00 in rat hours = ")
+  println(t)                             // 7/2
+  print("back to seconds = ")
+  println(rat_hours_to_seconds(t))       // 12600
+
+  // YBC 7289: the Babylonian √2 approximation carved on a clay tablet
+  // c. 1800 BCE. Writing `1;24 51 10` preserves the scribe's digits.
+  step sqrt2_approx: rat = 1;24 51 10
+  print("YBC 7289 sqrt2 approx = ")
+  println(sqrt2_approx)                  // 30547/21600
+
+  0
+}
