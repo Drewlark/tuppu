@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **374 tests passing.**
+- **383 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -35,7 +35,7 @@ What works:
   `tablets[N]T`, and comptime tables. Loop variable is step-bound.
 - **Mixed-width int comparisons** promote to the wider type (matches
   `if`-arm unification).
-- **Sex/dish Phases 1–3a:**
+- **Sex/dish Phases 1–3b:**
   - Distinct 20-byte runtime `{ [16]u8 digits, u8 radix, u8 count,
     i8 sign, u8 pad }`.
   - Native Babylonian printing (`1;30`, `1;24 51 10`, `-1;30`).
@@ -49,9 +49,12 @@ What works:
   - Native `sex + sex` and `sex - sex` via `__tuppu_sex_add` — radix
     alignment, 16-lane SIMD digit add, scalar carry, mixed-sign via
     magnitude compare + borrow-propagating subtract. No warning.
-  - Native `sex * sex` via the rat path: `(a as rat) * (b as rat)` →
-    `__tuppu_rat_to_sex`. Result stays dish-typed. Traps at runtime
-    on non-regular products.
+  - Native `sex * sex` and `sex / sex` via the rat path:
+    `(a as rat) op (b as rat)` → `__tuppu_rat_to_sex`. Result stays
+    dish-typed. Traps at runtime on non-regular results or div-zero.
+  - Mixed `sex op int` (any of +, -, *, /) promotes the int to sex
+    via `__tuppu_int_to_sex` — digit form preserved end-to-end, no
+    warning.
   - Unary `-` is a free sign-byte flip.
 - `step` (SSA) and `mut` (alloca) bindings; assignment.
 - `if`/`else` as expression; `while`; `yield` early-return.
@@ -64,12 +67,14 @@ What works:
 - Compile-time warning infrastructure.
 
 What doesn't yet:
-- Native sex `/`, `%` (still warn-lower to rat — **Phase 3b**).
+- Native sex `%` (still warn-lower to rat; rat % itself isn't
+  implemented either, so this errors at codegen).
+- Mixed sex × rat ops (still warn, stay as rat — deliberate, since
+  the rat operand has abandoned digit form).
 - Escape-analysis rat-fallback for rat-only sex values (**Phase 3c**
   — the big compiler-learning chunk).
+- `--strict-dish` flag (see FUTURE_OPTIMIZATIONS.md for the sketch).
 - Imports / namespacing.
-- Mixed-type sex × int / sex × rat operations (today you have to cast
-  to a common type first). Pre-existing, not Phase-3a-specific.
 - Dynamic string ops (concat, slice, case) — needs tablets-backed
   alloc plus a lifetime/ownership story.
 - `read_line() -> str` — same blocker.
@@ -97,13 +102,17 @@ What doesn't yet:
    regularity check, `rat → sex` coercion, native `sex * sex` via the
    rat path. See `tests/test_sex.py::test_rat_to_sex_*` and
    `::test_sex_mul_*`.
-7. **Sex/dish Phase 3b** — **Next.** Native `sex / sex` on top of
-   the rat path (chains `__tuppu_rat_to_sex` after `rat_div`, same
-   regularity-trap semantics).
-8. **Sex/dish Phase 3c** — escape-analysis pass for rat-fallback
-   specialization. See §3 below.
-9. **Imports** — cleanup; pay when stdlib grows enough to need
-   namespaces. After sex Phase 3.
+7. ~~**Sex/dish Phase 3b**~~ — **done.** Native `sex / sex` via the
+   same rat-path dispatch. Mixed `sex op int` (+/-/*//) also works
+   now — int promotes to sex via `__tuppu_int_to_sex`. See
+   `::test_sex_div_*` and `::test_sex_mixed_int_*`.
+8. **Language QoL pass** — **Next.** User wants to improve language
+   ergonomics broadly. Possibly break `codegen.py` into multiple
+   files (it's ~2400 lines now).
+9. **Sex/dish Phase 3c** — escape-analysis pass for rat-fallback
+   specialization. Unblocks the future `--strict-dish` flag idea.
+10. **Imports** — cleanup; pay when stdlib grows enough to need
+    namespaces.
 
 ## 1. Future: `impress` reinterpret cast
 
@@ -161,6 +170,8 @@ When the driver sees `use stdlib/rat` it resolves the file:
 
 ## 3. Sex Phase 3 — /, escape analysis (3a done)
 
+### Status: 3a + 3b done, 3c remaining
+
 ### 3a. ~~Native `sex * sex`~~ — **done.**
 
 Shipped via the rat path: `sex * sex → (a as rat) * (b as rat) →
@@ -178,25 +189,15 @@ exceed i64·i64 precision by staying in digit space — but that needs
 sign handling, alignment via radix-shift, and a non-SIMD carry chain
 across partial sums. Not on the roadmap unless someone asks.
 
-### 3b. Native `sex / sex` — **Next.**
+### 3b. ~~Native `sex / sex`~~ — **done.**
 
-With 3a's helpers in hand, `sex / sex` is a thin wrapper:
-`(a as rat) / (b as rat) → __tuppu_rat_to_sex`. Trap semantics are
-identical to `*`. Estimated ~10 lines in codegen.py and a couple of
-typecheck tweaks (dispatch `/` through the same DISH-returning branch
-as `*`). One subtlety: `rat_div` already traps on divisor-zero via
-`_get_rat_reduce`, so we don't need a separate zero check.
+Shipped alongside 3a's `*` path — same dispatch, same trap semantics
+(rat_reduce traps on divisor-zero, rat_to_sex traps on non-regular
+quotient). Bonus: mixed `sex op int` now works for +, -, *, / via a
+typecheck promotion to DISH + codegen call to `__tuppu_int_to_sex`.
 
-**Files to touch:**
-- `src/tuppu/typecheck.py` — extend the `op in ("+", "-", "*")`
-  sex-stays-sex branch to include `"/"`.
-- `src/tuppu/codegen.py` — mirror the sex*sex dispatch for `/`.
-- `tests/test_sex.py` — add div happy-path (0;30 / 0;20 = 1;30),
-  non-regular divisor trap, div by zero trap, integer form
-  (1 0 / 3 = 20).
-
-Remaining: `%` could follow the same shape but is arguably less
-useful for sex; defer unless needed.
+Remaining: `%` could follow the same shape but requires implementing
+`rat %` first; deferred unless needed.
 
 ### 3c. Escape-analysis rat-fallback
 
@@ -289,17 +290,18 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 374 passing.
+2. `.venv/bin/pytest` — expect 383 passing.
 3. `git log --oneline -8` — timeline: initial import, bundled v0.1
    features, untrack fun.tpu, sex Phase 1 + ergonomics, sex Phase 2,
-   int→sex + error locations, Phase 3a (rat→sex + native sex*).
+   int→sex + error locations, Phase 3a (rat→sex + native sex*),
+   Phase 3b (native sex/ + mixed sex+int).
 4. Read `SPEC.md` §4.3 for the current sex spec, §14 for non-goals.
-5. **Agreed next task: sex Phase 3b.** Native `sex / sex` on top of
-   the rat path — same shape as `sex * sex`, chains `__tuppu_rat_to_sex`
-   after `rat_div`. See §3b in this file for the design and the list
-   of files to touch. Then 3c (escape analysis — the big compiler-
-   learning chunk). See §3 in this file for the overall design.
-6. `FUTURE_OPTIMIZATIONS.md` (gitignored) captures a perf discussion
-   from 2026-04-22: shrink SEX from 20 → 16 bytes (option 1: 14 digit
-   slots), `alwaysinline` on hot helpers, SIMD carry in sex_add.
-   Don't forget on the next perf pass.
+5. **Agreed next task: language QoL pass.** Sex arithmetic is
+   structurally complete through +, -, *, / (native digit-form) and
+   sex+int mixed. User wants to step back and improve general
+   ergonomics next — possibly splitting `codegen.py` (~2400 lines).
+   Phase 3c (escape analysis) is queued behind QoL.
+6. `FUTURE_OPTIMIZATIONS.md` (gitignored) captures design sketches
+   for a `--strict-dish` flag, the SEX 20→16 byte shrink, SIMD carry
+   in sex_add, and other perf/language ideas. Don't forget on the
+   next perf pass.

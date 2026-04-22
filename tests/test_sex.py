@@ -603,17 +603,139 @@ def test_sex_mul_round_trip_via_int(tmp_path):
     assert out == b"56\n"
 
 
+def test_sex_div_native(tmp_path):
+    # 3/2 / 1/3 = 9/2 = 4;30 in digit form; no warning.
+    src = (
+        "fn main() -> i32 {\n"
+        "  println(1;30 / 0;20)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"4;30\n"
+
+
+def test_sex_div_integer_form(tmp_path):
+    # 1 0 (= 60) / 3 (sex) = 20, single-digit integer form.
+    src = (
+        "fn main() -> i32 {\n"
+        "  step a: sex = 60\n"
+        "  step b: sex = 3\n"
+        "  println(a / b)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"20\n"
+
+
+def test_sex_div_by_zero_traps(tmp_path):
+    # Division by zero traps via rat_reduce's existing zero check,
+    # before the rat→sex regularity check gets a chance to fire.
+    src = (
+        "fn main() -> i32 {\n"
+        "  step a = 1;30\n"
+        "  step b: sex = 0\n"
+        "  println(a / b)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, _, _ = run(src, tmp_path)
+    assert rc != 0
+
+
+def test_sex_div_non_regular_quotient_traps(tmp_path):
+    # 1 / 7 — quotient has non-regular denominator (7). Runtime trap.
+    src = (
+        "fn main() -> i32 {\n"
+        "  step a: sex = 1\n"
+        "  step b: sex = 7\n"
+        "  println(a / b)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, _, _ = run(src, tmp_path)
+    assert rc != 0
+
+
+def test_sex_mixed_int_add(tmp_path):
+    # 0;30 + 1 = 1;30 — int promotes to sex, stays digit-form.
+    src = (
+        "fn main() -> i32 {\n"
+        "  println(0;30 + 1)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"1;30\n"
+
+
+def test_sex_mixed_int_mul(tmp_path):
+    # 0;30 * 4 = 2 in digit form.
+    src = (
+        "fn main() -> i32 {\n"
+        "  println(0;30 * 4)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"2\n"
+
+
+def test_sex_mixed_int_on_left(tmp_path):
+    # 2 * 0;30 = 1 — int on the left side too.
+    src = (
+        "fn main() -> i32 {\n"
+        "  println(2 * 0;30)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"1\n"
+
+
+def test_sex_mixed_int_div(tmp_path):
+    # 1;30 / 3 = 0;30.
+    src = (
+        "fn main() -> i32 {\n"
+        "  println(1;30 / 3)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"0;30\n"
+
+
+def test_sex_div_no_warning(tmp_path):
+    # sex/sex now stays in digit form — no Phase 2-style warning.
+    src_path = tmp_path / "div.tpu"
+    src_path.write_text(
+        "fn main() -> i32 {\n"
+        "  println(1;30 / 0;20)\n"
+        "  0\n"
+        "}\n"
+    )
+    r = subprocess.run(
+        [sys.executable, "-m", "tuppu", "run", str(src_path), "--no-stdlib"],
+        capture_output=True,
+    )
+    assert r.returncode == 0
+    assert b"warning" not in r.stderr.lower()
+
+
 # --- CLI emits warnings to stderr ------------------------------------------
 
-def test_cli_sex_div_warning(tmp_path):
-    # Division still lowers to rat and warns. (Multiplication now stays
-    # in digit form — see test_sex_mul_native.)
+def test_cli_sex_mixed_with_rat_warns(tmp_path):
+    # Mixed sex-and-rat arithmetic lowers both operands to rat and
+    # produces a rat result — still warns, to flag that the
+    # Babylonian digit form has been abandoned. (Pure sex+sex, -, *, /
+    # stays in digit form with no warning.)
     src = tmp_path / "warn.tpu"
     src.write_text(
         "fn main() -> i32 {\n"
         "  step a = 1;30\n"
-        "  step b = 0;20\n"
-        "  println(a / b)\n"
+        "  step b: rat = rat(1, 3)\n"
+        "  println(a + b)\n"
         "  0\n"
         "}\n"
     )
@@ -622,5 +744,5 @@ def test_cli_sex_div_warning(tmp_path):
         capture_output=True,
     )
     assert r.returncode == 0
-    assert r.stdout == b"9/2\n"
+    assert r.stdout == b"11/6\n"
     assert b"warning" in r.stderr.lower()

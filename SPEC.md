@@ -270,17 +270,21 @@ the coercion point.
   SIMD-adds the 16-lane digit buffer, then propagates base-60 carries.
   Mixed signs dispatch to a magnitude compare + borrow-propagating
   subtract.
-- `sex * sex` (Phase 3a) computes the product through rat internally
-  (`(a as rat) * (b as rat)`), then reconstructs the sex digit form
-  via `__tuppu_rat_to_sex` — which runs the regularity check and
-  traps on non-terminating products. No compile-time warning; result
-  type is sex. The integer ≤ 14-digit headroom covers any i64 · i64
-  product (max 22 digits reduced is well within our 16-digit buffer
-  because regular denominators cap frac digits sharply).
-- `sex / sex` and `sex % sex` still lower to rat and emit a compile-
-  time warning for the moment — native digit-form division is Phase
-  3b. Escape-analysis rat-fallback specialization (where rat-only sex
-  values skip the digit-form runtime entirely) is Phase 3c.
+- `sex * sex` and `sex / sex` (Phase 3a/3b) compute the result
+  through rat internally (`(a as rat) op (b as rat)`), then
+  reconstruct the sex digit form via `__tuppu_rat_to_sex` — which
+  runs the regularity check and traps on non-terminating results.
+  No compile-time warning; result type is sex. Divide-by-zero traps
+  via `__tuppu_rat_reduce`'s existing zero check.
+- **Mixed `sex op int`** (any of +, -, *, /) promotes the int to sex
+  via `__tuppu_int_to_sex` (lossless base-60 decomposition), then
+  dispatches through the native digit-form path. No warning.
+- `sex % sex` still lower to rat (and errors at codegen, since rat%
+  isn't implemented either). Mixed `sex op rat` warns and stays as
+  rat — the rat operand has abandoned digit form, so the warning
+  signals that. Escape-analysis rat-fallback specialization (where
+  rat-only sex values skip the digit-form runtime entirely) is
+  Phase 3c.
 
 Field access: `x.num` and `x.den` are still allowed on sex (the
 compiler reduces to rat first), but prefer an explicit `as rat`

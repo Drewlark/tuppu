@@ -534,17 +534,24 @@ class Checker:
                 return RAT
             # Native sex arithmetic:
             #   +, -    stay in digit form end-to-end (Phase 2).
-            #   *       goes through rat internally but the result is
+            #   *, /    go through rat internally but the result is
             #           reconstructed as sex via __tuppu_rat_to_sex,
             #           which traps at runtime on non-regular results
-            #           (Phase 3a). Result type is sex — no warning.
+            #           (Phase 3a/3b). Result type is sex — no warning.
+            # Mixed sex + int promotes the int to sex (int→sex is a
+            # lossless decomposition into digits, so digit form is
+            # preserved end-to-end).
+            dish_or_int = lambda t: isinstance(t, TyDish) or _is_int(t)
             if (
-                isinstance(lhs, TyDish) and isinstance(rhs, TyDish)
-                and op in ("+", "-", "*")
+                isinstance(lhs, TyDish) and dish_or_int(rhs)
+                and op in ("+", "-", "*", "/")
+            ) or (
+                _is_int(lhs) and isinstance(rhs, TyDish)
+                and op in ("+", "-", "*", "/")
             ):
                 return DISH
             # Remaining sex-involved ops still lower to rat and warn —
-            # native division and mod come in a later phase.
+            # `%` is deferred.
             if dish_involved and _coerces_to(lhs, RAT) and _coerces_to(rhs, RAT):
                 self._warn(
                     f"sex {op} lowers to rat (native digit-form "

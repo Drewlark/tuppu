@@ -813,6 +813,15 @@ class Codegen:
             raise CodegenError(f"operand of binary {e.op} has no value")
         op = e.op
 
+        # Mixed sex + int: promote the int to sex (int→sex is a
+        # lossless base-60 decomposition) so the native digit-form path
+        # handles the op.
+        if op in ("+", "-", "*", "/"):
+            if lhs.type == SEX and isinstance(rhs.type, ir.IntType):
+                rhs = self._coerce(rhs, SEX)
+            elif isinstance(lhs.type, ir.IntType) and rhs.type == SEX:
+                lhs = self._coerce(lhs, SEX)
+
         # Native Babylonian arithmetic for sex+sex / sex-sex. The type
         # checker has already declared the result type as sex here, so no
         # warning is emitted; digit form is preserved through the op.
@@ -824,14 +833,15 @@ class Codegen:
                 rhs = self.builder.insert_value(rhs, flipped, SEX_IDX_SIGN)
             return self.builder.call(self._get_sex_add(), [lhs, rhs])
 
-        # Native sex*sex: lower through rat, then reconstruct a sex
-        # via the regularity-checked helper. Traps at runtime if the
-        # product isn't a regular number (den not 2^a·3^b·5^c).
-        if lhs.type == SEX and rhs.type == SEX and op == "*":
+        # Native sex*sex and sex/sex: lower through rat, then reconstruct
+        # a sex via the regularity-checked helper. Traps at runtime if
+        # the result isn't a regular number (den not 2^a·3^b·5^c), or
+        # on divide-by-zero (rat_reduce's existing trap).
+        if lhs.type == SEX and rhs.type == SEX and op in ("*", "/"):
             lhs_rat = self._coerce(lhs, RAT)
             rhs_rat = self._coerce(rhs, RAT)
-            product = self._gen_rat_binary("*", lhs_rat, rhs_rat)
-            return self.builder.call(self._get_rat_to_sex(), [product])
+            result_rat = self._gen_rat_binary(op, lhs_rat, rhs_rat)
+            return self.builder.call(self._get_rat_to_sex(), [result_rat])
 
         # Everything else still lowers sex to rat — the warning path the
         # type checker announced. Phase 3 will replace more of this with
