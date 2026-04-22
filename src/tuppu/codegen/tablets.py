@@ -106,9 +106,11 @@ class TabletsMixin:
             return existing
 
         suffix = f"{elem_ty}_{N}".replace(" ", "_").replace("{", "").replace("}", "")
-        node_ty = ir.global_context.get_identified_type(f"Node_{suffix}")
-        # Identified types live in the global context and persist across
-        # Codegen instances. Only set the body the first time we see one.
+        # Use this Codegen's module context so identified types live
+        # with the module (not leak across compilations via the global
+        # LLVM context). Tablets helpers are cached in self._tablets_types
+        # so we only set the body once per (N, elem_ty).
+        node_ty = self.module.context.get_identified_type(f"Node_{suffix}")
         if node_ty.is_opaque:
             node_ty.set_body(
                 ir.ArrayType(elem_ty, N),   # items

@@ -34,7 +34,10 @@ from .tablets import TabletsMixin
 
 class Codegen(SexMixin, RatMixin, TabletsMixin):
     def __init__(self) -> None:
-        self.module = ir.Module(name="tuppu")
+        # Fresh LLVM context per Codegen so identified struct types
+        # (e.g. user `seal Point { ... }`) don't leak across test runs
+        # or multiple compilations in the same process.
+        self.module = ir.Module(name="tuppu", context=ir.Context())
         self.module.triple = llvm.get_default_triple()
         self.builder: ir.IRBuilder | None = None
         self.functions: dict[str, ir.Function] = {}
@@ -235,35 +238,68 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         )
 
     def _register_structs(self, decls: list[A.StructDecl]) -> None:
-        """Build LLVM types for user-defined structs. Dependencies resolved
-        via topological sort so a struct can reference another regardless of
-        source order. Direct cycles are rejected — v0.1 has no recursive
-        structs (which would require identified-type heap indirection)."""
-        by_name = {d.name: d for d in decls}
-        state: dict[str, int] = {}  # 0=unseen, 1=in-progress, 2=done
+        """Build LLVM types for user-defined structs.
 
-        def visit(d: A.StructDecl) -> None:
-            st = state.get(d.name, 0)
-            if st == 2:
-                return
-            if st == 1:
-                raise CodegenError(
-                    f"struct {d.name!r}: recursive structs are not supported"
-                )
-            state[d.name] = 1
+        Two phases enable recursive and mutually-recursive types: first
+        we declare every struct name as an empty identified LLVM type;
+        then we resolve field types now that every name is visible, so
+        `*Node` inside `Node`'s body resolves cleanly.
+
+        A struct that contains itself without pointer indirection would
+        have infinite size — we detect that explicitly and point the
+        user at `*T` as the fix."""
+        by_name = {d.name: d for d in decls}
+
+        # Phase A: declare empty identified types for every struct.
+        for d in decls:
+            if d.name in self._struct_types:
+                raise CodegenError(f"duplicate struct {d.name!r}")
+            ident_ty = self.module.context.get_identified_type(d.name)
+            self._struct_types[d.name] = ident_ty
+
+        # Phase B: detect direct cycles (cycle in the "inline contains"
+        # graph). A field whose type is another struct by value — or an
+        # array of that struct — contributes a direct edge. A field
+        # that's a pointer or tablets does NOT (the recursion goes
+        # through heap indirection, so size is finite).
+        direct_deps: dict[str, set[str]] = {}
+        for d in decls:
+            deps: set[str] = set()
             for _fname, ftype in d.fields:
                 if isinstance(ftype, A.TypeName) and ftype.name in by_name:
-                    visit(by_name[ftype.name])
-            state[d.name] = 2
+                    deps.add(ftype.name)
+                elif isinstance(ftype, A.TypeArray):
+                    elem = ftype.element
+                    if isinstance(elem, A.TypeName) and elem.name in by_name:
+                        deps.add(elem.name)
+            direct_deps[d.name] = deps
+
+        color: dict[str, int] = {name: 0 for name in by_name}  # 0 white, 1 gray, 2 black
+        def visit(name: str) -> None:
+            if color[name] == 2:
+                return
+            if color[name] == 1:
+                raise CodegenError(
+                    f"struct {name!r} is recursively contained without "
+                    f"pointer indirection — use `*{name}` for a "
+                    f"recursive reference"
+                )
+            color[name] = 1
+            for dep in direct_deps[name]:
+                visit(dep)
+            color[name] = 2
+
+        for name in by_name:
+            visit(name)
+
+        # Phase C: resolve all bodies. Identified types support
+        # `set_body(*field_tys)` exactly once.
+        for d in decls:
             field_tys = [self._lower_type(ftype) for _, ftype in d.fields]
-            struct_ty = ir.LiteralStructType(field_tys)
-            self._struct_types[d.name] = struct_ty
+            self._struct_types[d.name].set_body(*field_tys)
             self._struct_fields[d.name] = list(
                 zip([n for n, _ in d.fields], field_tys)
             )
-
-        for d in decls:
-            visit(d)
 
     def _struct_name_for(self, llvm_ty: ir.Type) -> str | None:
         for name, ty in self._struct_types.items():
