@@ -254,23 +254,37 @@ class Parser:
         if t.kind is Tok.FOR:    return self.parse_for()
         if t.kind is Tok.YIELD:  return self.parse_yield()
         if t.kind is Tok.RELEASE: return self.parse_release()
-        if t.kind is Tok.IDENT and self.peek(1).kind is Tok.EQ:
-            return self.parse_assign()
-        if t.kind is Tok.IDENT and self.peek(1).kind in _AUG_ASSIGN_OPS:
-            return self.parse_aug_assign()
-        # Otherwise: expression statement.
+        # Parse an expression; if it's followed by `=` or an aug-op,
+        # treat it as an assignment whose target is that expression.
+        # Otherwise it's just an expression statement.
         expr = self.parse_expr()
+        peek = self.peek()
+        if peek.kind is Tok.EQ:
+            self.advance()
+            value = self.parse_expr()
+            self._check_lvalue(expr, t)
+            return _at(t, A.Assign(target=expr, value=value))
+        if peek.kind in _AUG_ASSIGN_OPS:
+            op_tok = self.advance()
+            op = _AUG_ASSIGN_OPS[op_tok.kind]
+            rhs = self.parse_expr()
+            self._check_lvalue(expr, t)
+            combined = _at(op_tok, A.Binary(op=op, lhs=expr, rhs=rhs))
+            return _at(t, A.Assign(target=expr, value=combined))
         return _at(t, A.ExprStmt(expr=expr))
 
-    def parse_aug_assign(self) -> A.Assign:
-        """Desugar `x += e` to `x = x + e`, same for -=, *=, /=, %=."""
-        name_tok = self.eat(Tok.IDENT)
-        op_tok = self.advance()
-        op = _AUG_ASSIGN_OPS[op_tok.kind]
-        rhs = self.parse_expr()
-        lhs_ref = _at(name_tok, A.Ident(name=name_tok.value))
-        combined = _at(op_tok, A.Binary(op=op, lhs=lhs_ref, rhs=rhs))
-        return _at(name_tok, A.Assign(name=name_tok.value, value=combined))
+    def _check_lvalue(self, expr: A.Expr, start) -> None:
+        """An assignment target must be an Ident or a `.`-chain of Field
+        accesses rooted at an Ident. No calls, indexes, or literals."""
+        node = expr
+        while isinstance(node, A.Field):
+            node = node.target
+        if not isinstance(node, A.Ident):
+            raise ParseError(
+                "assignment target must be a variable or a `.`-chain "
+                "of fields rooted at a variable",
+                start.line, start.col,
+            )
 
     def parse_binding(self, *, is_mut: bool) -> A.Binding:
         tok = self.advance()  # step or mut
@@ -301,13 +315,6 @@ class Parser:
         start = self.eat(Tok.RELEASE)
         name = self.eat(Tok.IDENT, "name after release").value
         return _at(start, A.ReleaseStmt(name=name))
-
-    def parse_assign(self) -> A.Assign:
-        start = self.peek()
-        name = self.eat(Tok.IDENT).value
-        self.eat(Tok.EQ)
-        value = self.parse_expr()
-        return _at(start, A.Assign(name=name, value=value))
 
     def parse_while(self) -> A.While:
         start = self.eat(Tok.WHILE)

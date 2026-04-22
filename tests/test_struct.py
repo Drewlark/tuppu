@@ -328,3 +328,107 @@ def test_while_with_ident_body_still_parses(tmp_path):
     )
     _, out, _ = run(src, tmp_path)
     assert out == b"3\n"
+
+
+# --- field mutation (p.x = 5) ----------------------------------------------
+
+def test_field_assign_simple(tmp_path):
+    src = (
+        "seal Point { x: i64, y: i64 }\n"
+        "fn main() -> i32 {\n"
+        "  mut p: Point = Point { x: 3, y: 4 }\n"
+        "  p.x = 99\n"
+        "  println(p.x)\n"
+        "  println(p.y)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"99\n4\n"
+
+
+def test_field_assign_aug_op(tmp_path):
+    # `p.x += 1` also parses — aug-assign works on field targets now.
+    src = (
+        "seal Point { x: i64, y: i64 }\n"
+        "fn main() -> i32 {\n"
+        "  mut p: Point = Point { x: 10, y: 0 }\n"
+        "  p.x += 5\n"
+        "  p.x *= 2\n"
+        "  println(p.x)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"30\n"
+
+
+def test_field_assign_nested(tmp_path):
+    # Multi-level field chains GEP through each struct level.
+    src = (
+        "seal Point { x: i64, y: i64 }\n"
+        "seal Line { a: Point, b: Point }\n"
+        "fn main() -> i32 {\n"
+        "  mut l: Line = Line { a: Point { x: 0, y: 0 }, b: Point { x: 0, y: 0 } }\n"
+        "  l.a.x = 7\n"
+        "  l.b.y += 100\n"
+        "  println(l.a.x)\n"
+        "  println(l.b.y)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"7\n100\n"
+
+
+def test_field_assign_preserves_other_fields(tmp_path):
+    # Mutating one field must not disturb siblings — confirms we GEP
+    # into the alloca rather than reassigning the whole struct.
+    src = (
+        "seal P { x: i64, y: i64, z: i64 }\n"
+        "fn main() -> i32 {\n"
+        "  mut p: P = P { x: 1, y: 2, z: 3 }\n"
+        "  p.y = 99\n"
+        "  println(p.x)\n"
+        "  println(p.y)\n"
+        "  println(p.z)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"1\n99\n3\n"
+
+
+def test_field_assign_to_step_rejected():
+    # step-bound structs are immutable; field assign is a codegen error.
+    with pytest.raises(CompileError, match="step binding"):
+        compile_to_ir(
+            "seal P { x: i64 }\n"
+            "fn main() -> i32 {\n"
+            "  step p = P { x: 1 }\n"
+            "  p.x = 2\n"
+            "  0\n"
+            "}\n"
+        )
+
+
+def test_field_assign_type_mismatch():
+    with pytest.raises(CompileError, match="assignment target has type i64"):
+        compile_to_ir(
+            "seal P { x: i64 }\n"
+            "fn main() -> i32 {\n"
+            "  mut p: P = P { x: 0 }\n"
+            "  p.x = rat(1, 2)\n"
+            "  0\n"
+            "}\n"
+        )
+
+
+def test_non_lvalue_assignment_rejected():
+    with pytest.raises(CompileError, match="assignment target"):
+        compile_to_ir(
+            "fn main() -> i32 {\n"
+            "  3 + 4 = 5\n"
+            "  0\n"
+            "}\n"
+        )

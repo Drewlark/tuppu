@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **383 tests passing.**
+- **390 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -21,7 +21,9 @@ What works:
 - **User-defined structs / seals** — nominal, by-value, forward refs
   resolved via topological sort. `struct`/`seal` are interchangeable
   keywords. Construction `Point { x: 3, y: 4 }`, field access `p.x`,
-  structs as params/returns and in `mut` bindings.
+  structs as params/returns and in `mut` bindings. **Field mutation**
+  `p.x = 5` and chained `l.a.x = 5` via GEP into the alloca; `p.x +=
+  1` aug-assign also works. `step`-bound structs remain immutable.
 - **Variable-length strings** — `str` is a built-in seal
   `{ ptr: *u8, len: i64 }`, auto-injected. `fn f(s: str)`, `s.len`,
   `s[i]`, `print(s)`/`println(s)` via `write(2)` (embedded NULs
@@ -80,7 +82,6 @@ What doesn't yet:
 - `read_line() -> str` — same blocker.
 - Expression-level pointer ops (`*p`, `&x`, `p + 1`) — intentional.
 - Recursive structs (would need identified types + heap indirection).
-- Struct field mutation (`p.x = 5`) — only whole-struct reassign.
 - `impress` reinterpret cast (documented in SPEC §14).
 - f64 (lexed but no codegen; `sex as f64` errors cleanly).
 - Closures / first-class functions.

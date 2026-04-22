@@ -106,7 +106,7 @@ def test_assignment_type_mismatch():
         "  x = rat(3, 2)\n"              # rat -> i64 isn't an auto-coercion
         "  0\n"
         "}\n",
-        "assignment to 'x': value has type rat",
+        "assignment target has type i64, value has type rat",
     )
 
 

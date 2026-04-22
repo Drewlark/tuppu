@@ -387,15 +387,15 @@ class Checker:
             self._bind(b.name, init_ty, b.line, b.col)
 
     def _tc_assign(self, a: A.Assign) -> None:
-        var_ty = self._lookup(a.name, a.line, a.col)
-        # We can't easily check is_mut here without tracking it — codegen
-        # will catch that.  Track it via a side table instead:
-        # (for simplicity, we trust codegen to catch "assign to step".)
+        # Type-check the target as an expression: this both validates
+        # the chain (field names must exist on their struct types) and
+        # yields the expected type of the RHS.
+        target_ty = self._tc_expr(a.target)
         value_ty = self._tc_expr(a.value)
-        if not _coerces_to(value_ty, var_ty):
+        if not _coerces_to(value_ty, target_ty):
             raise CheckError(
-                f"assignment to {a.name!r}: value has type {value_ty}, "
-                f"variable is {var_ty}",
+                f"assignment target has type {target_ty}, "
+                f"value has type {value_ty}",
                 a.line, a.col,
             )
 

@@ -631,14 +631,52 @@ class Codegen:
             self._bind(b.name, Variable(is_mut=False, ir_ref=init_val, value_ty=init_val.type))
 
     def _gen_assign(self, a: A.Assign) -> None:
-        var = self._lookup(a.name)
-        if not var.is_mut:
-            raise CodegenError(f"cannot assign to step binding {a.name!r}")
         assert self.builder is not None
+        # Resolve the target to (slot_ptr, value_type). For an Ident target
+        # the slot is the alloca itself. For a Field chain, we GEP from
+        # the root alloca down to the innermost field.
+        slot_ptr, slot_ty = self._lvalue_slot(a.target)
         value = self._gen_expr(a.value)
         if value is None:
-            raise CodegenError(f"assignment RHS for {a.name!r} has no value")
-        self.builder.store(self._coerce(value, var.value_ty), var.ir_ref)
+            raise CodegenError("assignment RHS has no value")
+        self.builder.store(self._coerce(value, slot_ty), slot_ptr)
+
+    def _lvalue_slot(self, target: A.Expr) -> tuple[ir.Value, ir.Type]:
+        """Resolve an lvalue to (pointer-to-slot, value-type-at-slot).
+
+        Root must be a mut-bound Ident. Each Field step GEPs one level
+        deeper through the appropriate user-struct LLVM type."""
+        assert self.builder is not None
+        if isinstance(target, A.Ident):
+            var = self._lookup(target.name)
+            if not var.is_mut:
+                raise CodegenError(
+                    f"cannot assign to step binding {target.name!r}"
+                )
+            return var.ir_ref, var.value_ty
+        if isinstance(target, A.Field):
+            parent_ptr, parent_ty = self._lvalue_slot(target.target)
+            struct_name = self._struct_name_for(parent_ty)
+            if struct_name is None:
+                raise CodegenError(
+                    f"field assignment: {parent_ty} is not a user struct"
+                )
+            fields = self._struct_fields[struct_name]
+            for i, (fname, fty) in enumerate(fields):
+                if fname == target.name:
+                    field_ptr = self.builder.gep(
+                        parent_ptr,
+                        [ir.Constant(I32, 0), ir.Constant(I32, i)],
+                        inbounds=True,
+                    )
+                    return field_ptr, fty
+            raise CodegenError(
+                f"struct {struct_name!r} has no field {target.name!r}"
+            )
+        raise CodegenError(
+            f"assignment target must be a variable or field chain, "
+            f"got {type(target).__name__}"
+        )
 
     # --- expressions ---
 

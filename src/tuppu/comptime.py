@@ -327,7 +327,11 @@ class Comptime:
             env.define(s.name, self.eval_expr(s.init, env))
             return
         if isinstance(s, A.Assign):
-            env.assign(s.name, self.eval_expr(s.value, env))
+            if not isinstance(s.target, A.Ident):
+                raise ComptimeError(
+                    "comptime: field assignment not supported"
+                )
+            env.assign(s.target.name, self.eval_expr(s.value, env))
             return
         if isinstance(s, A.While):
             limit, count = 10_000_000, 0

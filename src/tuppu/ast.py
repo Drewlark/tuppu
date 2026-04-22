@@ -193,7 +193,10 @@ class Binding:
 
 @dataclass
 class Assign:
-    name: str
+    # target is an lvalue expression — either `Ident` (plain variable
+    # assign) or a `Field` chain rooted at an Ident (`p.x = 5`,
+    # `line.a.x = 5`). The parser enforces this shape.
+    target: Expr
     value: Expr
     line: int = _pos()
     col:  int = _pos()
