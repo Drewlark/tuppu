@@ -145,9 +145,9 @@ def test_sex_to_i64_truncates_fractional(tmp_path):
 
 # --- arithmetic warning ----------------------------------------------------
 
-def test_sex_plus_sex_warns_and_lowers_to_rat(tmp_path, capsys):
-    # The warning is emitted by the compiler (parent process), not the
-    # compiled binary — so we capture via capsys, not subprocess stderr.
+def test_sex_plus_sex_native(tmp_path, capsys):
+    # Phase 2: sex + sex stays in digit form, no warning, no rat lowering.
+    # 1;30 + 0;20 = 1;50.
     src = (
         "fn main() -> i32 {\n"
         "  step a = 1;30\n"
@@ -158,9 +158,8 @@ def test_sex_plus_sex_warns_and_lowers_to_rat(tmp_path, capsys):
     )
     _, out, _ = run(src, tmp_path)
     captured = capsys.readouterr()
-    assert out == b"11/6\n"
-    assert "warning" in captured.err.lower()
-    assert "sex arithmetic" in captured.err.lower() or "native sex" in captured.err.lower()
+    assert out == b"1;50\n"
+    assert "warning" not in captured.err.lower()
 
 
 def test_sex_comparison_does_not_warn(tmp_path, capsys):
@@ -288,6 +287,97 @@ def test_sex_and_rat_print_differently(tmp_path):
     assert out == b"1;30\n3/2\n"
 
 
+def test_native_sex_add_same_radix(tmp_path, capsys):
+    # 1;30 + 0;20 = 1;50 (base 60: 30 + 20 = 50, no carry)
+    src = 'fn main() -> i32 { println((1;30) + (0;20))\n 0 }'
+    _, out, _ = run(src, tmp_path)
+    captured = capsys.readouterr()
+    assert out == b"1;50\n"
+    assert "warning" not in captured.err.lower()
+
+
+def test_native_sex_add_with_carry(tmp_path):
+    # 0;40 + 0;30 = 1;10 (fractional 40 + 30 = 70, carry one into int place)
+    src = 'fn main() -> i32 { println((0;40) + (0;30))\n 0 }'
+    _, out, _ = run(src, tmp_path)
+    assert out == b"1;10\n"
+
+
+def test_native_sex_add_cascading_carry(tmp_path):
+    # 0;59 + 0;1 = 1;0 — carry ripples to new integer position.
+    src = 'fn main() -> i32 { println((0;59) + (0;1))\n 0 }'
+    _, out, _ = run(src, tmp_path)
+    assert out == b"1;0\n"
+
+
+def test_native_sex_add_misaligned_radix(tmp_path):
+    # 1 30 (integer form, =90) + 0;20 (fractional, =1/3) = 1 30;20
+    # In base 60: int part [1, 30], frac part [20] → `1 30;20`.
+    src = 'fn main() -> i32 { println((1 30) + (0;20))\n 0 }'
+    _, out, _ = run(src, tmp_path)
+    assert out == b"1 30;20\n"
+
+
+def test_native_sex_add_misaligned_frac(tmp_path):
+    # 1;30 + 0;0 20 — pad a with trailing zero in frac: 1;30 0 + 0;0 20 = 1;30 20
+    src = 'fn main() -> i32 { println((1;30) + (0;0 20))\n 0 }'
+    _, out, _ = run(src, tmp_path)
+    assert out == b"1;30 20\n"
+
+
+def test_native_sex_sub_same_sign(tmp_path, capsys):
+    # 1;30 - 0;20 = 1;10 (base 60: 30 - 20 = 10)
+    src = 'fn main() -> i32 { println((1;30) - (0;20))\n 0 }'
+    _, out, _ = run(src, tmp_path)
+    captured = capsys.readouterr()
+    assert out == b"1;10\n"
+    assert "warning" not in captured.err.lower()
+
+
+def test_native_sex_sub_with_borrow(tmp_path):
+    # 1;10 - 0;20 → fractional 10 < 20, borrow 1 from int.
+    # 1;10 - 0;20 = 0;50
+    src = 'fn main() -> i32 { println((1;10) - (0;20))\n 0 }'
+    _, out, _ = run(src, tmp_path)
+    assert out == b"0;50\n"
+
+
+def test_native_sex_add_mixed_sign_via_sub(tmp_path):
+    # a + (-b) where b > a → result has b's sign (negative).
+    # 1;30 + (-(1;40)) → magnitudes 1;30 vs 1;40, second larger, result = -(0;10)
+    src = 'fn main() -> i32 { println((1;30) + -(1;40))\n 0 }'
+    _, out, _ = run(src, tmp_path)
+    assert out == b"-0;10\n"
+
+
+def test_native_sex_sub_underflow_flips_sign(tmp_path):
+    # 0;20 - 0;30 = -0;10
+    src = 'fn main() -> i32 { println((0;20) - (0;30))\n 0 }'
+    _, out, _ = run(src, tmp_path)
+    assert out == b"-0;10\n"
+
+
+def test_native_sex_ybc_plus_small(tmp_path):
+    # 1;24 51 10 + 0;0 0 5 = 1;24 51 15 (add at smallest place)
+    src = 'fn main() -> i32 { println((1;24 51 10) + (0;0 0 5))\n 0 }'
+    _, out, _ = run(src, tmp_path)
+    assert out == b"1;24 51 15\n"
+
+
+def test_native_sex_round_trip_via_rat(tmp_path):
+    # Verify that a + b digit-form matches what rat arithmetic would give.
+    src = (
+        "fn main() -> i32 {\n"
+        "  step s = (1;30) + (0;20)\n"
+        "  println(s)\n"           # 1;50
+        "  println(s as rat)\n"    # 11/6
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"1;50\n11/6\n"
+
+
 def test_sex_as_function_param_and_return(tmp_path):
     # Passing sex through a function preserves the digit sequence.
     src = (
@@ -303,13 +393,15 @@ def test_sex_as_function_param_and_return(tmp_path):
 
 # --- CLI emits warnings to stderr ------------------------------------------
 
-def test_cli_sex_arithmetic_warning(tmp_path):
+def test_cli_sex_mul_warning(tmp_path):
+    # Multiplication still lowers to rat and warns until Phase 3 lands
+    # a native digit-form multiply.
     src = tmp_path / "warn.tpu"
     src.write_text(
         "fn main() -> i32 {\n"
         "  step a = 1;30\n"
         "  step b = 0;20\n"
-        "  println(a + b)\n"
+        "  println(a * b)\n"
         "  0\n"
         "}\n"
     )
@@ -318,5 +410,5 @@ def test_cli_sex_arithmetic_warning(tmp_path):
         capture_output=True,
     )
     assert r.returncode == 0
-    assert r.stdout == b"11/6\n"
+    assert r.stdout == b"1/2\n"
     assert b"warning" in r.stderr.lower()

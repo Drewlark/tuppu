@@ -8,8 +8,8 @@ and the initial GitHub push.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **348 tests passing** (277 base + 21 struct + 17 string + 21
-  ergonomics + 7 sex-identity + examples).
+- **359 tests passing** (277 base + 21 struct + 17 string + 21
+  ergonomics + 7 sex-identity + 11 native-sex-arithmetic + examples).
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -70,13 +70,18 @@ What doesn't yet:
    `examples/greeting.tpu` and `tests/test_string.py`. Dynamic
    (allocating) string ops deferred until we wire tablets into a
    dynamic-string story — see §4 below.
-3. **Sex/dish redesign** — **in progress.** Phase 1 shipped: sex has
-   its own digit-form runtime, prints Babylonian, and `as rat` is a
-   real reduction. Phase 2 (native digit arithmetic with SIMD + escape
-   analysis to fall back to rat form when digits are never observed)
-   is the next milestone — see §5 below. **Next.**
+3. **Sex/dish redesign** — **Phase 2 shipped.**
+   - Phase 1: digit-form runtime + Babylonian printing + `sex as rat`
+     as an explicit reduce.
+   - Phase 2: native `sex + sex` and `sex - sex` — radix alignment,
+     16-lane SIMD digit add, scalar carry propagation, mixed-sign
+     handling via magnitude compare + borrow-propagating subtract.
+     No more warning for `+`/`-`. See `__tuppu_sex_add` in codegen.py.
+   - Phase 3 (remaining): native `*`, `/` with regularity checks, and
+     the escape-analysis pass for rat-fallback specialization.
+     See §5 for the design.
 4. **Imports** — cleanup; pay when stdlib grows enough to need
-   namespaces. After sex phase 2.
+   namespaces. After sex phase 3.
 
 ### Future: `impress` reinterpret cast
 
@@ -311,11 +316,10 @@ tight arithmetic loops). Cross-function specialization comes next.
 If starting a fresh session after this compact, do these first:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` to confirm 348 tests still pass.
+2. `.venv/bin/pytest` to confirm 359 tests still pass.
 3. `git log --oneline -5` to see where we are on the timeline.
 4. Read `SPEC.md` §4 for the type grammar and §14 for explicit non-goals.
-5. Agreed next task: **sex phase 2** — native Babylonian digit-form
-   arithmetic (with SIMD for the digit-wise add/sub inner loop) plus
-   an escape-analysis pass that specializes sex values to `{num,den}`
-   when their digit sequence is never observed. See §5 below for
+5. Agreed next task: **sex phase 3** — native digit-form
+   multiplication, division with regularity checks, and the
+   escape-analysis rat-fallback specialization. See §5 below for
    rules. Imports wait until we're actually hurting for namespaces.

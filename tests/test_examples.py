@@ -34,17 +34,23 @@ EXPECTED: dict[str, dict] = {
     "sexagesimal.tpu":       {
         "exit": 0,
         "stdout": (
-            b"1;30 = 3/2\n"
-            b"0;20 = 1/3\n"
-            b"sum = 11/6\n"
+            b"a = 1;30\n"
+            b"b = 0;20\n"
+            b"a + b = 1;50\n"
+            b"0;40 + 0;30 = 1;10\n"
+            b"1 30 + 0;20 = 1 30;20\n"
+            b"1;30 + -(1;40) = -0;10\n"
+            b"(a + b) as rat = 11/6\n"
             b"mean = 11/12\n"
             b"|-5/3| = 5/3\n"
             b"reciprocal of 0;20 = 3/1\n"
             b"3:30:00 in rat hours = 7/2\n"
             b"back to seconds = 12600\n"
-            b"YBC 7289 sqrt2 approx = 30547/21600\n"
+            b"YBC 7289 sqrt2 = 1;24 51 10\n"
+            b"              as rat = 30547/21600\n"
         ),
     },
+
     "collect_squares.tpu":   {
         "exit": 0,
         "stdout": (

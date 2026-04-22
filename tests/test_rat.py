@@ -76,14 +76,21 @@ def test_rat_constructor_zero_den_traps(tmp_path):
 # --- arithmetic ------------------------------------------------------------
 
 def test_rat_add(tmp_path):
-    # 3/2 + 1/3 = 11/6 (LCD = 6; 9 + 2 = 11)
-    _, out = run('fn main() -> i32 { println(1;30 + 0;20)\n 0 }', tmp_path)
+    # 3/2 + 1/3 = 11/6 (LCD = 6; 9 + 2 = 11). Cast to rat because sex+sex
+    # now stays in digit form — we're specifically testing rat arithmetic.
+    _, out = run(
+        'fn main() -> i32 { println((1;30) as rat + (0;20) as rat)\n 0 }',
+        tmp_path,
+    )
     assert out == b"11/6\n"
 
 
 def test_rat_sub(tmp_path):
     # 3/2 - 1/3 = 7/6
-    _, out = run('fn main() -> i32 { println(1;30 - 0;20)\n 0 }', tmp_path)
+    _, out = run(
+        'fn main() -> i32 { println((1;30) as rat - (0;20) as rat)\n 0 }',
+        tmp_path,
+    )
     assert out == b"7/6\n"
 
 

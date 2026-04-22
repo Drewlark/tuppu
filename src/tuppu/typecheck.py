@@ -532,12 +532,19 @@ class Checker:
                 return lhs
             if isinstance(lhs, TyRat) and isinstance(rhs, TyRat):
                 return RAT
-            # Either operand is dish -> coerce both to rat, result rat,
-            # warn so the user remembers to revisit this.
+            # Native sex arithmetic: addition and subtraction stay in
+            # digit form when both operands are sex. Result is sex.
+            if (
+                isinstance(lhs, TyDish) and isinstance(rhs, TyDish)
+                and op in ("+", "-")
+            ):
+                return DISH
+            # Remaining sex-involved ops still lower to rat and warn —
+            # native multiplication and division come in a later phase.
             if dish_involved and _coerces_to(lhs, RAT) and _coerces_to(rhs, RAT):
                 self._warn(
-                    "sex arithmetic lowers to rat (native sex arithmetic "
-                    "not yet implemented)",
+                    f"sex {op} lowers to rat (native digit-form "
+                    f"{op} not yet implemented for this case)",
                     e.line, e.col,
                 )
                 return RAT

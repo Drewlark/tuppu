@@ -95,6 +95,8 @@ class Codegen:
         self._rat_reduce: ir.Function | None = None  # built lazily
         self._sex_to_rat: ir.Function | None = None
         self._sex_print: ir.Function | None = None
+        self._sex_add: ir.Function | None = None
+        self._sex_cmp: ir.Function | None = None
         self._trap: ir.Function | None = None
         # table name -> (global array, length, lo bound, element LLVM type)
         self._tables: dict[str, tuple[ir.GlobalVariable, int, int, ir.Type]] = {}
@@ -784,9 +786,20 @@ class Codegen:
             raise CodegenError(f"operand of binary {e.op} has no value")
         op = e.op
 
-        # Sex operands lower to rat arithmetic for now — this is the
-        # warning path the type checker already announced. Phase 3 will
-        # replace this with native digit-sequence arithmetic.
+        # Native Babylonian arithmetic for sex+sex / sex-sex. The type
+        # checker has already declared the result type as sex here, so no
+        # warning is emitted; digit form is preserved through the op.
+        if lhs.type == SEX and rhs.type == SEX and op in ("+", "-"):
+            if op == "-":
+                # a - b = a + (-b); negation is a sign-byte flip, free.
+                rhs_sign = self.builder.extract_value(rhs, SEX_IDX_SIGN)
+                flipped = self.builder.xor(rhs_sign, ir.Constant(I8, 1))
+                rhs = self.builder.insert_value(rhs, flipped, SEX_IDX_SIGN)
+            return self.builder.call(self._get_sex_add(), [lhs, rhs])
+
+        # Everything else still lowers sex to rat — the warning path the
+        # type checker announced. Phase 3 will replace more of this with
+        # native digit-sequence operations (multiplication, division).
         if lhs.type == SEX:
             lhs = self._coerce(lhs, RAT)
         if rhs.type == SEX:
@@ -1768,6 +1781,342 @@ class Codegen:
         b.ret(result)
 
         self._sex_to_rat = fn
+        return fn
+
+    def _get_sex_add(self) -> ir.Function:
+        """Emit `__tuppu_sex_add(sex, sex) -> sex` — native Babylonian
+        digit-form addition.
+
+        Algorithm:
+        1. Align operands: compute max_int = max(a.radix, b.radix) and
+           max_frac = max(a_frac, b_frac). Write digits into 16-byte
+           buffers right-aligned in the int zone and left-aligned in
+           the frac zone; everything else stays zero.
+        2. On same sign: digit-wise SIMD add, then scalar carry
+           propagation. A final carry extends the int zone by one digit.
+        3. On different sign: lexicographic magnitude compare, then
+           digit-wise sub (borrow propagation) of smaller from larger;
+           the result takes the sign of the larger magnitude.
+        """
+        if self._sex_add is not None:
+            return self._sex_add
+
+        fn = ir.Function(
+            self.module,
+            ir.FunctionType(SEX, [SEX, SEX]),
+            name="__tuppu_sex_add",
+        )
+        fn.args[0].name = "a"
+        fn.args[1].name = "b"
+        a_arg, b_arg = fn.args
+
+        vec16 = ir.VectorType(I8, SEX_MAX_DIGITS)
+        arr16_ty = ir.ArrayType(I8, SEX_MAX_DIGITS)
+        ZERO_I32 = ir.Constant(I32, 0)
+
+        # --- declare every basic block up front for clarity -----------------
+        entry       = fn.append_basic_block("entry")
+        overflow_bb = fn.append_basic_block("overflow")
+        align_start = fn.append_basic_block("align.start")
+        align_a_hdr = fn.append_basic_block("align.a.hdr")
+        align_a_stp = fn.append_basic_block("align.a.step")
+        align_b_hdr = fn.append_basic_block("align.b.hdr")
+        align_b_stp = fn.append_basic_block("align.b.step")
+        signs_check = fn.append_basic_block("signs.check")
+        same_sign   = fn.append_basic_block("same.sign")
+        add_carry   = fn.append_basic_block("add.carry")
+        add_cbody   = fn.append_basic_block("add.carry.body")
+        add_fcarry  = fn.append_basic_block("add.final.carry")
+        add_shift   = fn.append_basic_block("add.shift")
+        add_sbody   = fn.append_basic_block("add.shift.body")
+        add_sfinish = fn.append_basic_block("add.shift.finish")
+        add_nocarry = fn.append_basic_block("add.no.carry")
+        mag_cmp     = fn.append_basic_block("mag.cmp")
+        mag_cbody   = fn.append_basic_block("mag.cmp.body")
+        mag_equal   = fn.append_basic_block("mag.equal")
+        mag_sub     = fn.append_basic_block("mag.sub")
+        mag_sbody   = fn.append_basic_block("mag.sub.body")
+        mag_send    = fn.append_basic_block("mag.sub.end")
+        pack        = fn.append_basic_block("pack")
+
+        b = ir.IRBuilder(entry)
+
+        # --- entry: spill args, zero buffers, compute widths ---------------
+        a_slot = b.alloca(SEX)
+        b_slot = b.alloca(SEX)
+        b.store(a_arg, a_slot)
+        b.store(b_arg, b_slot)
+        a_buf = b.alloca(arr16_ty); a_buf.align = SEX_MAX_DIGITS
+        bbuf  = b.alloca(arr16_ty); bbuf.align  = SEX_MAX_DIGITS
+        out_buf = b.alloca(arr16_ty); out_buf.align = SEX_MAX_DIGITS
+        zero_vec = ir.Constant(vec16, [0] * SEX_MAX_DIGITS)
+        for buf in (a_buf, bbuf, out_buf):
+            st = b.store(zero_vec, b.bitcast(buf, vec16.as_pointer()))
+            st.align = SEX_MAX_DIGITS
+
+        def load_field(slot, idx):
+            return b.load(b.gep(
+                slot, [ZERO_I32, ir.Constant(I32, idx)], inbounds=True,
+            ))
+
+        a_radix = b.zext(load_field(a_slot, SEX_IDX_RADIX), I32)
+        a_count = b.zext(load_field(a_slot, SEX_IDX_COUNT), I32)
+        a_sign  = load_field(a_slot, SEX_IDX_SIGN)
+        b_radix = b.zext(load_field(b_slot, SEX_IDX_RADIX), I32)
+        b_count = b.zext(load_field(b_slot, SEX_IDX_COUNT), I32)
+        b_sign  = load_field(b_slot, SEX_IDX_SIGN)
+        a_frac  = b.sub(a_count, a_radix)
+        b_frac  = b.sub(b_count, b_radix)
+        max_int = b.select(
+            b.icmp_signed(">", a_radix, b_radix), a_radix, b_radix,
+        )
+        max_frac = b.select(
+            b.icmp_signed(">", a_frac, b_frac), a_frac, b_frac,
+        )
+        new_count = b.add(max_int, max_frac)
+        overflow = b.icmp_signed(
+            ">", new_count, ir.Constant(I32, SEX_MAX_DIGITS - 1),
+        )
+        b.cbranch(overflow, overflow_bb, align_start)
+
+        b.position_at_end(overflow_bb)
+        b.call(self._get_trap(), [])
+        b.unreachable()
+
+        # --- align.start: prepare offsets and digit-array pointers ---------
+        b.position_at_end(align_start)
+        a_int_offset = b.sub(max_int, a_radix)
+        b_int_offset = b.sub(max_int, b_radix)
+        a_digits = b.gep(
+            a_slot, [ZERO_I32, ir.Constant(I32, SEX_IDX_DIGITS)], inbounds=True,
+        )
+        b_digits = b.gep(
+            b_slot, [ZERO_I32, ir.Constant(I32, SEX_IDX_DIGITS)], inbounds=True,
+        )
+        # Pre-compute the first iteration value once, in this block, so the
+        # phi-incoming edges below come from dominating instructions.
+        zero_i32 = ZERO_I32
+        b.branch(align_a_hdr)
+
+        # --- align.a: copy a.count digits into a_buf at aligned positions --
+        b.position_at_end(align_a_hdr)
+        j_phi = b.phi(I32, "j")
+        j_phi.add_incoming(zero_i32, align_start)
+        done_a = b.icmp_signed(">=", j_phi, a_count)
+        b.cbranch(done_a, align_b_hdr, align_a_stp)
+
+        b.position_at_end(align_a_stp)
+        src = b.load(b.gep(
+            a_digits, [ZERO_I32, b.sext(j_phi, I64)], inbounds=True,
+        ))
+        is_int = b.icmp_signed("<", j_phi, a_radix)
+        dst_int  = b.add(a_int_offset, j_phi)
+        dst_frac = b.add(max_int, b.sub(j_phi, a_radix))
+        dst_idx  = b.select(is_int, dst_int, dst_frac)
+        b.store(src, b.gep(
+            a_buf, [ZERO_I32, b.sext(dst_idx, I64)], inbounds=True,
+        ))
+        j_next = b.add(j_phi, ir.Constant(I32, 1))
+        j_phi.add_incoming(j_next, align_a_stp)
+        b.branch(align_a_hdr)
+
+        # --- align.b: same structure, into bbuf ----------------------------
+        b.position_at_end(align_b_hdr)
+        k_phi = b.phi(I32, "k")
+        k_phi.add_incoming(zero_i32, align_a_hdr)
+        done_b = b.icmp_signed(">=", k_phi, b_count)
+        b.cbranch(done_b, signs_check, align_b_stp)
+
+        b.position_at_end(align_b_stp)
+        src_b = b.load(b.gep(
+            b_digits, [ZERO_I32, b.sext(k_phi, I64)], inbounds=True,
+        ))
+        is_int_b = b.icmp_signed("<", k_phi, b_radix)
+        dst_int_b  = b.add(b_int_offset, k_phi)
+        dst_frac_b = b.add(max_int, b.sub(k_phi, b_radix))
+        dst_idx_b  = b.select(is_int_b, dst_int_b, dst_frac_b)
+        b.store(src_b, b.gep(
+            bbuf, [ZERO_I32, b.sext(dst_idx_b, I64)], inbounds=True,
+        ))
+        k_next = b.add(k_phi, ir.Constant(I32, 1))
+        k_phi.add_incoming(k_next, align_b_stp)
+        b.branch(align_b_hdr)
+
+        # --- signs_check: dispatch same-sign vs mixed-sign -----------------
+        b.position_at_end(signs_check)
+        # Compute starting-i for the loops we're about to launch, so the
+        # phi nodes can reference already-dominating values.
+        nc_minus_one = b.sub(new_count, ir.Constant(I32, 1))
+        same = b.icmp_signed("==", a_sign, b_sign)
+        b.cbranch(same, same_sign, mag_cmp)
+
+        # --- same_sign: SIMD raw add + scalar carry propagation ------------
+        b.position_at_end(same_sign)
+        a_vec = b.load(b.bitcast(a_buf, vec16.as_pointer()))
+        a_vec.align = SEX_MAX_DIGITS
+        b_vec = b.load(b.bitcast(bbuf, vec16.as_pointer()))
+        b_vec.align = SEX_MAX_DIGITS
+        raw = b.add(a_vec, b_vec)
+        rs = b.store(raw, b.bitcast(out_buf, vec16.as_pointer()))
+        rs.align = SEX_MAX_DIGITS
+        b.branch(add_carry)
+
+        b.position_at_end(add_carry)
+        i_phi = b.phi(I32, "i")
+        carry_phi = b.phi(I8, "carry")
+        i_phi.add_incoming(nc_minus_one, same_sign)
+        carry_phi.add_incoming(ir.Constant(I8, 0), same_sign)
+        cont = b.icmp_signed(">=", i_phi, ZERO_I32)
+        b.cbranch(cont, add_cbody, add_fcarry)
+
+        b.position_at_end(add_cbody)
+        cell_ptr = b.gep(
+            out_buf, [ZERO_I32, b.sext(i_phi, I64)], inbounds=True,
+        )
+        cell = b.load(cell_ptr)
+        combined = b.add(cell, carry_phi)
+        over = b.icmp_signed(">=", combined, ir.Constant(I8, 60))
+        corrected = b.select(over, b.sub(combined, ir.Constant(I8, 60)), combined)
+        next_carry = b.select(over, ir.Constant(I8, 1), ir.Constant(I8, 0))
+        b.store(corrected, cell_ptr)
+        i_phi.add_incoming(b.sub(i_phi, ir.Constant(I32, 1)), add_cbody)
+        carry_phi.add_incoming(next_carry, add_cbody)
+        b.branch(add_carry)
+
+        b.position_at_end(add_fcarry)
+        has_final = b.icmp_signed("!=", carry_phi, ir.Constant(I8, 0))
+        b.cbranch(has_final, add_shift, add_nocarry)
+
+        # Shift out_buf right by one, then write 1 at position 0.
+        b.position_at_end(add_shift)
+        b.branch(add_sbody)
+
+        b.position_at_end(add_sbody)
+        s_phi = b.phi(I32, "s")
+        s_phi.add_incoming(nc_minus_one, add_shift)
+        s_cont = b.icmp_signed(">=", s_phi, ZERO_I32)
+        shift_do = fn.append_basic_block("add.shift.do")
+        b.cbranch(s_cont, shift_do, add_sfinish)
+
+        b.position_at_end(shift_do)
+        s_i64 = b.sext(s_phi, I64)
+        src_cell = b.load(b.gep(out_buf, [ZERO_I32, s_i64], inbounds=True))
+        s_plus_i64 = b.sext(b.add(s_phi, ir.Constant(I32, 1)), I64)
+        b.store(src_cell, b.gep(out_buf, [ZERO_I32, s_plus_i64], inbounds=True))
+        s_phi.add_incoming(b.sub(s_phi, ir.Constant(I32, 1)), shift_do)
+        b.branch(add_sbody)
+
+        b.position_at_end(add_sfinish)
+        b.store(
+            ir.Constant(I8, 1),
+            b.gep(out_buf, [ZERO_I32, ir.Constant(I64, 0)], inbounds=True),
+        )
+        shifted_count = b.add(new_count, ir.Constant(I32, 1))
+        shifted_radix = b.add(max_int, ir.Constant(I32, 1))
+        b.branch(pack)
+
+        b.position_at_end(add_nocarry)
+        b.branch(pack)
+
+        # --- mag_cmp: MSB-first lexicographic magnitude compare ------------
+        b.position_at_end(mag_cmp)
+        # For the subtract loop below we also need nc_minus_one here; it's
+        # already defined in signs_check which dominates mag_cmp.
+        b.branch(mag_cbody)   # enter via header for simpler phi wiring
+
+        b.position_at_end(mag_cbody)
+        m_phi = b.phi(I32, "m")
+        m_phi.add_incoming(ZERO_I32, mag_cmp)
+        m_done = b.icmp_signed(">=", m_phi, new_count)
+        mag_cload = fn.append_basic_block("mag.cmp.load")
+        b.cbranch(m_done, mag_equal, mag_cload)
+
+        b.position_at_end(mag_cload)
+        m_i64 = b.sext(m_phi, I64)
+        av = b.load(b.gep(a_buf, [ZERO_I32, m_i64], inbounds=True))
+        bv = b.load(b.gep(bbuf,  [ZERO_I32, m_i64], inbounds=True))
+        ne = b.icmp_signed("!=", av, bv)
+        m_next = b.add(m_phi, ir.Constant(I32, 1))
+        m_phi.add_incoming(m_next, mag_cload)
+        a_larger_here = b.icmp_signed(">", av, bv)
+        b.cbranch(ne, mag_sub, mag_cbody)
+
+        # `a_larger_here` is only defined in mag_cload; phi it at mag_sub.
+        b.position_at_end(mag_sub)
+        a_larger = b.phi(I1, "a.larger")
+        a_larger.add_incoming(a_larger_here, mag_cload)
+        b.branch(mag_sbody)
+
+        b.position_at_end(mag_sbody)
+        sub_i = b.phi(I32, "sub.i")
+        borrow_phi = b.phi(I8, "borrow")
+        sub_i.add_incoming(nc_minus_one, mag_sub)
+        borrow_phi.add_incoming(ir.Constant(I8, 0), mag_sub)
+        sub_cont = b.icmp_signed(">=", sub_i, ZERO_I32)
+        sub_do = fn.append_basic_block("mag.sub.do")
+        b.cbranch(sub_cont, sub_do, mag_send)
+
+        b.position_at_end(sub_do)
+        si64 = b.sext(sub_i, I64)
+        a_cell = b.load(b.gep(a_buf, [ZERO_I32, si64], inbounds=True))
+        b_cell = b.load(b.gep(bbuf,  [ZERO_I32, si64], inbounds=True))
+        minuend    = b.select(a_larger, a_cell, b_cell)
+        subtrahend = b.select(a_larger, b_cell, a_cell)
+        diff = b.sub(
+            b.sub(b.sext(minuend, I16), b.sext(subtrahend, I16)),
+            b.sext(borrow_phi, I16),
+        )
+        neg = b.icmp_signed("<", diff, ir.Constant(I16, 0))
+        bumped = b.select(neg, b.add(diff, ir.Constant(I16, 60)), diff)
+        new_borrow = b.select(neg, ir.Constant(I8, 1), ir.Constant(I8, 0))
+        b.store(b.trunc(bumped, I8),
+                b.gep(out_buf, [ZERO_I32, si64], inbounds=True))
+        sub_i.add_incoming(b.sub(sub_i, ir.Constant(I32, 1)), sub_do)
+        borrow_phi.add_incoming(new_borrow, sub_do)
+        b.branch(mag_sbody)
+
+        b.position_at_end(mag_send)
+        mixed_sign_val = b.select(a_larger, a_sign, b_sign)
+        b.branch(pack)
+
+        # --- mag_equal: zero result --------------------------------------
+        b.position_at_end(mag_equal)
+        ze = b.store(zero_vec, b.bitcast(out_buf, vec16.as_pointer()))
+        ze.align = SEX_MAX_DIGITS
+        b.branch(pack)
+
+        # --- pack: phi result metadata, assemble struct ------------------
+        b.position_at_end(pack)
+        sign_phi  = b.phi(I8,  "final.sign")
+        count_phi = b.phi(I32, "final.count")
+        radix_phi = b.phi(I32, "final.radix")
+        # add_nocarry: same sign, no overflow
+        sign_phi.add_incoming(a_sign, add_nocarry)
+        count_phi.add_incoming(new_count, add_nocarry)
+        radix_phi.add_incoming(max_int, add_nocarry)
+        # add_sfinish: same sign, overflow extended one digit
+        sign_phi.add_incoming(a_sign, add_sfinish)
+        count_phi.add_incoming(shifted_count, add_sfinish)
+        radix_phi.add_incoming(shifted_radix, add_sfinish)
+        # mag_send: mixed sign, sign of larger
+        sign_phi.add_incoming(mixed_sign_val, mag_send)
+        count_phi.add_incoming(new_count, mag_send)
+        radix_phi.add_incoming(max_int, mag_send)
+        # mag_equal: magnitudes equal, result is zero
+        sign_phi.add_incoming(ir.Constant(I8, 0), mag_equal)
+        count_phi.add_incoming(new_count, mag_equal)
+        radix_phi.add_incoming(max_int, mag_equal)
+
+        final_digits = b.load(out_buf)
+        result: ir.Value = ir.Constant(SEX, ir.Undefined)
+        result = b.insert_value(result, final_digits, SEX_IDX_DIGITS)
+        result = b.insert_value(result, b.trunc(radix_phi, I8), SEX_IDX_RADIX)
+        result = b.insert_value(result, b.trunc(count_phi, I8), SEX_IDX_COUNT)
+        result = b.insert_value(result, sign_phi, SEX_IDX_SIGN)
+        result = b.insert_value(result, ir.Constant(I8, 0), 4)
+        b.ret(result)
+
+        self._sex_add = fn
         return fn
 
     def _get_rat_reduce(self) -> ir.Function:

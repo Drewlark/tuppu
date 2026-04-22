@@ -260,10 +260,18 @@ sex  as f64    // deferred: "f64 not yet supported"
 
 Sex values coerce silently to `rat` at typed binding sites
 (`step x: rat = 1;30` works) — the conversion happens implicitly at
-the coercion point. Arithmetic on sex still lowers to rat and emits
-a warning for the moment; native digit-form arithmetic (with base-60
-carries, radix alignment, regularity checks, and a SIMD-friendly digit
-buffer) is planned as Phase 3 of the sex redesign.
+the coercion point.
+
+**Native digit-form arithmetic** (Phase 2):
+
+- `sex + sex` and `sex - sex` stay in digit form. No warning, no rat
+  lowering. The runtime helper aligns radix points, SIMD-adds the
+  16-lane digit buffer, then propagates base-60 carries. Mixed signs
+  dispatch to a magnitude compare + borrow-propagating subtract.
+- Remaining ops (`*`, `/`, `%`) still lower to rat and emit a
+  compile-time warning for the moment — native digit-form
+  multiplication, division with regularity checks, and escape-analysis
+  rat-fallback specialization are planned for Phase 3.
 
 Field access: `x.num` and `x.den` are still allowed on sex (the
 compiler reduces to rat first), but prefer an explicit `as rat`
