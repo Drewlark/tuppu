@@ -7,3 +7,8 @@ dist/
 *.egg-info/
 *.o
 *.ll
+
+# Personal scratch files — experiment freely without polluting history.
+fun.tpu
+scratch.tpu
+scratch/
