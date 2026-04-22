@@ -428,14 +428,27 @@ class Parser:
         raise ParseError(f"not an infix operator: {op_tok.kind.name}", op_tok.line, op_tok.col)
 
     def parse_if(self) -> A.IfExpr:
-        start = self.eat(Tok.IF)
+        # Accept either `if` or `elif` as the starter — elif is just
+        # `else if` without the brace layer. Produces the same AST
+        # (nested IfExpr in else_).
+        start = self.peek()
+        if start.kind not in (Tok.IF, Tok.ELIF):
+            raise ParseError(
+                f"expected `if` or `elif`, got {start.kind.name}",
+                start.line, start.col,
+            )
+        self.advance()
         cond = self.parse_expr()
         then = self.parse_block()
         else_: A.Block | A.IfExpr | None = None
         save = self.pos
         self.skip_newlines()
-        if self.check(Tok.ELSE):
+        if self.check(Tok.ELIF):
+            else_ = self.parse_if()
+        elif self.check(Tok.ELSE):
             self.advance()
+            # Still accept the two-token `else if` form for backward
+            # compatibility — harmless and common muscle memory.
             if self.check(Tok.IF):
                 else_ = self.parse_if()
             else:

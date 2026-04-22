@@ -234,3 +234,64 @@ def test_error_carries_line_and_col():
     )
     assert err.line >= 2
     assert err.col >= 1
+
+
+# --- did-you-mean suggestions ---------------------------------------------
+
+def test_suggest_typo_undefined_name():
+    err = fails(
+        "fn main() -> i32 {\n"
+        "  step velocity = 10\n"
+        "  println(veocity)\n"
+        "  0\n"
+        "}\n",
+        r"undefined name 'veocity' \(did you mean 'velocity'\?\)",
+    )
+    assert err.line == 3
+
+
+def test_suggest_typo_unknown_function():
+    fails(
+        "fn compute(n: i64) -> i64 { n * 2 }\n"
+        "fn main() -> i32 {\n"
+        "  println(comute(5))\n"
+        "  0\n"
+        "}\n",
+        r"unknown function 'comute' \(did you mean 'compute'\?\)",
+    )
+
+
+def test_suggest_typo_struct_field():
+    fails(
+        "seal Point { x: i64, y: i64 }\n"
+        "fn main() -> i32 {\n"
+        "  step p = Point { x: 1, y: 2 }\n"
+        "  println(p.ex)\n"
+        "  0\n"
+        "}\n",
+        r"has no field 'ex' \(did you mean 'x'\?\)",
+    )
+
+
+def test_suggest_typo_unknown_struct():
+    fails(
+        "seal Tablet { id: i64 }\n"
+        "fn main() -> i32 {\n"
+        "  step t = Tablt { id: 1 }\n"
+        "  0\n"
+        "}\n",
+        r"unknown struct 'Tablt' \(did you mean 'Tablet'\?\)",
+    )
+
+
+def test_no_suggestion_when_nothing_close():
+    # Completely unrelated name — we should NOT hallucinate a suggestion.
+    err = fails(
+        "fn main() -> i32 {\n"
+        "  step velocity = 10\n"
+        "  println(xyzzy)\n"
+        "  0\n"
+        "}\n",
+        r"undefined name 'xyzzy'",
+    )
+    assert "did you mean" not in str(err)

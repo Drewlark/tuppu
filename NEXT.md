@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **390 tests passing.**
+- **398 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -33,6 +33,10 @@ What works:
 - **Char literals** `'a'`, `'\n'`, etc. — type `u8`.
 - **Multi-arg `print`/`println`** — `println("x=", x, " y=", y)`.
 - **Augmented assignment** `+= -= *= /= %=` (parser-desugared).
+- **`elif` keyword** for chained conditionals — sugar over
+  `else if`, both forms still parse.
+- **Did-you-mean suggestions** on undefined name, unknown function,
+  unknown struct, and unknown struct-field errors.
 - **`for name in iter { ... }`** — works over `str` (u8 bytes),
   `tablets[N]T`, and comptime tables. Loop variable is step-bound.
 - **Mixed-width int comparisons** promote to the wider type (matches

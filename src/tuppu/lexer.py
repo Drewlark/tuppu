@@ -33,6 +33,7 @@ class Tok(Enum):
     MUT = auto()
     VAR = auto()
     IF = auto()
+    ELIF = auto()
     ELSE = auto()
     WHILE = auto()
     FOR = auto()
@@ -92,6 +93,7 @@ KEYWORDS: dict[str, Tok] = {
     "mut": Tok.MUT,
     "var": Tok.VAR,
     "if": Tok.IF,
+    "elif": Tok.ELIF,
     "else": Tok.ELSE,
     "while": Tok.WHILE,
     "for": Tok.FOR,

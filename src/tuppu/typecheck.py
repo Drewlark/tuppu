@@ -17,10 +17,22 @@ Coercion rules (match existing codegen behavior):
 """
 from __future__ import annotations
 
+import difflib
 from dataclasses import dataclass
+from typing import Iterable
 
 from . import ast as A
 from .errors import CompileError, CompileWarning
+
+
+def _suggest(name: str, candidates: Iterable[str]) -> str:
+    """Return a ' (did you mean 'x'?)' suffix if a single close match
+    exists, otherwise an empty string. Tunes cutoff/n to avoid noisy
+    suggestions — we only speak up when confident."""
+    matches = difflib.get_close_matches(name, list(candidates), n=1, cutoff=0.6)
+    if not matches:
+        return ""
+    return f" (did you mean {matches[0]!r}?)"
 
 
 class CheckError(CompileError):
@@ -348,8 +360,19 @@ class Checker:
         for scope in reversed(self.scopes):
             if name in scope:
                 return scope[name]
+        # Gather everything nameable in this program so the suggestion
+        # can point to a function / struct / table if the user typo'd
+        # across categories, not just a local.
+        candidates: set[str] = set()
+        for scope in self.scopes:
+            candidates.update(scope)
+        candidates.update(self.fns)
+        candidates.update(self.structs)
+        candidates.update(self.tables)
         raise CheckError(
-            f"in fn {self.current_fn!r}: undefined name {name!r}", line, col,
+            f"in fn {self.current_fn!r}: undefined name {name!r}"
+            f"{_suggest(name, candidates)}",
+            line, col,
         )
 
     # --- statements -------------------------------------------------
@@ -638,7 +661,8 @@ class Checker:
         fn = self.fns.get(name)
         if fn is None:
             raise CheckError(
-                f"in fn {self.current_fn!r}: unknown function {name!r}",
+                f"in fn {self.current_fn!r}: unknown function {name!r}"
+                f"{_suggest(name, self.fns)}",
                 e.line, e.col,
             )
         if len(e.args) != len(fn.params):
@@ -702,11 +726,14 @@ class Checker:
                 e.line, e.col,
             )
         if isinstance(target_ty, TyStruct):
-            for fname, fty in self.struct_fields[target_ty.name]:
+            fields = self.struct_fields[target_ty.name]
+            for fname, fty in fields:
                 if fname == e.name:
                     return fty
+            field_names = [n for n, _ in fields]
             raise CheckError(
-                f"struct {target_ty.name!r} has no field {e.name!r}",
+                f"struct {target_ty.name!r} has no field {e.name!r}"
+                f"{_suggest(e.name, field_names)}",
                 e.line, e.col,
             )
         raise CheckError(
@@ -717,7 +744,9 @@ class Checker:
     def _tc_struct_lit(self, e: A.StructLit) -> Ty:
         if e.name not in self.structs:
             raise CheckError(
-                f"unknown struct {e.name!r}", e.line, e.col,
+                f"unknown struct {e.name!r}"
+                f"{_suggest(e.name, self.structs)}",
+                e.line, e.col,
             )
         declared = self.struct_fields[e.name]
         declared_map = {n: t for n, t in declared}
@@ -725,7 +754,8 @@ class Checker:
         for fname, fexpr in e.fields:
             if fname not in declared_map:
                 raise CheckError(
-                    f"struct {e.name!r}: unknown field {fname!r}",
+                    f"struct {e.name!r}: unknown field {fname!r}"
+                    f"{_suggest(fname, declared_map)}",
                     e.line, e.col,
                 )
             if fname in seen:

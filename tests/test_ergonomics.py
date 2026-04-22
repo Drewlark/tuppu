@@ -301,3 +301,57 @@ def test_idiomatic_vowel_count(tmp_path):
     _, out, _ = run(src, tmp_path)
     # Mesopotamia → e, o, o, a, i, a = 6
     assert out == b"vowels: 6\n"
+
+
+# --- elif chain sugar -----------------------------------------------------
+
+def test_elif_basic(tmp_path):
+    src = (
+        "fn classify(n: i64) -> i64 {\n"
+        "  if n < 0 { 0 - 1 }\n"
+        "  elif n == 0 { 0 }\n"
+        "  elif n < 10 { 1 }\n"
+        "  elif n < 100 { 2 }\n"
+        "  else { 3 }\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  println(classify(0 - 5))\n"
+        "  println(classify(0))\n"
+        "  println(classify(7))\n"
+        "  println(classify(42))\n"
+        "  println(classify(1000))\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"-1\n0\n1\n2\n3\n"
+
+
+def test_elif_without_else_is_unit(tmp_path):
+    # An if/elif chain with no final else evaluates to unit, same as if/then.
+    src = (
+        "fn main() -> i32 {\n"
+        "  mut x: i64 = 0\n"
+        "  if 1 > 2 { x = 10 }\n"
+        "  elif 2 > 3 { x = 20 }\n"
+        "  println(x)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"0\n"
+
+
+def test_else_if_still_works(tmp_path):
+    # Backward-compat: the old two-token `else if` form still parses.
+    src = (
+        "fn main() -> i32 {\n"
+        "  step x: i64 = if 1 < 2 { 1 }\n"
+        "    else if 1 < 3 { 2 }\n"
+        "    else { 3 }\n"
+        "  println(x)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"1\n"
