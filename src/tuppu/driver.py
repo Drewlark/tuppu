@@ -30,10 +30,26 @@ from .typecheck import CheckError, check
 
 # --- IR generation --------------------------------------------------------
 
+def _builtin_decls() -> list[A.Decl]:
+    """Decls injected into every compilation. Currently just the `str` seal:
+    `{ ptr: *u8, len: i64 }`. Keeping the definition here (rather than in a
+    .tpu stdlib file) means string literals work even with `--no-stdlib`."""
+    return [
+        A.StructDecl(
+            name="str",
+            fields=[
+                ("ptr", A.TypePointer(element=A.TypeName(name="u8"))),
+                ("len", A.TypeName(name="i64")),
+            ],
+        ),
+    ]
+
+
 def _parse_labeled(sources: list[tuple[str, str]]) -> A.Program:
     """Parse a list of (label, source_text) pairs and merge their top-level
-    decls into one Program. Labels are used only for error-message context."""
-    decls: list[A.Decl] = []
+    decls into one Program. Labels are used only for error-message context.
+    Built-in declarations (e.g. the `str` seal) are prepended automatically."""
+    decls: list[A.Decl] = list(_builtin_decls())
     for label, text in sources:
         try:
             prog = parse(lex(text))

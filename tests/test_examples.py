@@ -62,6 +62,20 @@ EXPECTED: dict[str, dict] = {
             b"sum = 285\n"
         ),
     },
+    "points.tpu":            {
+        "exit": 0,
+        "stdout": b"3\n4\n25\n",
+    },
+    "greeting.tpu":          {
+        "exit": 0,
+        "stdout": (
+            b"message: Ur is in Mesopotamia\n"
+            b"length:  20\n"
+            b"vowels:  8\n"
+            b"starts with 'Ur': true\n"
+            b"ends with '.tpu': false\n"
+        ),
+    },
     "reciprocal_table.tpu":  {
         "exit": 0,
         "stdout": (

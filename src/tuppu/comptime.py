@@ -122,6 +122,10 @@ class Comptime:
             return e.value
         if isinstance(e, A.SexLit):
             return (e.num, e.den)
+        if isinstance(e, A.CharLit):
+            return e.value
+        if isinstance(e, A.StructLit):
+            return {fname: self.eval_expr(fexpr, env) for fname, fexpr in e.fields}
         if isinstance(e, A.StringLit):
             return e.value
         if isinstance(e, A.Ident):
@@ -256,6 +260,12 @@ class Comptime:
             if e.name == "num": return target[0]
             if e.name == "den": return target[1]
             raise ComptimeError(f"comptime: rat has no field {e.name!r}")
+        if isinstance(target, dict):
+            if e.name in target:
+                return target[e.name]
+            raise ComptimeError(
+                f"comptime: struct has no field {e.name!r}"
+            )
         raise ComptimeError(
             f"comptime: field {e.name!r} on unsupported value"
         )

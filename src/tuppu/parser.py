@@ -41,6 +41,12 @@ BINARY_OP_NAME: dict[Tok, str] = {
     Tok.AMPAMP: "&&", Tok.PIPEPIPE: "||",
 }
 
+# `x += y` desugars to `x = x + y` at parse time. This map drives that.
+_AUG_ASSIGN_OPS: dict[Tok, str] = {
+    Tok.PLUSEQ: "+", Tok.MINUSEQ: "-", Tok.STAREQ: "*",
+    Tok.SLASHEQ: "/", Tok.PERCENTEQ: "%",
+}
+
 
 def _at(tok: Token, node):
     """Stamp the starting token's position onto an AST node."""
@@ -90,10 +96,13 @@ class Parser:
                 decls.append(self.parse_fn())
             elif self.check(Tok.TABLE):
                 decls.append(self.parse_table())
+            elif self.check(Tok.STRUCT):
+                decls.append(self.parse_struct_decl())
             else:
                 t = self.peek()
                 raise ParseError(
-                    f"expected 'fn' or 'table' at top level, got {t.kind.name}",
+                    f"expected 'fn', 'table', or 'struct' at top level, "
+                    f"got {t.kind.name}",
                     t.line, t.col,
                 )
             self.skip_newlines()
@@ -127,6 +136,52 @@ class Parser:
         self.eat(Tok.COLON)
         ty = self.parse_type()
         return _at(start, A.Param(name=name, type=ty))
+
+    def parse_struct_decl(self) -> A.StructDecl:
+        start = self.eat(Tok.STRUCT)
+        name = self.eat(Tok.IDENT, "struct name").value
+        self.eat(Tok.LBRACE)
+        fields: list[tuple[str, A.TypeExpr]] = []
+        self.skip_newlines()
+        while not self.check(Tok.RBRACE):
+            field_name = self.eat(Tok.IDENT, "field name").value
+            self.eat(Tok.COLON)
+            field_type = self.parse_type()
+            fields.append((field_name, field_type))
+            self.skip_newlines()
+            if self.check(Tok.COMMA):
+                self.advance()
+                self.skip_newlines()
+            else:
+                break
+        self.skip_newlines()
+        self.eat(Tok.RBRACE)
+        if not fields:
+            raise ParseError(
+                f"struct {name!r} must declare at least one field",
+                start.line, start.col,
+            )
+        return _at(start, A.StructDecl(name=name, fields=fields))
+
+    def parse_struct_lit(self) -> A.StructLit:
+        name_tok = self.eat(Tok.IDENT, "struct name")
+        self.eat(Tok.LBRACE)
+        fields: list[tuple[str, A.Expr]] = []
+        self.skip_newlines()
+        while not self.check(Tok.RBRACE):
+            field_name = self.eat(Tok.IDENT, "field name").value
+            self.eat(Tok.COLON)
+            value = self.parse_expr()
+            fields.append((field_name, value))
+            self.skip_newlines()
+            if self.check(Tok.COMMA):
+                self.advance()
+                self.skip_newlines()
+            else:
+                break
+        self.skip_newlines()
+        self.eat(Tok.RBRACE)
+        return _at(name_tok, A.StructLit(name=name_tok.value, fields=fields))
 
     def parse_table(self) -> A.TableDecl:
         start = self.eat(Tok.TABLE)
@@ -168,6 +223,10 @@ class Parser:
             self.eat(Tok.RBRACKET)
             element = self.parse_type()
             return _at(t, A.TypeArray(size=size, element=element))
+        if t.kind is Tok.STAR:
+            self.advance()
+            element = self.parse_type()
+            return _at(t, A.TypePointer(element=element))
         raise ParseError(f"expected type, got {t.kind.name}", t.line, t.col)
 
     # --- blocks and statements ---------------------------------------
@@ -192,13 +251,26 @@ class Parser:
         if t.kind is Tok.STEP:   return self.parse_binding(is_mut=False)
         if t.kind is Tok.MUT:    return self.parse_binding(is_mut=True)
         if t.kind is Tok.WHILE:  return self.parse_while()
+        if t.kind is Tok.FOR:    return self.parse_for()
         if t.kind is Tok.YIELD:  return self.parse_yield()
         if t.kind is Tok.RELEASE: return self.parse_release()
         if t.kind is Tok.IDENT and self.peek(1).kind is Tok.EQ:
             return self.parse_assign()
+        if t.kind is Tok.IDENT and self.peek(1).kind in _AUG_ASSIGN_OPS:
+            return self.parse_aug_assign()
         # Otherwise: expression statement.
         expr = self.parse_expr()
         return _at(t, A.ExprStmt(expr=expr))
+
+    def parse_aug_assign(self) -> A.Assign:
+        """Desugar `x += e` to `x = x + e`, same for -=, *=, /=, %=."""
+        name_tok = self.eat(Tok.IDENT)
+        op_tok = self.advance()
+        op = _AUG_ASSIGN_OPS[op_tok.kind]
+        rhs = self.parse_expr()
+        lhs_ref = _at(name_tok, A.Ident(name=name_tok.value))
+        combined = _at(op_tok, A.Binary(op=op, lhs=lhs_ref, rhs=rhs))
+        return _at(name_tok, A.Assign(name=name_tok.value, value=combined))
 
     def parse_binding(self, *, is_mut: bool) -> A.Binding:
         tok = self.advance()  # step or mut
@@ -243,6 +315,14 @@ class Parser:
         body = self.parse_block()
         return _at(start, A.While(cond=cond, body=body))
 
+    def parse_for(self) -> A.ForStmt:
+        start = self.eat(Tok.FOR)
+        name = self.eat(Tok.IDENT, "loop variable name").value
+        self.eat(Tok.IN, "expected 'in' after for loop variable")
+        iter_expr = self.parse_expr()
+        body = self.parse_block()
+        return _at(start, A.ForStmt(name=name, iter=iter_expr, body=body))
+
     def parse_yield(self) -> A.YieldStmt:
         start = self.eat(Tok.YIELD)
         if self.check(Tok.NEWLINE) or self.check(Tok.RBRACE) or self.check(Tok.EOF):
@@ -275,11 +355,23 @@ class Parser:
             ))
         if t.kind is Tok.STRING:
             self.advance(); return _at(t, A.StringLit(value=t.value))
+        if t.kind is Tok.CHAR:
+            self.advance(); return _at(t, A.CharLit(value=t.value))
         if t.kind is Tok.TRUE:
             self.advance(); return _at(t, A.BoolLit(value=True))
         if t.kind is Tok.FALSE:
             self.advance(); return _at(t, A.BoolLit(value=False))
         if t.kind is Tok.IDENT:
+            # `Name { field : ...` is a struct literal. The 3-token lookahead
+            # (LBRACE IDENT COLON) avoids colliding with block expressions or
+            # `if x { body }` — a block's first token is never IDENT-COLON
+            # because bindings require `step`/`mut`.
+            if (
+                self.peek(1).kind is Tok.LBRACE
+                and self.peek(2).kind is Tok.IDENT
+                and self.peek(3).kind is Tok.COLON
+            ):
+                return self.parse_struct_lit()
             self.advance(); return _at(t, A.Ident(name=t.value))
         if t.kind is Tok.TYPE_KW:
             # Type names double as identifiers in expression position so

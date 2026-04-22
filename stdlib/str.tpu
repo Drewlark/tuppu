@@ -1,0 +1,50 @@
+// Byte-level string utilities for `str` (the built-in `seal str { ptr: *u8, len: i64 }`).
+//
+// All functions operate on the existing bytes behind a `str` — no allocation,
+// no copying. Anything that *produces* a new string (concat, slice, to_upper)
+// is deferred until we commit to an allocation strategy for dynamic strings.
+
+fn str_is_empty(s: str) -> bool {
+  s.len == 0
+}
+
+fn str_eq(a: str, b: str) -> bool {
+  if a.len != b.len { yield false }
+  mut i: i64 = 0
+  while i < a.len {
+    if a[i] != b[i] { yield false }
+    i = i + 1
+  }
+  true
+}
+
+fn str_starts_with(s: str, prefix: str) -> bool {
+  if s.len < prefix.len { yield false }
+  mut i: i64 = 0
+  while i < prefix.len {
+    if s[i] != prefix[i] { yield false }
+    i = i + 1
+  }
+  true
+}
+
+fn str_ends_with(s: str, suffix: str) -> bool {
+  if s.len < suffix.len { yield false }
+  step offset: i64 = s.len - suffix.len
+  mut i: i64 = 0
+  while i < suffix.len {
+    if s[offset + i] != suffix[i] { yield false }
+    i = i + 1
+  }
+  true
+}
+
+// Index of first occurrence of byte `b` in `s`, or -1 if absent.
+fn str_index_of(s: str, b: u8) -> i64 {
+  mut i: i64 = 0
+  while i < s.len {
+    if s[i] == b { yield i }
+    i = i + 1
+  }
+  -1
+}

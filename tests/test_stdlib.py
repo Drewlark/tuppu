@@ -157,9 +157,10 @@ def test_cannot_define_read_int():
         )
 
 
-def test_print_wrong_arity_errors():
-    with pytest.raises(CompileError, match="exactly one argument"):
-        compile_to_ir("fn main() -> i32 { println(1, 2)\n 0 }")
+def test_print_empty_arity_errors():
+    # println now accepts N≥1 args; the empty case must still be rejected.
+    with pytest.raises(CompileError, match="at least one argument"):
+        compile_to_ir("fn main() -> i32 { println()\n 0 }")
 
 
 def test_read_int_takes_no_args():

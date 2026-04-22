@@ -89,8 +89,10 @@ IDENT   = [a-zA-Z_] [a-zA-Z0-9_]*
 ```
 fn        step      mut       if        else      while
 for       in        yield     true      false     as
-table     tablet    tablets   release   struct
-i8 i16 i32 i64 u8 u16 u32 u64 bool f32 f64 rat
+table     tablet    tablets   release   struct    seal
+i8 i16 i32 i64 u8 u16 u32 u64 bool f32 f64 rat  sex  dish
+
+Char literals: `'a'`, `'\n'`, `'\\'`, `'\''` — single-byte, type `u8`.
 ```
 
 ### 3.4 Operators and punctuation
@@ -172,17 +174,18 @@ BOOL     = "true" | "false"
 STRING   = "\"" ([^"\\] | "\\" ["\\nrt0])* "\""
 ```
 
-Strings are immutable and live in the static section. They have type
-`[N]u8` where `N` is the byte length (null terminator not counted).
+String literals have type `str` — a built-in seal (see §4.7) whose
+contents live in the static section. Arbitrary bytes (including NUL)
+are permitted; printing goes through `write(2)` so embedded NULs
+survive unchanged.
 
 ## 4. Types
 
 ```
 type = prim
-     | "[" INT "]" type              // fixed-size array (Zig-style)
      | "tablets" "[" INT "]" type    // chained growable
-     | "*" type                      // raw pointer (rare; for runtime)
-     | IDENT                         // struct name
+     | "*" type                      // raw pointer (see §4.7)
+     | IDENT                         // primitive, user seal, or `str`
 
 prim = "i8"  | "i16" | "i32" | "i64"
      | "u8"  | "u16" | "u32" | "u64"
@@ -196,9 +199,9 @@ reserved for sexagesimal literals only.
 Examples:
 
 ```
-[16]i64            // array of 16 i64
-[32]u8             // 32-byte buffer (e.g. a fixed string)
 tablets[256]Token  // chained storage, 256 tokens per tablet
+*u8                // raw pointer to a byte (used inside `str`)
+Point              // a user seal declared elsewhere
 ```
 
 ### 4.1 Primitives
@@ -224,35 +227,49 @@ rat  as i64    // truncation toward zero (signed division of num by den)
 ### 4.3 `sex` (alias: `dish`)
 
 The Babylonian sexagesimal type — a digit sequence with a positional
-radix, modelled faithfully. `sex` and `dish` are both keywords for the
-same compile-time type; `dish` (Sumerian for the cuneiform vertical
-wedge) is the preferred name in docs and library code.
+radix, modelled faithfully and **distinct from `rat` at runtime**.
+`sex` and `dish` are both keywords for the same compile-time type;
+`dish` (Sumerian for the cuneiform vertical wedge) is the preferred
+name in docs and library code.
 
-At runtime, sex values share the `{i64 num, i64 den}` struct layout
-with `rat`. The type-level distinction lets the compiler warn when
-arithmetic implicitly lowers sex→rat (because native sex arithmetic,
-which could in principle exceed i64/i64 precision by keeping digit
-sequences and radix shifts first-class, is a planned future feature).
+Runtime layout (20 bytes):
+
+```
+seal sex {
+  digits : [16]u8,   // base-60 digits; int digits first, then fractional
+  radix  : u8,       // where fractional begins (also = count of int digits)
+  count  : u8,       // total digits used (0..=16)
+  sign   : i8,       // 0 positive, non-zero negative
+  _pad   : u8,
+}
+```
+
+Printing shows the scribe's digits: `println(1;30)` emits `1;30`,
+`println(1;24 51 10)` emits `1;24 51 10`, and `println(-(1;30))`
+emits `-1;30`.
 
 Conversions:
 
 ```
-sex  as rat    // silent, no-op at runtime
-rat  as sex    // silent (compile-time retype)
-i64  as sex    // silent, wraps as {x, 1}
-sex  as i64    // silent, truncation toward zero
+sex  as rat    // real work: reconstruct num/den, reduce via gcd
+sex  as i64    // reduces to rat then truncates toward zero
+rat  as sex    // not yet supported (regularity check required — v0.2)
+i64  as sex    // not yet supported (wrap as one-digit — v0.2)
 sex  as f64    // deferred: "f64 not yet supported"
 ```
 
-Field access: `x.num` and `x.den` both return `i64`, same as for `rat`.
+Sex values coerce silently to `rat` at typed binding sites
+(`step x: rat = 1;30` works) — the conversion happens implicitly at
+the coercion point. Arithmetic on sex still lowers to rat and emits
+a warning for the moment; native digit-form arithmetic (with base-60
+carries, radix alignment, regularity checks, and a SIMD-friendly digit
+buffer) is planned as Phase 3 of the sex redesign.
 
-### 4.4 Arrays
+Field access: `x.num` and `x.den` are still allowed on sex (the
+compiler reduces to rat first), but prefer an explicit `as rat`
+cast at the call site if you care about the conversion cost.
 
-`[N]T` is a fixed-size array, `N` known at compile time. Values are
-passed by reference (conceptually) — semantically an array is a value
-but its size in bytes is fixed.
-
-### 4.5 Tablets — the memory model
+### 4.4 Tablets — the memory model
 
 - `tablet[N]T` is a single fixed-size allocation of `N` elements of
   `T`. In v0.1 this is a synonym for `[N]T`; distinction reserved for
@@ -274,7 +291,90 @@ Core operations on a `var toks: tablets[N]T`:
 There is no general-purpose heap. All dynamic allocation in user code
 goes through `tablets`.
 
-### 4.6 Function types
+### 4.5 Structs (alias: `seal`)
+
+A user-defined composite type with named fields. Nominally typed —
+two structurally identical structs with different names are different
+types and do not implicitly convert.
+
+```
+struct Point { x: i64, y: i64 }
+seal   Line  { a: Point, b: Point }
+```
+
+`struct` and `seal` are both keywords for the same declaration form;
+`seal` is the preferred name in Babylonian-flavored examples because a
+cylinder seal was the native metaphor for nominal identity — a named
+composite design whose impressions in clay are the struct values.
+
+Construction uses a trailing-braces literal:
+
+```
+step p: Point = Point { x: 3, y: 4 }
+step l = Line { a: Point { x: 0, y: 0 }, b: p }
+```
+
+Fields may appear in any order in a literal but all declared fields
+must be present. Field access is `p.x`. Forward references across
+declarations are supported (declaration order is resolved by the
+compiler); direct recursion is an error in v0.1.
+
+Structs are passed and returned by value. Struct field mutation
+(`p.x = 5`) is not yet supported; reassign the whole struct via `mut`.
+
+Conversions: no implicit `as` casts involving structs. Explicit
+reinterpret between same-layout structs is planned as a separate
+operator, `impress` (see §14).
+
+The built-in `str` type (§4.7) is itself a seal — nothing about it
+is special at the type-system level, just at literal-production
+time.
+
+### 4.6 Raw pointers (`*T`)
+
+`*T` is a raw, unmanaged pointer type — a machine address interpreted
+as pointing to a value of type `T`. In v0.1 raw pointers are
+intentionally **type-only**: you can hold one (as a field of a seal,
+a function parameter, or a binding), pass it through, and the
+compiler can use it internally, but there is no expression-level
+syntax for dereferencing (`*p`), pointer arithmetic, or address-of.
+
+Their purpose in v0.1 is to let the built-in `str` seal describe its
+own contents and to leave room for future FFI and low-level stdlib
+code.
+
+### 4.7 `str` — variable-length strings
+
+```
+seal str {
+  ptr: *u8,
+  len: i64,
+}
+```
+
+`str` is a built-in seal, auto-injected into every compilation
+(including `--no-stdlib`). String literals produce `str` values;
+the bytes live in a deduped global constant.
+
+Operations:
+
+| Syntax             | Result | Notes                                   |
+|--------------------|--------|-----------------------------------------|
+| `"literal"`        | `str`  | `.ptr` into static bytes, `.len` in bytes |
+| `s.len`            | `i64`  | Byte length (free — ordinary field access) |
+| `s[i]`             | `u8`   | Bounds-checked byte load through `s.ptr` |
+| `print(s)`         | `()`   | Writes bytes verbatim via `write(2)`     |
+| `println(s)`       | `()`   | Same, followed by `\n`                   |
+| `fn f(s: str)`     | —      | Pass-by-value (pointer + length, 16 B)   |
+
+Stdlib functions in `stdlib/str.tpu` cover the non-allocating byte-
+level operations: `str_eq`, `str_starts_with`, `str_ends_with`,
+`str_is_empty`, `str_index_of`. Anything that would need to
+*produce* a new string (concat, slice, case-fold) is deferred until
+v0.2 when we commit to a dynamic-string allocation strategy
+(likely tablets-backed).
+
+### 4.8 Function types
 
 Functions are not first-class in v0.1. A `fn` declaration introduces a
 name bound to a function; it can be called but not passed, stored, or
@@ -571,27 +671,55 @@ Explicitly out of scope — to keep the compiler reachable:
 - Trait/interface system
 - Modules (everything is one file in v0.1)
 - Macros / metaprogramming beyond `table`
-- String manipulation beyond indexing and length
+- String manipulation that allocates: concatenation, slicing, case
+  conversion, case-insensitive compare (deferred until we settle on
+  tablets-backed dynamic strings in v0.2)
+- `read_line()` or any stdin-to-`str` intrinsic (same reason)
+- Struct field mutation (`p.x = 5`); whole-struct `mut` reassignment works
+- Recursive struct types (would require identified types + heap
+  indirection)
+- Reinterpret casts between same-layout structs — planned as the
+  `impress` operator in v0.2 (see below)
 - Package manager, build tool, formatter
 - Type inference across function boundaries
 
-v0.2 candidates (rough): struct types, sum types with pattern match,
-modules, first-class functions, simple type inference in bodies.
+v0.2 candidates (rough): modules / imports, dynamic strings (concat /
+slice, tablets-backed), sum types with pattern match, first-class
+functions, simple type inference in bodies, and the `impress`
+reinterpret cast:
+
+```
+// v0.2 sketch — same-layout reinterpret, explicitly unsafe-flavored:
+step v: Vector = impress p as Vector
+```
+
+Rationale for separating `impress` from `as`: `as` stays the safe,
+semantics-preserving numeric conversion operator; `impress` is the
+Babylonian-flavored escape hatch that treats the bits of one seal as
+though they had been pressed from a different-named seal of identical
+layout. Requires field-type-by-field-type equality between source and
+target structs; codegen is a no-op. A future trait-driven
+`into`-style conversion would be a third, distinct mechanism.
 
 ## 15. Grammar summary
 
 ```
 program     = decl*
-decl        = fn_decl | table_decl
+decl        = fn_decl | table_decl | struct_decl
 fn_decl     = "fn" IDENT "(" params? ")" ("->" type)? block_expr
 params      = param ("," param)*
 param       = IDENT ":" type
 table_decl  = "table" IDENT "[" expr ".." expr "]" ":" type "=" expr
+struct_decl = ("struct" | "seal") IDENT "{" field ("," field)* ","? "}"
+field       = IDENT ":" type
 
-stmt        = binding | assign | while_stmt | yield_stmt | expr
+stmt        = binding | assign | aug_assign
+            | while_stmt | for_stmt | yield_stmt | expr
 binding     = ("step" | "mut") IDENT (":" type)? "=" expr
 assign      = IDENT "=" expr
+aug_assign  = IDENT ("+=" | "-=" | "*=" | "/=" | "%=") expr
 while_stmt  = "while" expr block_expr
+for_stmt    = "for" IDENT "in" expr block_expr
 yield_stmt  = "yield" expr?
 
 expr        = if_expr | block_expr | binary | unary | call | atom
@@ -599,11 +727,12 @@ if_expr     = "if" expr block_expr ("else" (if_expr | block_expr))?
 block_expr  = "{" stmt* expr? "}"
 call        = expr "(" args? ")"
 args        = expr ("," expr)*
-atom        = IDENT | literal | "(" expr ")"
-literal     = DEC_INT | HEX_INT | BIN_INT | SEX_LIT | STRING | BOOL
+struct_lit  = IDENT "{" (IDENT ":" expr ("," IDENT ":" expr)* ","?)? "}"
+atom        = IDENT | literal | struct_lit | "(" expr ")"
+literal     = DEC_INT | HEX_INT | BIN_INT | SEX_LIT | CHAR | STRING | BOOL
 
 type        = prim
-            | "[" DEC_INT "]" type
             | "tablets" "[" DEC_INT "]" type
-            | IDENT
+            | "*" type                      // raw pointer
+            | IDENT                         // primitive, struct, or `str`
 ```

@@ -1,0 +1,23 @@
+// Variable-length strings, idiomatically. Compare to earlier drafts of
+// this file — the count_vowels loop is half as long and reads like what
+// you'd expect in a real language.
+
+fn count_vowels(s: str) -> i64 {
+  mut n: i64 = 0
+  for c in s {
+    if c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u' {
+      n += 1
+    }
+  }
+  n
+}
+
+fn main() -> i32 {
+  step message: str = "Ur is in Mesopotamia"
+  println("message: ", message)
+  println("length:  ", message.len)
+  println("vowels:  ", count_vowels(message))
+  println("starts with 'Ur': ",  str_starts_with(message, "Ur"))
+  println("ends with '.tpu': ", str_ends_with(message, ".tpu"))
+  0
+}

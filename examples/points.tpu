@@ -1,0 +1,32 @@
+// Demonstrates user-defined structs: declaration, construction, field
+// access, nested structs, and pass-by-value as function arguments.
+
+struct Point {
+  x: i64,
+  y: i64,
+}
+
+struct Line {
+  a: Point,
+  b: Point,
+}
+
+fn translate(p: Point, dx: i64, dy: i64) -> Point {
+  Point { x: p.x + dx, y: p.y + dy }
+}
+
+fn length_sq(l: Line) -> i64 {
+  step dx = l.b.x - l.a.x
+  step dy = l.b.y - l.a.y
+  dx * dx + dy * dy
+}
+
+fn main() -> i32 {
+  step origin = Point { x: 0, y: 0 }
+  step far = translate(origin, 3, 4)
+  step segment = Line { a: origin, b: far }
+  println(far.x)
+  println(far.y)
+  println(length_sq(segment))
+  0
+}

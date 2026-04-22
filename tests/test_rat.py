@@ -20,25 +20,27 @@ def run(src: str, tmp_path: Path, stdin: bytes = b"") -> tuple[int, bytes]:
 # --- literals (sexagesimal) ------------------------------------------------
 
 def test_sex_literal_one_and_a_half(tmp_path):
-    _, out = run('fn main() -> i32 { println(1;30)\n 0 }', tmp_path)
+    # print(sex) now renders in Babylonian notation; cast to rat for the
+    # reduced-fraction form these tests are checking.
+    _, out = run('fn main() -> i32 { println((1;30) as rat)\n 0 }', tmp_path)
     assert out == b"3/2\n"
 
 
 def test_sex_literal_one_third_exact(tmp_path):
     # 0;20 = 1/3 exactly — cannot be represented in f64.
-    _, out = run('fn main() -> i32 { println(0;20)\n 0 }', tmp_path)
+    _, out = run('fn main() -> i32 { println((0;20) as rat)\n 0 }', tmp_path)
     assert out == b"1/3\n"
 
 
 def test_sex_literal_tiny(tmp_path):
     # 0;0 45 = 45/3600 = 1/80 (space-separator convention)
-    _, out = run('fn main() -> i32 { println(0;0 45)\n 0 }', tmp_path)
+    _, out = run('fn main() -> i32 { println((0;0 45) as rat)\n 0 }', tmp_path)
     assert out == b"1/80\n"
 
 
 def test_sex_literal_reduces_at_parse_time(tmp_path):
-    # 1;30 0 0 — trailing fractional zeros still reduce to 3/2.
-    _, out = run('fn main() -> i32 { println(1;30 0 0)\n 0 }', tmp_path)
+    # 1;30 0 0 — trailing fractional zeros still reduce to 3/2 via `as rat`.
+    _, out = run('fn main() -> i32 { println((1;30 0 0) as rat)\n 0 }', tmp_path)
     assert out == b"3/2\n"
 
 

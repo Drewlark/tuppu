@@ -60,9 +60,12 @@ class TyDish:
     def __str__(self) -> str: return "dish"
 
 @dataclass(frozen=True)
-class TyStr:
-    """String literal — variable-length, immutable byte string."""
-    def __str__(self) -> str: return "[N]u8"
+class TyPtr:
+    """A raw pointer. Held and passed around but not directly
+    dereferenced or manipulated from user code — the compiler uses
+    these internally for string and FFI byte access."""
+    element: "Ty"
+    def __str__(self) -> str: return f"*{self.element}"
 
 @dataclass(frozen=True)
 class TyUnit:
@@ -79,6 +82,13 @@ class TyTablets:
     size: int
     element: "Ty"
     def __str__(self) -> str: return f"tablets[{self.size}]{self.element}"
+
+@dataclass(frozen=True)
+class TyStruct:
+    """A user-defined struct. Nominally typed — equal by name only.
+    Field layout lives in Checker.struct_fields, keyed by name."""
+    name: str
+    def __str__(self) -> str: return self.name
 
 @dataclass(frozen=True)
 class TyTable:
@@ -98,7 +108,7 @@ Ty = object  # structural union; actual nodes listed above
 
 I8  = TyInt(8);  I16 = TyInt(16); I32 = TyInt(32); I64 = TyInt(64)
 U8  = TyInt(8, False); U16 = TyInt(16, False); U32 = TyInt(32, False); U64 = TyInt(64, False)
-BOOL = TyBool(); RAT = TyRat(); DISH = TyDish(); STR = TyStr(); UNIT = TyUnit(); DIV = TyDiverge()
+BOOL = TyBool(); RAT = TyRat(); DISH = TyDish(); UNIT = TyUnit(); DIV = TyDiverge()
 
 PRIM_TYPES: dict[str, Ty] = {
     "i8": I8, "i16": I16, "i32": I32, "i64": I64,
@@ -162,6 +172,8 @@ class Checker:
         self.prog = prog
         self.fns: dict[str, TyFn] = {}
         self.tables: dict[str, TyTable] = {}
+        self.structs: dict[str, TyStruct] = {}
+        self.struct_fields: dict[str, tuple[tuple[str, Ty], ...]] = {}
         self.scopes: list[dict[str, Ty]] = [{}]
         self.current_fn: str = "<top>"
         self.warnings: list[CompileWarning] = []
@@ -170,6 +182,18 @@ class Checker:
         self.warnings.append(CompileWarning(message=message, line=line, col=col))
 
     def check(self) -> None:
+        # Phase 0a: collect struct names so struct-referencing-struct works
+        # regardless of source order.
+        for d in self.prog.decls:
+            if isinstance(d, A.StructDecl):
+                self._register_struct_name(d)
+        # Phase 0b: resolve each struct's fields. Struct names are visible
+        # at this point; primitive types always have been.
+        for d in self.prog.decls:
+            if isinstance(d, A.StructDecl):
+                self._resolve_struct_fields(d)
+        # Phase 1: function signatures (parameter and return types can now
+        # reference any struct).
         for d in self.prog.decls:
             if isinstance(d, A.FnDecl):
                 self._register_fn(d)
@@ -181,6 +205,33 @@ class Checker:
                 self._check_fn_body(d)
 
     # --- registration ------------------------------------------------
+
+    def _register_struct_name(self, s: A.StructDecl) -> None:
+        if s.name in PRIM_TYPES:
+            raise CheckError(
+                f"struct {s.name!r}: name shadows a built-in type", s.line, s.col,
+            )
+        if s.name in self.structs:
+            raise CheckError(
+                f"duplicate struct {s.name!r}", s.line, s.col,
+            )
+        self.structs[s.name] = TyStruct(name=s.name)
+
+    def _resolve_struct_fields(self, s: A.StructDecl) -> None:
+        seen: set[str] = set()
+        resolved: list[tuple[str, Ty]] = []
+        for fname, ftype in s.fields:
+            if fname in seen:
+                raise CheckError(
+                    f"struct {s.name!r}: duplicate field {fname!r}",
+                    s.line, s.col,
+                )
+            seen.add(fname)
+            resolved.append((
+                fname,
+                self._resolve_type(ftype, f"field {fname!r} of struct {s.name!r}"),
+            ))
+        self.struct_fields[s.name] = tuple(resolved)
 
     def _register_fn(self, fn: A.FnDecl) -> None:
         if fn.name in INTRINSIC_NAMES:
@@ -260,6 +311,8 @@ class Checker:
         if isinstance(t, A.TypeName):
             if t.name in PRIM_TYPES:
                 return PRIM_TYPES[t.name]
+            if t.name in self.structs:
+                return self.structs[t.name]
             raise CheckError(
                 f"{where}: unknown type {t.name!r}", t.line, t.col,
             )
@@ -267,13 +320,13 @@ class Checker:
             inner = self._resolve_type(t.element, f"{where} element")
             return TyTablets(size=t.size, element=inner)
         if isinstance(t, A.TypeArray):
-            inner = self._resolve_type(t.element, f"{where} element")
-            if inner == U8:
-                return STR
             raise CheckError(
-                f"{where}: array types other than [N]u8 are not supported yet",
+                f"{where}: array types are not supported in v0.1",
                 t.line, t.col,
             )
+        if isinstance(t, A.TypePointer):
+            inner = self._resolve_type(t.element, f"{where} element")
+            return TyPtr(element=inner)
         raise CheckError(
             f"{where}: unsupported type expression",
             getattr(t, "line", 0), getattr(t, "col", 0),
@@ -305,6 +358,7 @@ class Checker:
         if isinstance(s, A.Binding):       return self._tc_binding(s)
         if isinstance(s, A.Assign):        return self._tc_assign(s)
         if isinstance(s, A.While):         return self._tc_while(s)
+        if isinstance(s, A.ForStmt):       return self._tc_for(s)
         if isinstance(s, A.YieldStmt):     return self._tc_yield(s)
         if isinstance(s, A.ReleaseStmt):   return self._tc_release(s)
         if isinstance(s, A.ExprStmt):      self._tc_expr(s.expr); return
@@ -345,6 +399,33 @@ class Checker:
                 a.line, a.col,
             )
 
+    def _tc_for(self, f: A.ForStmt) -> None:
+        # Resolve element type before we look at the body so errors about
+        # the iterable itself are reported at the for-stmt position.
+        element_ty = self._for_element_type(f)
+        self._push()
+        try:
+            self._bind(f.name, element_ty, f.line, f.col)
+            self._tc_block(f.body, allow_nonbool_tail=True)
+        finally:
+            self._pop()
+
+    def _for_element_type(self, f: A.ForStmt) -> Ty:
+        """Resolve the per-iteration type for a `for name in iter` loop.
+        Tables are recognized by identifier name (like `_tc_index`); other
+        iterables come through the normal type of the iter expression."""
+        if isinstance(f.iter, A.Ident) and f.iter.name in self.tables:
+            return self.tables[f.iter.name].element
+        iter_ty = self._tc_expr(f.iter)
+        if isinstance(iter_ty, TyTablets):
+            return iter_ty.element
+        str_ty = self.structs.get("str")
+        if str_ty is not None and iter_ty == str_ty:
+            return U8
+        raise CheckError(
+            f"for loop: cannot iterate over {iter_ty}", f.line, f.col,
+        )
+
     def _tc_while(self, w: A.While) -> None:
         cond_ty = self._tc_expr(w.cond)
         if not isinstance(cond_ty, TyBool):
@@ -384,9 +465,17 @@ class Checker:
 
     def _tc_expr(self, e: A.Expr) -> Ty:
         if isinstance(e, A.IntLit):    return I64
+        if isinstance(e, A.CharLit):   return U8
         if isinstance(e, A.BoolLit):   return BOOL
         if isinstance(e, A.SexLit):    return DISH
-        if isinstance(e, A.StringLit): return STR
+        if isinstance(e, A.StringLit):
+            if "str" not in self.structs:
+                raise CheckError(
+                    "string literal used but `str` type is not in scope "
+                    "(stdlib may be missing)",
+                    e.line, e.col,
+                )
+            return self.structs["str"]
         if isinstance(e, A.Ident):
             return self._lookup(e.name, e.line, e.col)
         if isinstance(e, A.Unary):     return self._tc_unary(e)
@@ -395,6 +484,7 @@ class Checker:
         if isinstance(e, A.Field):     return self._tc_field(e)
         if isinstance(e, A.Index):     return self._tc_index(e)
         if isinstance(e, A.Cast):      return self._tc_cast(e)
+        if isinstance(e, A.StructLit): return self._tc_struct_lit(e)
         if isinstance(e, A.Block):     return self._tc_block(e)
         if isinstance(e, A.IfExpr):    return self._tc_if(e)
         raise CheckError(
@@ -460,6 +550,10 @@ class Checker:
         if op in ("==", "!=", "<", "<=", ">", ">="):
             if lhs == rhs and (_is_int(lhs) or isinstance(lhs, (TyBool, TyRat, TyDish))):
                 return BOOL
+            # Mixed-width integer comparison: promote both to the wider
+            # type (same rule as `if` arm unification).
+            if _is_int(lhs) and _is_int(rhs):
+                return BOOL
             # Dish vs rat (or dish vs dish that isn't the "equal" case)
             # is cheap to compare via rat, no warning necessary.
             if dish_involved and _coerces_to(lhs, RAT) and _coerces_to(rhs, RAT):
@@ -483,17 +577,22 @@ class Checker:
         name = e.callee.name
 
         if name in ("print", "println"):
-            if len(e.args) != 1:
+            if not e.args:
                 raise CheckError(
-                    f"{name} takes exactly one argument, got {len(e.args)}",
-                    e.line, e.col,
+                    f"{name} takes at least one argument", e.line, e.col,
                 )
-            at = self._tc_expr(e.args[0])
-            if not (_is_int(at) or isinstance(at, (TyBool, TyRat, TyDish, TyStr))):
-                raise CheckError(
-                    f"{name}: unsupported argument type {at}",
-                    e.line, e.col,
-                )
+            str_ty = self.structs.get("str")
+            for arg in e.args:
+                at = self._tc_expr(arg)
+                if not (
+                    _is_int(at)
+                    or isinstance(at, (TyBool, TyRat, TyDish))
+                    or (str_ty is not None and at == str_ty)
+                ):
+                    raise CheckError(
+                        f"{name}: unsupported argument type {at}",
+                        e.line, e.col,
+                    )
             return UNIT
 
         if name == "read_int":
@@ -584,10 +683,53 @@ class Checker:
                 f"tablets has no field {e.name!r}; only len",
                 e.line, e.col,
             )
+        if isinstance(target_ty, TyStruct):
+            for fname, fty in self.struct_fields[target_ty.name]:
+                if fname == e.name:
+                    return fty
+            raise CheckError(
+                f"struct {target_ty.name!r} has no field {e.name!r}",
+                e.line, e.col,
+            )
         raise CheckError(
             f"field access on type {target_ty} is not supported",
             e.line, e.col,
         )
+
+    def _tc_struct_lit(self, e: A.StructLit) -> Ty:
+        if e.name not in self.structs:
+            raise CheckError(
+                f"unknown struct {e.name!r}", e.line, e.col,
+            )
+        declared = self.struct_fields[e.name]
+        declared_map = {n: t for n, t in declared}
+        seen: set[str] = set()
+        for fname, fexpr in e.fields:
+            if fname not in declared_map:
+                raise CheckError(
+                    f"struct {e.name!r}: unknown field {fname!r}",
+                    e.line, e.col,
+                )
+            if fname in seen:
+                raise CheckError(
+                    f"struct {e.name!r}: duplicate field {fname!r} in literal",
+                    e.line, e.col,
+                )
+            seen.add(fname)
+            val_ty = self._tc_expr(fexpr)
+            if not _coerces_to(val_ty, declared_map[fname]):
+                raise CheckError(
+                    f"struct {e.name!r} field {fname!r}: got {val_ty}, "
+                    f"expected {declared_map[fname]}",
+                    e.line, e.col,
+                )
+        missing = [n for n, _ in declared if n not in seen]
+        if missing:
+            raise CheckError(
+                f"struct {e.name!r}: missing field(s) {', '.join(repr(n) for n in missing)}",
+                e.line, e.col,
+            )
+        return self.structs[e.name]
 
     def _tc_index(self, e: A.Index) -> Ty:
         if isinstance(e.target, A.Ident) and e.target.name in self.tables:
@@ -608,6 +750,17 @@ class Checker:
                     e.line, e.col,
                 )
             return target_ty.element
+        # str indexing yields u8 — the compiler inserts a bounds check
+        # against s.len and reads through s.ptr.
+        str_ty = self.structs.get("str")
+        if str_ty is not None and target_ty == str_ty:
+            idx_ty = self._tc_expr(e.index)
+            if not _is_int(idx_ty):
+                raise CheckError(
+                    f"str index must be integer, got {idx_ty}",
+                    e.line, e.col,
+                )
+            return U8
         raise CheckError(
             f"cannot index into {target_ty}", e.line, e.col,
         )

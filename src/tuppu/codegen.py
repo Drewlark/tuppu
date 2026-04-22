@@ -34,6 +34,25 @@ I64 = ir.IntType(64)
 # normalized so den > 0 at construction time. Field 0 is num, field 1 is den.
 RAT = ir.LiteralStructType([I64, I64])
 
+# Sex: Babylonian-faithful sexagesimal representation. A fixed-width digit
+# sequence with explicit radix position and sign. Each digit is in [0, 60).
+# Layout (20 bytes):
+#   digits : [16]u8   fixed buffer, int digits first then fractional
+#   radix  : u8       index where fractional part begins (also = int digit count)
+#   count  : u8       total digits used (0..=16)
+#   sign   : i8       0 = positive, non-zero = negative
+#   _pad   : u8       alignment filler
+# Values beyond 16 total digits are a compile-time error.
+SEX_MAX_DIGITS = 16
+SEX = ir.LiteralStructType([
+    ir.ArrayType(I8, SEX_MAX_DIGITS),
+    I8, I8, I8, I8,
+])
+SEX_IDX_DIGITS = 0
+SEX_IDX_RADIX = 1
+SEX_IDX_COUNT = 2
+SEX_IDX_SIGN = 3
+
 INT_WIDTH: dict[str, int] = {
     "i8": 8, "i16": 16, "i32": 32, "i64": 64,
     "u8": 8, "u16": 16, "u32": 32, "u64": 64,
@@ -74,11 +93,16 @@ class Codegen:
         self._strings: dict[bytes, ir.GlobalVariable] = {}
         self._str_counter = 0
         self._rat_reduce: ir.Function | None = None  # built lazily
+        self._sex_to_rat: ir.Function | None = None
+        self._sex_print: ir.Function | None = None
         self._trap: ir.Function | None = None
         # table name -> (global array, length, lo bound, element LLVM type)
         self._tables: dict[str, tuple[ir.GlobalVariable, int, int, ir.Type]] = {}
         # Tablets monomorphizations: key is (N, str(elem_type)).
         self._tablets_types: dict[tuple[int, str], "TabletsInfo"] = {}
+        # User-defined structs: name -> LLVM struct type + ordered fields.
+        self._struct_types: dict[str, ir.LiteralStructType] = {}
+        self._struct_fields: dict[str, list[tuple[str, ir.Type]]] = {}
         self._init_runtime_externs()
 
     def _init_runtime_externs(self) -> None:
@@ -96,6 +120,8 @@ class Codegen:
         )
         self._malloc: ir.Function | None = None  # lazy
         self._free: ir.Function | None = None
+        self._write: ir.Function | None = None
+        self._fflush: ir.Function | None = None
 
     def _get_malloc(self) -> ir.Function:
         if self._malloc is None:
@@ -115,10 +141,34 @@ class Codegen:
             )
         return self._free
 
+    def _get_write(self) -> ir.Function:
+        if self._write is None:
+            self._write = ir.Function(
+                self.module,
+                ir.FunctionType(I64, [I32, I8.as_pointer(), I64]),
+                name="write",
+            )
+        return self._write
+
+    def _get_fflush(self) -> ir.Function:
+        if self._fflush is None:
+            self._fflush = ir.Function(
+                self.module,
+                ir.FunctionType(I32, [I8.as_pointer()]),
+                name="fflush",
+            )
+        return self._fflush
+
     # --- top level ---
 
     def gen(self, prog: A.Program) -> ir.Module:
         self.comptime = Comptime(prog)
+
+        # Phase 0: build struct LLVM types. Ordered so a struct referenced by
+        # a later struct (or by function signatures) is always ready.
+        self._register_structs(
+            [d for d in prog.decls if isinstance(d, A.StructDecl)]
+        )
 
         # Phase 1: forward-declare all user functions.
         for decl in prog.decls:
@@ -126,6 +176,8 @@ class Codegen:
                 self._declare_fn(decl)
             elif isinstance(decl, A.TableDecl):
                 pass  # handled in phase 2 after function decls are visible
+            elif isinstance(decl, A.StructDecl):
+                pass  # already handled in phase 0
             else:
                 raise CodegenError(
                     f"unsupported top-level: {type(decl).__name__}"
@@ -205,26 +257,86 @@ class Codegen:
                 return ir.IntType(INT_WIDTH[t.name])
             if t.name == "bool":
                 return I1
-            # Both `rat` and the sex/dish aliases share the same runtime
-            # struct. The compile-time distinction between sex and rat lives
-            # in the type checker only.
-            if t.name in ("rat", "sex", "dish"):
+            if t.name == "rat":
                 return RAT
+            # sex/dish now has a distinct digit-form representation so its
+            # Babylonian identity survives to runtime. Coercion between sex
+            # and rat is a real conversion, not a no-op.
+            if t.name in ("sex", "dish"):
+                return SEX
+            if t.name in self._struct_types:
+                return self._struct_types[t.name]
             raise CodegenError(f"type {t.name!r} not supported in this stage")
         if isinstance(t, A.TypeTablets):
             elem = self._lower_type(t.element)
             return self._get_tablets(t.size, elem).tablets_ty
+        if isinstance(t, A.TypePointer):
+            elem = self._lower_type(t.element)
+            return elem.as_pointer()
         raise CodegenError(
             f"complex types not supported in this stage: {type(t).__name__}"
         )
 
+    def _register_structs(self, decls: list[A.StructDecl]) -> None:
+        """Build LLVM types for user-defined structs. Dependencies resolved
+        via topological sort so a struct can reference another regardless of
+        source order. Direct cycles are rejected — v0.1 has no recursive
+        structs (which would require identified-type heap indirection)."""
+        by_name = {d.name: d for d in decls}
+        state: dict[str, int] = {}  # 0=unseen, 1=in-progress, 2=done
+
+        def visit(d: A.StructDecl) -> None:
+            st = state.get(d.name, 0)
+            if st == 2:
+                return
+            if st == 1:
+                raise CodegenError(
+                    f"struct {d.name!r}: recursive structs are not supported"
+                )
+            state[d.name] = 1
+            for _fname, ftype in d.fields:
+                if isinstance(ftype, A.TypeName) and ftype.name in by_name:
+                    visit(by_name[ftype.name])
+            state[d.name] = 2
+            field_tys = [self._lower_type(ftype) for _, ftype in d.fields]
+            struct_ty = ir.LiteralStructType(field_tys)
+            self._struct_types[d.name] = struct_ty
+            self._struct_fields[d.name] = list(
+                zip([n for n, _ in d.fields], field_tys)
+            )
+
+        for d in decls:
+            visit(d)
+
+    def _struct_name_for(self, llvm_ty: ir.Type) -> str | None:
+        for name, ty in self._struct_types.items():
+            if ty is llvm_ty:
+                return name
+        return None
+
     def _coerce(self, value: ir.Value, target_ty: ir.Type) -> ir.Value:
         """Insert a cast instruction if value's type differs from target_ty.
         Handles integer widening (sext/zext), integer narrowing (trunc),
-        and i64<->rat conversions."""
+        and i64<->rat and sex<->rat conversions."""
         if value.type == target_ty:
             return value
         assert self.builder is not None
+
+        # Sex conversions. Sex is a compile-time-distinct type now; going
+        # to rat requires a runtime reduction of the digit sequence.
+        if value.type == SEX:
+            if target_ty == RAT:
+                return self.builder.call(self._get_sex_to_rat(), [value])
+            if isinstance(target_ty, ir.IntType):
+                # sex → iN: reduce to rat, then truncate.
+                as_rat = self._coerce(value, RAT)
+                return self._coerce(as_rat, target_ty)
+        if target_ty == SEX:
+            # For now we refuse implicit construction of sex from numeric
+            # types. A future phase will add regularity-checked rat → sex.
+            raise CodegenError(
+                f"converting {value.type} to sex is not yet supported"
+            )
 
         # Rat conversions.
         if value.type == RAT and isinstance(target_ty, ir.IntType):
@@ -284,6 +396,8 @@ class Codegen:
             self._gen_assign(s); return
         if isinstance(s, A.While):
             self._gen_while(s); return
+        if isinstance(s, A.ForStmt):
+            self._gen_for(s); return
         if isinstance(s, A.YieldStmt):
             self._gen_yield(s); return
         if isinstance(s, A.ReleaseStmt):
@@ -301,6 +415,134 @@ class Codegen:
             raise CodegenError(f"cannot release step-bound tablets {s.name!r}")
         assert self.builder is not None
         self.builder.call(info.release, [var.ir_ref])
+
+    def _gen_for(self, f: A.ForStmt) -> None:
+        """Generate a `for name in iter { body }` loop.
+
+        Three iterable shapes are supported; each picks a different loop
+        body:
+
+        - **str**: walk 0..len, load s.ptr[i] as u8.
+        - **tablets[N]T**: walk the chain via the cached `get` helper.
+        - **table**: walk the global array in memory order.
+
+        The loop variable is bound as a fresh `step` (SSA) per iteration
+        so it cannot be assigned inside the body."""
+        assert self.builder is not None
+
+        # Comptime table iteration — recognise the table by name before
+        # we try to produce a value for the iter expression.
+        if isinstance(f.iter, A.Ident) and f.iter.name in self._tables:
+            self._gen_for_table(f, f.iter.name)
+            return
+
+        iter_val = self._gen_expr(f.iter)
+        if iter_val is None:
+            raise CodegenError("for: iter expression has no value")
+
+        if self._is_str_value(iter_val.type):
+            self._gen_for_str(f, iter_val)
+            return
+
+        info = self._tablets_info_for(iter_val.type)
+        if info is not None:
+            self._gen_for_tablets(f, iter_val, info)
+            return
+
+        raise CodegenError(
+            f"for: cannot iterate over value of type {iter_val.type}"
+        )
+
+    def _gen_for_str(self, f: A.ForStmt, str_val: ir.Value) -> None:
+        """Lower `for c in s { body }` — c is u8, bounds-safe by construction
+        since we walk 0..len."""
+        assert self.builder is not None
+        ptr = self.builder.extract_value(str_val, 0)
+        length = self.builder.extract_value(str_val, 1)
+        self._emit_counted_loop(
+            length,
+            lambda i: self.builder.load(
+                self.builder.gep(ptr, [i], inbounds=True),
+            ),
+            f,
+        )
+
+    def _gen_for_tablets(
+        self, f: A.ForStmt, tbl_val: ir.Value, info: "TabletsInfo",
+    ) -> None:
+        """Iterate over a tablets value. We reuse the cached `get` helper;
+        mem2reg + the existing optimizer clean up the redundant chain walks
+        for dense access patterns."""
+        assert self.builder is not None
+        # tbl_val is a value (loaded struct). We need an address to pass
+        # to the get helper, so spill it to a temp alloca.
+        slot = self._alloca_entry(info.tablets_ty, "for.tbl")
+        self.builder.store(tbl_val, slot)
+        len_addr = self.builder.gep(
+            slot, [ir.Constant(I32, 0), ir.Constant(I32, 2)], inbounds=True,
+        )
+        length = self.builder.load(len_addr)
+        self._emit_counted_loop(
+            length,
+            lambda i: self.builder.call(info.get, [slot, i]),
+            f,
+        )
+
+    def _gen_for_table(self, f: A.ForStmt, name: str) -> None:
+        """Walk a compile-time table in declaration order (element index
+        0..size-1), regardless of the table's `lo` bound."""
+        assert self.builder is not None
+        g, size, _lo, _elem_ty = self._tables[name]
+        length = ir.Constant(I64, size)
+        zero = ir.Constant(I32, 0)
+
+        def load_at(i: ir.Value) -> ir.Value:
+            return self.builder.load(
+                self.builder.gep(g, [zero, i], inbounds=True),
+            )
+
+        self._emit_counted_loop(length, load_at, f)
+
+    def _emit_counted_loop(
+        self,
+        length: ir.Value,
+        load_element,
+        f: A.ForStmt,
+    ) -> None:
+        """Emit the shared 0..length loop skeleton and bind `f.name` to the
+        current element inside the body. `load_element(i_i64)` returns the
+        value to bind."""
+        assert self.builder is not None
+        fn = self.builder.function
+        header = fn.append_basic_block("for.header")
+        body = fn.append_basic_block("for.body")
+        exit_ = fn.append_basic_block("for.exit")
+
+        i_slot = self._alloca_entry(I64, "for.i")
+        self.builder.store(ir.Constant(I64, 0), i_slot)
+        self.builder.branch(header)
+
+        self.builder.position_at_end(header)
+        i_val = self.builder.load(i_slot)
+        cond = self.builder.icmp_signed("<", i_val, length)
+        self.builder.cbranch(cond, body, exit_)
+
+        self.builder.position_at_end(body)
+        element = load_element(i_val)
+        self.scopes.append({})
+        try:
+            self._bind(f.name, Variable(
+                is_mut=False, ir_ref=element, value_ty=element.type,
+            ))
+            self._gen_block(f.body)
+        finally:
+            self.scopes.pop()
+        if not self._is_terminated():
+            next_i = self.builder.add(i_val, ir.Constant(I64, 1))
+            self.builder.store(next_i, i_slot)
+            self.builder.branch(header)
+
+        self.builder.position_at_end(exit_)
 
     def _gen_while(self, w: A.While) -> None:
         assert self.builder is not None
@@ -381,16 +623,16 @@ class Codegen:
         an `if` without `else`, which produces unit)."""
         if isinstance(e, A.IntLit):
             return ir.Constant(I64, e.value)
+        if isinstance(e, A.CharLit):
+            return ir.Constant(I8, e.value)
         if isinstance(e, A.BoolLit):
             return ir.Constant(I1, 1 if e.value else 0)
         if isinstance(e, A.StringLit):
-            return self._str_ptr(e.value)
+            return self._gen_string_lit(e.value)
         if isinstance(e, A.SexLit):
-            # The lexer already pre-reduced the sex digits to (num, den).
-            return ir.Constant(RAT, (
-                ir.Constant(I64, e.num),
-                ir.Constant(I64, e.den),
-            ))
+            return self._gen_sex_lit(e)
+        if isinstance(e, A.StructLit):
+            return self._gen_struct_lit(e)
         if isinstance(e, A.Field):
             return self._gen_field(e)
         if isinstance(e, A.Index):
@@ -517,6 +759,14 @@ class Codegen:
         if operand is None:
             raise CodegenError(f"unary {e.op} operand has no value")
         if e.op == "-":
+            if operand.type == SEX:
+                # Flip sign byte in place; digits untouched.
+                sign = self.builder.extract_value(operand, SEX_IDX_SIGN)
+                flipped = self.builder.xor(sign, ir.Constant(I8, 1))
+                return self.builder.insert_value(operand, flipped, SEX_IDX_SIGN)
+            if operand.type == RAT:
+                num = self.builder.extract_value(operand, 0)
+                return self.builder.insert_value(operand, self.builder.neg(num), 0)
             if not isinstance(operand.type, ir.IntType) or operand.type.width < 8:
                 raise CodegenError(f"unary - requires integer, got {operand.type}")
             return self.builder.neg(operand)
@@ -533,6 +783,14 @@ class Codegen:
         if lhs is None or rhs is None:
             raise CodegenError(f"operand of binary {e.op} has no value")
         op = e.op
+
+        # Sex operands lower to rat arithmetic for now — this is the
+        # warning path the type checker already announced. Phase 3 will
+        # replace this with native digit-sequence arithmetic.
+        if lhs.type == SEX:
+            lhs = self._coerce(lhs, RAT)
+        if rhs.type == SEX:
+            rhs = self._coerce(rhs, RAT)
 
         # --- rat arithmetic and comparison ---
         if lhs.type == RAT and rhs.type == RAT:
@@ -552,6 +810,16 @@ class Codegen:
             }[op](lhs, rhs)
 
         if op in ("<", "<=", ">", ">=", "==", "!="):
+            # Mixed-width integer compare: promote to the wider type
+            # (matches _unify_if_arms on the checker side).
+            if (
+                isinstance(lhs.type, ir.IntType)
+                and isinstance(rhs.type, ir.IntType)
+                and lhs.type.width != rhs.type.width
+            ):
+                target = lhs.type if lhs.type.width >= rhs.type.width else rhs.type
+                lhs = self._coerce(lhs, target)
+                rhs = self._coerce(rhs, target)
             if lhs.type != rhs.type or not isinstance(lhs.type, ir.IntType):
                 raise CodegenError(
                     f"comparison requires matching types, got {lhs.type} and {rhs.type}"
@@ -629,15 +897,22 @@ class Codegen:
         return self.builder.gep(g, [zero, zero], inbounds=True)
 
     def _gen_print(self, args: list[A.Expr], *, newline: bool) -> None:
-        if len(args) != 1:
+        if not args:
             raise CodegenError(
-                f"{'println' if newline else 'print'} takes exactly one argument"
+                f"{'println' if newline else 'print'} takes at least one argument"
             )
         assert self.builder is not None
-        val = self._gen_expr(args[0])
-        if val is None:
-            raise CodegenError("print argument has no value")
+        # Each argument is emitted without a newline; if `newline=True`
+        # the trailing newline goes AFTER the last argument only.
+        for i, arg in enumerate(args):
+            val = self._gen_expr(arg)
+            if val is None:
+                raise CodegenError("print argument has no value")
+            last = (i == len(args) - 1)
+            self._emit_one_print(val, newline=(newline and last))
 
+    def _emit_one_print(self, val: ir.Value, *, newline: bool) -> None:
+        assert self.builder is not None
         # Dispatch on runtime IR type.
         if val.type == I1:
             fmt = "%s\n" if newline else "%s"
@@ -645,25 +920,39 @@ class Codegen:
                 val, self._str_ptr(b"true"), self._str_ptr(b"false"),
             )
             self.builder.call(self.printf, [self._str_ptr(fmt.encode()), choice])
-            return None
+            return
 
         if isinstance(val.type, ir.IntType):
             fmt = "%lld\n" if newline else "%lld"
             v64 = self._coerce(val, I64)
             self.builder.call(self.printf, [self._str_ptr(fmt.encode()), v64])
-            return None
+            return
 
-        if isinstance(val.type, ir.PointerType) and val.type.pointee == I8:
-            fmt = "%s\n" if newline else "%s"
-            self.builder.call(self.printf, [self._str_ptr(fmt.encode()), val])
-            return None
+        if val.type == SEX:
+            self._emit_sex_print(val, newline=newline)
+            return
+
+        # Seal types must be checked before RAT, since a user seal may be
+        # structurally equal to the rat struct at the LLVM level.
+        if self._is_str_value(val.type):
+            ptr = self.builder.extract_value(val, 0)
+            length = self.builder.extract_value(val, 1)
+            null_file = ir.Constant(I8.as_pointer(), None)
+            self.builder.call(self._get_fflush(), [null_file])
+            stdout_fd = ir.Constant(I32, 1)
+            self.builder.call(self._get_write(), [stdout_fd, ptr, length])
+            if newline:
+                self.builder.call(self._get_write(), [
+                    stdout_fd, self._str_ptr(b"\n"), ir.Constant(I64, 1),
+                ])
+            return
 
         if val.type == RAT:
             num = self.builder.extract_value(val, 0)
             den = self.builder.extract_value(val, 1)
             fmt = "%lld/%lld\n" if newline else "%lld/%lld"
             self.builder.call(self.printf, [self._str_ptr(fmt.encode()), num, den])
-            return None
+            return
 
         raise CodegenError(f"print: unsupported value type {val.type}")
 
@@ -707,13 +996,97 @@ class Codegen:
         target = self._gen_expr(e.target)
         if target is None:
             raise CodegenError("field access target has no value")
+        # Check user-defined structs BEFORE rat: a `struct P { x: i64, y: i64 }`
+        # is structurally equal to RAT at the LLVM level, but identity
+        # comparison against _struct_types distinguishes them correctly.
+        struct_name = self._struct_name_for(target.type)
+        if struct_name is not None:
+            for i, (fname, _fty) in enumerate(self._struct_fields[struct_name]):
+                if fname == e.name:
+                    return self.builder.extract_value(target, i)
+            raise CodegenError(
+                f"struct {struct_name!r} has no field {e.name!r}"
+            )
         if target.type == RAT:
             if e.name == "num":
                 return self.builder.extract_value(target, 0)
             if e.name == "den":
                 return self.builder.extract_value(target, 1)
             raise CodegenError(f"rat has no field {e.name!r}; only num and den")
+        if target.type == SEX and e.name in ("num", "den"):
+            # Sex has no literal num/den fields; reduce first.
+            as_rat = self._coerce(target, RAT)
+            return self.builder.extract_value(as_rat, 0 if e.name == "num" else 1)
         raise CodegenError(f"field access on {target.type} not supported yet")
+
+    def _gen_sex_lit(self, e: A.SexLit) -> ir.Value:
+        """Lower a sex literal to a digit-form constant. The lexer has
+        already validated each digit is in [0, 60)."""
+        int_digits = e.int_digits
+        frac_digits = e.frac_digits if e.frac_digits is not None else []
+        all_digits = int_digits + frac_digits
+        if len(all_digits) > SEX_MAX_DIGITS:
+            raise CodegenError(
+                f"sex literal has {len(all_digits)} digits; max is "
+                f"{SEX_MAX_DIGITS}"
+            )
+        # Pad to fixed width so every sex value has identical layout.
+        padded = all_digits + [0] * (SEX_MAX_DIGITS - len(all_digits))
+        digit_arr = ir.Constant(
+            ir.ArrayType(I8, SEX_MAX_DIGITS),
+            padded,
+        )
+        radix = len(int_digits)
+        count = len(all_digits)
+        return ir.Constant(SEX, (
+            digit_arr,
+            ir.Constant(I8, radix),
+            ir.Constant(I8, count),
+            ir.Constant(I8, 0),   # positive by construction; unary - flips
+            ir.Constant(I8, 0),   # pad
+        ))
+
+    def _gen_string_lit(self, data: bytes) -> ir.Value:
+        """Lower a string literal to a `str` seal value: `{ ptr: *u8, len: i64 }`.
+        Backing bytes live in a deduped internal global."""
+        assert self.builder is not None
+        if "str" not in self._struct_types:
+            raise CodegenError(
+                "string literal used but `str` seal is not registered "
+                "(driver should have auto-injected it)"
+            )
+        struct_ty = self._struct_types["str"]
+        ptr = self._str_ptr(data)                      # i8*
+        length = ir.Constant(I64, len(data))
+        value: ir.Value = ir.Constant(struct_ty, ir.Undefined)
+        value = self.builder.insert_value(value, ptr, 0)
+        value = self.builder.insert_value(value, length, 1)
+        return value
+
+    def _is_str_value(self, llvm_ty: ir.Type) -> bool:
+        ty = self._struct_types.get("str")
+        return ty is not None and ty is llvm_ty
+
+    def _gen_struct_lit(self, e: A.StructLit) -> ir.Value:
+        assert self.builder is not None
+        if e.name not in self._struct_types:
+            raise CodegenError(f"unknown struct {e.name!r}")
+        struct_ty = self._struct_types[e.name]
+        fields = self._struct_fields[e.name]
+        provided: dict[str, A.Expr] = dict(e.fields)
+        value: ir.Value = ir.Constant(struct_ty, ir.Undefined)
+        for i, (fname, fty) in enumerate(fields):
+            if fname not in provided:
+                raise CodegenError(
+                    f"struct {e.name!r}: missing field {fname!r}"
+                )
+            fv = self._gen_expr(provided[fname])
+            if fv is None:
+                raise CodegenError(
+                    f"struct {e.name!r} field {fname!r}: initializer has no value"
+                )
+            value = self.builder.insert_value(value, self._coerce(fv, fty), i)
+        return value
 
     # --- tablets method/field/index dispatch -----------------------------
 
@@ -858,7 +1231,20 @@ class Codegen:
                 if info is not None:
                     return self._gen_tablets_index(info, var, e.index)
 
-        raise CodegenError("indexing is only supported on tables and tablets")
+        # str indexing: bounds-checked byte load through s.ptr.
+        target = self._gen_expr(e.target)
+        if target is not None and self._is_str_value(target.type):
+            idx = self._gen_expr(e.index)
+            if idx is None:
+                raise CodegenError("str index has no value")
+            idx_i64 = self._coerce(idx, I64)
+            ptr = self.builder.extract_value(target, 0)    # i8*
+            length = self.builder.extract_value(target, 1) # i64
+            self._emit_dynamic_bounds_trap(idx_i64, length)
+            byte_ptr = self.builder.gep(ptr, [idx_i64], inbounds=True)
+            return self.builder.load(byte_ptr)
+
+        raise CodegenError("indexing is only supported on tables, tablets, and str")
 
     def _gen_tablets_index(
         self, info: TabletsInfo, var: Variable, idx_expr: A.Expr,
@@ -1134,6 +1520,255 @@ class Codegen:
                 name="llvm.trap",
             )
         return self._trap
+
+    def _get_sex_print(self) -> ir.Function:
+        """Emit (once) `__tuppu_sex_print(sex, newline: i1)` — prints a sex
+        value in Babylonian notation: integer digits space-separated,
+        a semicolon before the fractional digits (if any), then fractional
+        digits space-separated. Negative sign printed as a leading `-`."""
+        if self._sex_print is not None:
+            return self._sex_print
+
+        fn = ir.Function(
+            self.module,
+            ir.FunctionType(ir.VoidType(), [SEX, I1]),
+            name="__tuppu_sex_print",
+        )
+        fn.args[0].name = "sx"
+        fn.args[1].name = "newline"
+        sx, want_nl = fn.args
+
+        entry     = fn.append_basic_block("entry")
+        neg_bb    = fn.append_basic_block("print.neg")
+        int_loop  = fn.append_basic_block("int.loop")
+        int_body  = fn.append_basic_block("int.body")
+        int_next  = fn.append_basic_block("int.next")
+        radix_bb  = fn.append_basic_block("radix")
+        has_frac  = fn.append_basic_block("print.semi")
+        frac_loop = fn.append_basic_block("frac.loop")
+        frac_body = fn.append_basic_block("frac.body")
+        frac_next = fn.append_basic_block("frac.next")
+        maybe_nl  = fn.append_basic_block("maybe.nl")
+        do_nl     = fn.append_basic_block("do.nl")
+        done      = fn.append_basic_block("done")
+
+        b = ir.IRBuilder(entry)
+        # _str_ptr emits GEPs into self.builder — temporarily point it at
+        # our local builder so the format constants live in this function.
+        saved_builder = self.builder
+        self.builder = b
+        try:
+            fmt_dash  = self._str_ptr(b"-")
+            fmt_sp    = self._str_ptr(b" ")
+            fmt_semi  = self._str_ptr(b";")
+            fmt_nl    = self._str_ptr(b"\n")
+            fmt_digit = self._str_ptr(b"%d")
+        finally:
+            self.builder = saved_builder
+        slot = b.alloca(SEX, name="sex.slot")
+        b.store(sx, slot)
+        digits_addr = b.gep(
+            slot, [ir.Constant(I32, 0), ir.Constant(I32, SEX_IDX_DIGITS)],
+            inbounds=True,
+        )
+        radix = b.sext(b.load(b.gep(
+            slot, [ir.Constant(I32, 0), ir.Constant(I32, SEX_IDX_RADIX)],
+            inbounds=True,
+        )), I64)
+        count = b.sext(b.load(b.gep(
+            slot, [ir.Constant(I32, 0), ir.Constant(I32, SEX_IDX_COUNT)],
+            inbounds=True,
+        )), I64)
+        sign = b.load(b.gep(
+            slot, [ir.Constant(I32, 0), ir.Constant(I32, SEX_IDX_SIGN)],
+            inbounds=True,
+        ))
+        is_neg = b.icmp_signed("!=", sign, ir.Constant(I8, 0))
+        b.cbranch(is_neg, neg_bb, int_loop)
+
+        b.position_at_end(neg_bb)
+        b.call(self.printf, [fmt_dash])
+        b.branch(int_loop)
+
+        # Integer-digit loop: print each digit, space-separated.
+        b.position_at_end(int_loop)
+        i_phi = b.phi(I64, "i")
+        i_phi.add_incoming(ir.Constant(I64, 0), neg_bb)
+        i_phi.add_incoming(ir.Constant(I64, 0), entry)
+        done_int = b.icmp_signed(">=", i_phi, radix)
+        b.cbranch(done_int, radix_bb, int_body)
+
+        b.position_at_end(int_body)
+        need_space = b.icmp_signed(">", i_phi, ir.Constant(I64, 0))
+        with b.if_then(need_space):
+            b.call(self.printf, [fmt_sp])
+        dptr = b.gep(digits_addr, [ir.Constant(I32, 0), i_phi], inbounds=True)
+        dval = b.zext(b.load(dptr), I32)
+        b.call(self.printf, [fmt_digit, dval])
+        b.branch(int_next)
+
+        b.position_at_end(int_next)
+        next_i = b.add(i_phi, ir.Constant(I64, 1))
+        i_phi.add_incoming(next_i, int_next)
+        b.branch(int_loop)
+
+        # After integer digits, maybe print ';' and fractional digits.
+        b.position_at_end(radix_bb)
+        fractional = b.icmp_signed(">", count, radix)
+        b.cbranch(fractional, has_frac, maybe_nl)
+
+        b.position_at_end(has_frac)
+        b.call(self.printf, [fmt_semi])
+        b.branch(frac_loop)
+
+        b.position_at_end(frac_loop)
+        j_phi = b.phi(I64, "j")
+        j_phi.add_incoming(radix, has_frac)
+        done_frac = b.icmp_signed(">=", j_phi, count)
+        b.cbranch(done_frac, maybe_nl, frac_body)
+
+        b.position_at_end(frac_body)
+        # First fractional digit immediately follows `;` with no space.
+        need_sp2 = b.icmp_signed(">", j_phi, radix)
+        with b.if_then(need_sp2):
+            b.call(self.printf, [fmt_sp])
+        fptr = b.gep(digits_addr, [ir.Constant(I32, 0), j_phi], inbounds=True)
+        fval = b.zext(b.load(fptr), I32)
+        b.call(self.printf, [fmt_digit, fval])
+        b.branch(frac_next)
+
+        b.position_at_end(frac_next)
+        next_j = b.add(j_phi, ir.Constant(I64, 1))
+        j_phi.add_incoming(next_j, frac_next)
+        b.branch(frac_loop)
+
+        b.position_at_end(maybe_nl)
+        b.cbranch(want_nl, do_nl, done)
+
+        b.position_at_end(do_nl)
+        b.call(self.printf, [fmt_nl])
+        b.branch(done)
+
+        b.position_at_end(done)
+        b.ret_void()
+
+        self._sex_print = fn
+        return fn
+
+    def _emit_sex_print(self, val: ir.Value, *, newline: bool) -> None:
+        assert self.builder is not None
+        nl_flag = ir.Constant(I1, 1 if newline else 0)
+        self.builder.call(self._get_sex_print(), [val, nl_flag])
+
+    def _get_sex_to_rat(self) -> ir.Function:
+        """Emit (once per module) `__tuppu_sex_to_rat(sex) -> rat`.
+
+        Reconstructs an integer numerator by Horner-style evaluation over
+        the digit sequence (each digit × 60^place), computes the implied
+        denominator from (count - radix) fractional places, applies the
+        sign bit, then delegates to `__tuppu_rat_reduce` for gcd reduction.
+        The result is a normal rat value — all invariants preserved."""
+        if self._sex_to_rat is not None:
+            return self._sex_to_rat
+
+        fn = ir.Function(
+            self.module,
+            ir.FunctionType(RAT, [SEX]),
+            name="__tuppu_sex_to_rat",
+        )
+        fn.args[0].name = "sx"
+        sx = fn.args[0]
+
+        entry = fn.append_basic_block("entry")
+        num_loop = fn.append_basic_block("num.loop")
+        num_body = fn.append_basic_block("num.body")
+        den_loop = fn.append_basic_block("den.loop")
+        den_body = fn.append_basic_block("den.body")
+        apply_sign = fn.append_basic_block("apply.sign")
+        do_reduce = fn.append_basic_block("reduce")
+
+        b = ir.IRBuilder(entry)
+
+        # Spill the sex value to a stack slot so we can GEP into the digit
+        # array by a runtime index. (LLVM can't index a struct field by a
+        # non-constant, but it can GEP into an alloca.)
+        slot = b.alloca(SEX, name="sex.slot")
+        b.store(sx, slot)
+        digits_addr = b.gep(
+            slot,
+            [ir.Constant(I32, 0), ir.Constant(I32, SEX_IDX_DIGITS)],
+            inbounds=True,
+        )
+        radix = b.load(b.gep(
+            slot, [ir.Constant(I32, 0), ir.Constant(I32, SEX_IDX_RADIX)],
+            inbounds=True,
+        ))
+        count = b.load(b.gep(
+            slot, [ir.Constant(I32, 0), ir.Constant(I32, SEX_IDX_COUNT)],
+            inbounds=True,
+        ))
+        sign = b.load(b.gep(
+            slot, [ir.Constant(I32, 0), ir.Constant(I32, SEX_IDX_SIGN)],
+            inbounds=True,
+        ))
+        count_i64 = b.sext(count, I64)
+        radix_i64 = b.sext(radix, I64)
+        frac_places = b.sub(count_i64, radix_i64)
+        b.branch(num_loop)
+
+        # num = sum(digits[i] * 60^(count-1-i)) computed Horner-style:
+        #   num = 0; for i in 0..count: num = num*60 + digits[i]
+        b.position_at_end(num_loop)
+        num_phi = b.phi(I64, "num")
+        i_phi = b.phi(I64, "i")
+        num_phi.add_incoming(ir.Constant(I64, 0), entry)
+        i_phi.add_incoming(ir.Constant(I64, 0), entry)
+        done_num = b.icmp_signed(">=", i_phi, count_i64)
+        b.cbranch(done_num, den_loop, num_body)
+
+        b.position_at_end(num_body)
+        digit_ptr = b.gep(
+            digits_addr,
+            [ir.Constant(I32, 0), i_phi],
+            inbounds=True,
+        )
+        digit_byte = b.load(digit_ptr)
+        digit = b.zext(digit_byte, I64)
+        scaled = b.mul(num_phi, ir.Constant(I64, 60))
+        next_num = b.add(scaled, digit)
+        next_i = b.add(i_phi, ir.Constant(I64, 1))
+        num_phi.add_incoming(next_num, num_body)
+        i_phi.add_incoming(next_i, num_body)
+        b.branch(num_loop)
+
+        # den = 60^frac_places
+        b.position_at_end(den_loop)
+        den_phi = b.phi(I64, "den")
+        k_phi = b.phi(I64, "k")
+        den_phi.add_incoming(ir.Constant(I64, 1), num_loop)
+        k_phi.add_incoming(ir.Constant(I64, 0), num_loop)
+        done_den = b.icmp_signed(">=", k_phi, frac_places)
+        b.cbranch(done_den, apply_sign, den_body)
+
+        b.position_at_end(den_body)
+        next_den = b.mul(den_phi, ir.Constant(I64, 60))
+        next_k = b.add(k_phi, ir.Constant(I64, 1))
+        den_phi.add_incoming(next_den, den_body)
+        k_phi.add_incoming(next_k, den_body)
+        b.branch(den_loop)
+
+        # Apply sign (any nonzero sign byte means negative).
+        b.position_at_end(apply_sign)
+        is_neg = b.icmp_signed("!=", sign, ir.Constant(I8, 0))
+        signed_num = b.select(is_neg, b.neg(num_phi), num_phi)
+        b.branch(do_reduce)
+
+        b.position_at_end(do_reduce)
+        result = b.call(self._get_rat_reduce(), [signed_num, den_phi])
+        b.ret(result)
+
+        self._sex_to_rat = fn
+        return fn
 
     def _get_rat_reduce(self) -> ir.Function:
         """Emit (once per module) __tuppu_rat_reduce(i64 num, i64 den) -> rat.

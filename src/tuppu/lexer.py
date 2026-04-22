@@ -20,6 +20,7 @@ class Tok(Enum):
                         #   - frac_digits: list[int] | None — post-radix digits, or None for integer form
                         #   - num, den: pre-reduced rat form, den > 0
     STRING = auto()     # value: bytes (after escape processing)
+    CHAR = auto()       # value: int (0..255) — a single-byte char literal 'a'
     TRUE = auto()
     FALSE = auto()
 
@@ -55,6 +56,11 @@ class Tok(Enum):
     PERCENT = auto()    # %
     EQ = auto()         # =
     EQEQ = auto()       # ==
+    PLUSEQ = auto()     # +=
+    MINUSEQ = auto()    # -=
+    STAREQ = auto()     # *=
+    SLASHEQ = auto()    # /=
+    PERCENTEQ = auto()  # %=
     BANG = auto()       # !
     BANGEQ = auto()     # !=
     LT = auto()         # <
@@ -97,6 +103,10 @@ KEYWORDS: dict[str, Tok] = {
     "tablets": Tok.TABLETS,
     "release": Tok.RELEASE,
     "struct": Tok.STRUCT,
+    # `seal` is the Babylonian-flavored alias for `struct`: cylinder seals
+    # were the native metaphor for nominal identity — a named, composite
+    # design pressed into clay to yield distinct impressions.
+    "seal": Tok.STRUCT,
     "true": Tok.TRUE,
     "false": Tok.FALSE,
 }
@@ -132,6 +142,7 @@ def _sex_to_rat(int_digits: list[int], frac_digits: list[int] | None) -> tuple[i
 CONTINUERS: frozenset[Tok] = frozenset({
     Tok.PLUS, Tok.MINUS, Tok.STAR, Tok.SLASH, Tok.PERCENT,
     Tok.EQ, Tok.EQEQ, Tok.BANGEQ,
+    Tok.PLUSEQ, Tok.MINUSEQ, Tok.STAREQ, Tok.SLASHEQ, Tok.PERCENTEQ,
     Tok.LT, Tok.LE, Tok.GT, Tok.GE,
     Tok.AMPAMP, Tok.PIPEPIPE, Tok.BANG,
     Tok.ARROW, Tok.FATARROW,
@@ -247,6 +258,10 @@ class Lexer:
 
             if c == '"':
                 self._scan_string()
+                continue
+
+            if c == "'":
+                self._scan_char()
                 continue
 
             self._scan_operator()
@@ -392,8 +407,40 @@ class Lexer:
             out.extend(c.encode("utf-8"))
         self._emit(Tok.STRING, bytes(out), line, col)
 
+    def _scan_char(self) -> None:
+        """Scan a char literal like `'a'` or `'\\n'`. Body is exactly one
+        byte post-escape; emits Tok.CHAR with integer byte value."""
+        line, col = self.line, self.col
+        self._advance()  # opening '
+        if self.pos >= len(self.src):
+            raise LexError("unterminated char literal", line, col)
+        c = self._peek()
+        if c == "'":
+            raise LexError("empty char literal", line, col)
+        if c == "\n":
+            raise LexError("unterminated char literal (newline)", line, col)
+        if c == "\\":
+            self._advance()
+            esc = self._peek()
+            if esc == "":
+                raise LexError("unterminated escape", self.line, self.col)
+            self._advance()
+            payload = self._decode_escape(esc).encode("utf-8")
+        else:
+            self._advance()
+            payload = c.encode("utf-8")
+        if len(payload) != 1:
+            raise LexError(
+                "char literal must encode to exactly one byte",
+                line, col,
+            )
+        if self._peek() != "'":
+            raise LexError("expected closing ' in char literal", self.line, self.col)
+        self._advance()  # closing '
+        self._emit(Tok.CHAR, payload[0], line, col)
+
     def _decode_escape(self, esc: str) -> str:
-        table = {"n": "\n", "r": "\r", "t": "\t", "0": "\0", '"': '"', "\\": "\\"}
+        table = {"n": "\n", "r": "\r", "t": "\t", "0": "\0", '"': '"', "'": "'", "\\": "\\"}
         if esc in table:
             return table[esc]
         raise LexError(f"unknown escape \\{esc}", self.line, self.col)
@@ -408,6 +455,8 @@ class Lexer:
             "==": Tok.EQEQ, "!=": Tok.BANGEQ, "<=": Tok.LE, ">=": Tok.GE,
             "&&": Tok.AMPAMP, "||": Tok.PIPEPIPE, "->": Tok.ARROW,
             "=>": Tok.FATARROW, "..": Tok.DOTDOT,
+            "+=": Tok.PLUSEQ, "-=": Tok.MINUSEQ, "*=": Tok.STAREQ,
+            "/=": Tok.SLASHEQ, "%=": Tok.PERCENTEQ,
         }
         if two in two_map:
             self._advance(); self._advance()
