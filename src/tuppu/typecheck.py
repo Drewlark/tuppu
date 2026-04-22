@@ -81,17 +81,21 @@ class TyPtr:
 
 @dataclass(frozen=True)
 class TyHandle:
-    """`tablet T` — a handle into some `tablets[N]T` storage. At
+    """`wedge T` — a handle into some `tablets[N]T` storage. At
     runtime a pointer to T; at the type level it's distinct from
     `*T` so we can restrict how it's obtained (only through
     `tablets.push`, not `&x`) and what operations it supports
-    (auto-deref field access, equality, `lost` comparison)."""
+    (auto-deref field access, equality, `lost` comparison).
+
+    The name comes from cuneiform being "wedge-writing" — a wedge
+    is the atom of a Mesopotamian mark, a single pointer to
+    something larger."""
     element: "Ty"
-    def __str__(self) -> str: return f"tablet {self.element}"
+    def __str__(self) -> str: return f"wedge {self.element}"
 
 @dataclass(frozen=True)
 class TyLost:
-    """The bare `lost` literal's type — coerces to any `tablet T`.
+    """The bare `lost` literal's type — coerces to any `wedge T`.
     Never appears in a type annotation; only as the transient type
     of a `LostLit` expression that hasn't been placed yet."""
     def __str__(self) -> str: return "lost"
@@ -252,7 +256,7 @@ class Checker:
     def _register_struct_name(self, s: A.StructDecl) -> None:
         if s.name in PRIM_TYPES:
             raise CheckError(
-                f"struct {s.name!r}: name shadows a built-in type", s.line, s.col,
+                f"tablet {s.name!r}: name shadows a built-in type", s.line, s.col,
             )
         if s.name in self.structs:
             raise CheckError(
@@ -266,7 +270,7 @@ class Checker:
         for fname, ftype in s.fields:
             if fname in seen:
                 raise CheckError(
-                    f"struct {s.name!r}: duplicate field {fname!r}",
+                    f"tablet {s.name!r}: duplicate field {fname!r}",
                     s.line, s.col,
                 )
             seen.add(fname)
@@ -352,7 +356,7 @@ class Checker:
         # Trailing-expression return (no yield): apply escape check.
         if isinstance(expected, TyHandle) and self._expr_escapes(fn.body):
             raise CheckError(
-                f"in fn {fn.name!r}: cannot return a tablet handle whose "
+                f"in fn {fn.name!r}: cannot return a wedge handle whose "
                 f"tablets is declared locally — auto-release at scope "
                 f"exit would free the storage while the caller still "
                 f"holds the handle. Take the tablets as a parameter "
@@ -541,7 +545,7 @@ class Checker:
             )
         if isinstance(expected, TyHandle) and self._expr_escapes(y.value):
             raise CheckError(
-                f"yield: cannot return a tablet handle whose tablets "
+                f"yield: cannot return a wedge handle whose tablets "
                 f"is declared locally — auto-release at scope exit "
                 f"would free the storage while the caller still holds "
                 f"the handle. Take the tablets as a parameter instead.",
@@ -875,7 +879,7 @@ class Checker:
                     return fty
             field_names = [n for n, _ in fields]
             raise CheckError(
-                f"struct {target_ty.name!r} has no field {e.name!r}"
+                f"tablet {target_ty.name!r} has no field {e.name!r}"
                 f"{_suggest(e.name, field_names)}",
                 e.line, e.col,
             )
@@ -897,27 +901,27 @@ class Checker:
         for fname, fexpr in e.fields:
             if fname not in declared_map:
                 raise CheckError(
-                    f"struct {e.name!r}: unknown field {fname!r}"
+                    f"tablet {e.name!r}: unknown field {fname!r}"
                     f"{_suggest(fname, declared_map)}",
                     e.line, e.col,
                 )
             if fname in seen:
                 raise CheckError(
-                    f"struct {e.name!r}: duplicate field {fname!r} in literal",
+                    f"tablet {e.name!r}: duplicate field {fname!r} in literal",
                     e.line, e.col,
                 )
             seen.add(fname)
             val_ty = self._tc_expr(fexpr)
             if not _coerces_to(val_ty, declared_map[fname]):
                 raise CheckError(
-                    f"struct {e.name!r} field {fname!r}: got {val_ty}, "
+                    f"tablet {e.name!r} field {fname!r}: got {val_ty}, "
                     f"expected {declared_map[fname]}",
                     e.line, e.col,
                 )
         missing = [n for n, _ in declared if n not in seen]
         if missing:
             raise CheckError(
-                f"struct {e.name!r}: missing field(s) {', '.join(repr(n) for n in missing)}",
+                f"tablet {e.name!r}: missing field(s) {', '.join(repr(n) for n in missing)}",
                 e.line, e.col,
             )
         return self.structs[e.name]

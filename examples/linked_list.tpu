@@ -10,7 +10,7 @@ fn main() -> i32 {
   // `store` is the tablets that owns every IntNode we push. When
   // main returns, auto-release frees every chunk — no explicit free.
   mut store: tablets[16]IntNode
-  mut head: tablet IntNode = lost
+  mut head: wedge IntNode = lost
 
   // Push 5, 4, 3, 2, 1 to the front. Each push returns the new head.
   head = int_list_push(store, head, 5)
@@ -26,7 +26,7 @@ fn main() -> i32 {
   int_list_print(head)
 
   // Search returns a handle to the matching node, or `lost`.
-  step maybe_three: tablet IntNode = int_list_find(head, 3)
+  step maybe_three: wedge IntNode = int_list_find(head, 3)
   if maybe_three != lost {
     println("found 3; its successor is ", maybe_three.next.value)
   }

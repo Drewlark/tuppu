@@ -324,9 +324,10 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
                 return
             if color[name] == 1:
                 raise CodegenError(
-                    f"struct {name!r} is recursively contained without "
-                    f"pointer indirection — use `*{name}` for a "
-                    f"recursive reference"
+                    f"tablet {name!r} is recursively contained without "
+                    f"indirection — use `wedge {name}` for a "
+                    f"recursive reference (it gives finite size via "
+                    f"a tablets-backed pointer)"
                 )
             color[name] = 1
             for dep in direct_deps[name]:
@@ -738,7 +739,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
                     )
                     return field_ptr, fty
             raise CodegenError(
-                f"struct {struct_name!r} has no field {target.name!r}"
+                f"tablet {struct_name!r} has no field {target.name!r}"
             )
         raise CodegenError(
             f"assignment target must be a variable or field chain, "
@@ -1226,7 +1227,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
                         )
                         return self.builder.load(field_ptr)
                 raise CodegenError(
-                    f"struct {struct_name!r} has no field {e.name!r}"
+                    f"tablet {struct_name!r} has no field {e.name!r}"
                 )
         # Check user-defined structs BEFORE rat: a `struct P { x: i64, y: i64 }`
         # is structurally equal to RAT at the LLVM level, but identity
@@ -1237,7 +1238,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
                 if fname == e.name:
                     return self.builder.extract_value(target, i)
             raise CodegenError(
-                f"struct {struct_name!r} has no field {e.name!r}"
+                f"tablet {struct_name!r} has no field {e.name!r}"
             )
         if target.type == RAT:
             if e.name == "num":
@@ -1283,12 +1284,12 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         for i, (fname, fty) in enumerate(fields):
             if fname not in provided:
                 raise CodegenError(
-                    f"struct {e.name!r}: missing field {fname!r}"
+                    f"tablet {e.name!r}: missing field {fname!r}"
                 )
             fv = self._gen_expr(provided[fname])
             if fv is None:
                 raise CodegenError(
-                    f"struct {e.name!r} field {fname!r}: initializer has no value"
+                    f"tablet {e.name!r} field {fname!r}: initializer has no value"
                 )
             value = self.builder.insert_value(value, self._coerce(fv, fty), i)
         return value

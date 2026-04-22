@@ -1,7 +1,7 @@
 // Singly-linked list of i64, tablets-backed.
 //
 // A list is a pair: the backing tablets that owns the nodes, and a
-// `tablet IntNode` head handle pointing into it. Callers hold the
+// `wedge IntNode` head handle pointing into it. Callers hold the
 // tablets (for auto-release) and the head (the "current front").
 // Pushing returns a new head; the old head stays reachable through
 // the new head's `next`.
@@ -14,23 +14,23 @@
 // When generics land, this file generalizes to `List<T>`; for now,
 // `int_list_*` is the honest name.
 
-seal IntNode {
+tablet IntNode {
   value: i64,
-  next:  tablet IntNode,
+  next:  wedge IntNode,
 }
 
 // Return a new head that prepends `v` to `head`. `store` owns the
 // node storage — caller passes their own tablets by `mut`, so the
 // push persists and auto-release at the caller's scope frees every
 // node at once.
-fn int_list_push(mut store: tablets[16]IntNode, head: tablet IntNode, v: i64) -> tablet IntNode {
+fn int_list_push(mut store: tablets[16]IntNode, head: wedge IntNode, v: i64) -> wedge IntNode {
   store.push(IntNode { value: v, next: head })
 }
 
 // Count nodes in the list. Walks from head to lost.
-fn int_list_len(head: tablet IntNode) -> i64 {
+fn int_list_len(head: wedge IntNode) -> i64 {
   mut n: i64 = 0
-  mut cur: tablet IntNode = head
+  mut cur: wedge IntNode = head
   while cur != lost {
     n += 1
     cur = cur.next
@@ -39,9 +39,9 @@ fn int_list_len(head: tablet IntNode) -> i64 {
 }
 
 // Sum of all values. Handy for quick checks.
-fn int_list_sum(head: tablet IntNode) -> i64 {
+fn int_list_sum(head: wedge IntNode) -> i64 {
   mut total: i64 = 0
-  mut cur: tablet IntNode = head
+  mut cur: wedge IntNode = head
   while cur != lost {
     total += cur.value
     cur = cur.next
@@ -50,8 +50,8 @@ fn int_list_sum(head: tablet IntNode) -> i64 {
 }
 
 // Return the first node whose value equals `v`, or `lost` if absent.
-fn int_list_find(head: tablet IntNode, v: i64) -> tablet IntNode {
-  mut cur: tablet IntNode = head
+fn int_list_find(head: wedge IntNode, v: i64) -> wedge IntNode {
+  mut cur: wedge IntNode = head
   while cur != lost {
     if cur.value == v { yield cur }
     cur = cur.next
@@ -60,13 +60,13 @@ fn int_list_find(head: tablet IntNode, v: i64) -> tablet IntNode {
 }
 
 // True if `v` appears in the list.
-fn int_list_contains(head: tablet IntNode, v: i64) -> bool {
+fn int_list_contains(head: wedge IntNode, v: i64) -> bool {
   int_list_find(head, v) != lost
 }
 
 // Print each value on its own line. Handy for demos and debugging.
-fn int_list_print(head: tablet IntNode) {
-  mut cur: tablet IntNode = head
+fn int_list_print(head: wedge IntNode) {
+  mut cur: wedge IntNode = head
   while cur != lost {
     println(cur.value)
     cur = cur.next

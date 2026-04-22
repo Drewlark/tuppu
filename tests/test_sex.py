@@ -433,7 +433,7 @@ def test_int_to_sex_in_struct_field(tmp_path):
     # The scratch-file motivating case: integer literal at a sex field
     # slot should decompose via int→sex, not error out.
     src = (
-        "seal Point { x: sex, y: sex }\n"
+        "tablet Point { x: sex, y: sex }\n"
         "fn main() -> i32 {\n"
         "  step p = Point { x: 0, y: 0 }\n"
         "  println(p.x)\n"
@@ -449,7 +449,7 @@ def test_rat_to_sex_coerces_regular(tmp_path):
     # Storing a rat in a sex-typed field should reconstruct the Babylonian
     # digit form and print 1;30.
     src = (
-        "seal P { x: sex }\n"
+        "tablet P { x: sex }\n"
         "fn main() -> i32 {\n"
         "  step r: rat = rat(3, 2)\n"
         "  step p = P { x: r }\n"

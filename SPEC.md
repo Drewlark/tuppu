@@ -87,10 +87,14 @@ IDENT   = [a-zA-Z_] [a-zA-Z0-9_]*
 ### 3.3 Keywords (reserved)
 
 ```
-fn        step      mut       if        else      while
-for       in        yield     true      false     as
-table     tablet    tablets   release   struct    seal
+fn        step      mut       if        elif      else
+while     for       in        yield     true      false     as
+table     tablet    tablets   wedge     lost      release
+seal      colophon
 i8 i16 i32 i64 u8 u16 u32 u64 bool f32 f64 rat  sex  dish
+
+`seal` and `colophon` are reserved for future use (sum types and
+file-level metadata, respectively) — no current semantics.
 
 Char literals: `'a'`, `'\n'`, `'\\'`, `'\''` — single-byte, type `u8`.
 ```
@@ -159,7 +163,7 @@ Examples:
 | `1;24 51 10`  | fractional  | 30547/21600 ≈ √2    | `sex`        |
 | `1; 30`, `1 ; 30`, `1 ;30` | fractional | 3/2 (whitespace around `;` tolerated) | `sex` |
 
-Sex values silently coerce to `rat` (no-op at runtime; same struct) or
+Sex values silently coerce to `rat` (no-op at runtime; same tablet) or
 to any integer type (via truncating `sdiv num, den`). Arithmetic on sex
 values (`+`, `-`, `*`, `/`) is auto-lowered to rat arithmetic and emits
 a compile-time warning, as native sex arithmetic — which would avoid
@@ -174,7 +178,7 @@ BOOL     = "true" | "false"
 STRING   = "\"" ([^"\\] | "\\" ["\\nrt0])* "\""
 ```
 
-String literals have type `str` — a built-in seal (see §4.7) whose
+String literals have type `str` — a built-in tablet (see §4.7) whose
 contents live in the static section. Arbitrary bytes (including NUL)
 are permitted; printing goes through `write(2)` so embedded NULs
 survive unchanged.
@@ -185,7 +189,7 @@ survive unchanged.
 type = prim
      | "tablets" "[" INT "]" type    // chained growable
      | "*" type                      // raw pointer (see §4.7)
-     | IDENT                         // primitive, user seal, or `str`
+     | IDENT                         // primitive, user tablet, or `str`
 
 prim = "i8"  | "i16" | "i32" | "i64"
      | "u8"  | "u16" | "u32" | "u64"
@@ -201,7 +205,7 @@ Examples:
 ```
 tablets[256]Token  // chained storage, 256 tokens per tablet
 *u8                // raw pointer to a byte (used inside `str`)
-Point              // a user seal declared elsewhere
+Point              // a user tablet declared elsewhere
 ```
 
 ### 4.1 Primitives
@@ -212,7 +216,7 @@ types it wraps. Floating types are IEEE 754.
 
 ### 4.2 `rat`
 
-A rational number: `struct rat { num: i64, den: i64 }`, always stored
+A rational number: `tablet rat { num: i64, den: i64 }`, always stored
 reduced, with `den > 0`. Arithmetic operations reduce on construction.
 Overflow of either field traps at runtime.
 
@@ -235,7 +239,7 @@ name in docs and library code.
 Runtime layout (20 bytes):
 
 ```
-seal sex {
+tablet sex {
   digits : [16]u8,   // base-60 digits; int digits first, then fractional
   radix  : u8,       // where fractional begins (also = count of int digits)
   count  : u8,       // total digits used (0..=16)
@@ -312,21 +316,17 @@ Core operations on a `var toks: tablets[N]T`:
 There is no general-purpose heap. All dynamic allocation in user code
 goes through `tablets`.
 
-### 4.5 Structs (alias: `seal`)
+### 4.5 Tablets (product types)
 
-A user-defined composite type with named fields. Nominally typed —
-two structurally identical structs with different names are different
+A user-defined composite type with named fields — a clay tablet
+inscribed with specific field definitions. Nominally typed: two
+structurally identical tablets with different names are different
 types and do not implicitly convert.
 
 ```
-struct Point { x: i64, y: i64 }
-seal   Line  { a: Point, b: Point }
+tablet Point { x: i64, y: i64 }
+tablet Line  { a: Point, b: Point }
 ```
-
-`struct` and `seal` are both keywords for the same declaration form;
-`seal` is the preferred name in Babylonian-flavored examples because a
-cylinder seal was the native metaphor for nominal identity — a named
-composite design whose impressions in clay are the struct values.
 
 Construction uses a trailing-braces literal:
 
@@ -338,42 +338,94 @@ step l = Line { a: Point { x: 0, y: 0 }, b: p }
 Fields may appear in any order in a literal but all declared fields
 must be present. Field access is `p.x`. Forward references across
 declarations are supported (declaration order is resolved by the
-compiler); direct recursion is an error in v0.1.
+compiler); mutually-recursive tablets work if every cycle goes
+through a `wedge T` (§4.6) or `tablets[N]T` indirection — direct
+inline recursion is rejected with a pointer at the `wedge` fix.
 
-Structs are passed and returned by value. Struct field mutation
-(`p.x = 5`) is not yet supported; reassign the whole struct via `mut`.
+Tablets are passed and returned by value. Fields are mutable through
+a `mut` binding: `p.x = 5`, `l.a.x = 7`, `p.x += 1`.
 
-Conversions: no implicit `as` casts involving structs. Explicit
-reinterpret between same-layout structs is planned as a separate
-operator, `impress` (see §14).
+Conversions: no implicit `as` casts between different tablets.
+Explicit reinterpret between same-layout tablets is planned as a
+separate operator, `impress` (see §14).
 
-The built-in `str` type (§4.7) is itself a seal — nothing about it
+The built-in `str` type (§4.7) is itself a tablet — nothing about it
 is special at the type-system level, just at literal-production
 time.
 
-### 4.6 Raw pointers (`*T`)
+**Reserved keywords.** `seal` is reserved for a future sum-type
+declaration form (the sealed-class pattern from Kotlin/Scala/Swift,
+where the set of variants is fixed and enumerated). `colophon` is
+reserved for future file-level metadata. Neither has semantics in
+v0.1 — they're just off-limits as identifiers.
+
+### 4.6 Wedges (tablet handles)
+
+A `wedge T` is a single-slot reference into some `tablets[N]T`
+storage — a pointer to one element inside a tablets chunk. The name
+comes from cuneiform being literally "wedge-writing": a single wedge
+is the atom of a Mesopotamian inscribed mark.
+
+```
+tablet Node {
+  value: i64,
+  next:  wedge Node,
+}
+```
+
+**How you get one.** Only through `tablets.push(x)` — which returns a
+`wedge T` to the newly-written slot. There is no address-of operator;
+wedges are handed out by the tablets, never synthesized.
+
+**Operations.**
+
+| Expression        | Result     | Notes                                                         |
+|-------------------|------------|---------------------------------------------------------------|
+| `tablets.push(x)` | `wedge T`  | Returns a handle to the just-pushed element                   |
+| `h.field`         | field type | Auto-deref: GEPs through the wedge and loads                  |
+| `h == lost`       | `bool`     | Is this handle empty?                                         |
+| `h1 == h2`        | `bool`     | Do two handles refer to the same slot? (pointer equality)     |
+| `h != lost`       | `bool`     | Convenient walk termination                                   |
+
+`lost` is the null handle — coerces to any `wedge T`. Returned from
+a function when there's no sensible handle to give back.
+
+**Lifetime.** Every `wedge T` points into some `mut tablets[N]T`.
+When that tablets goes out of scope, auto-release frees every chunk
+and every wedge into it is invalidated. Returning a wedge whose
+tablets is declared locally is a compile-time error — take the
+tablets as a parameter instead.
+
+**Why not raw pointers (`*T`)?** Wedges restrict how handles come
+into existence (only through `tablets.push`) and what you can do
+with them (auto-deref, equality, nothing else). That closes off the
+usual pointer-unsafety surface — arbitrary arithmetic, freeing-by-
+handle, aliasing unrelated memory — while keeping the shape users
+actually want for recursive data structures.
+
+### 4.7 Raw pointers (`*T`)
 
 `*T` is a raw, unmanaged pointer type — a machine address interpreted
 as pointing to a value of type `T`. In v0.1 raw pointers are
-intentionally **type-only**: you can hold one (as a field of a seal,
+intentionally **type-only**: you can hold one (as a field of a tablet,
 a function parameter, or a binding), pass it through, and the
 compiler can use it internally, but there is no expression-level
 syntax for dereferencing (`*p`), pointer arithmetic, or address-of.
 
-Their purpose in v0.1 is to let the built-in `str` seal describe its
+Their purpose in v0.1 is to let the built-in `str` tablet describe its
 own contents and to leave room for future FFI and low-level stdlib
 code.
 
-### 4.7 `str` — variable-length strings
+### 4.8 `str` — variable-length strings
 
 ```
-seal str {
+tablet str {
   ptr: *u8,
   len: i64,
 }
 ```
 
-`str` is a built-in seal, auto-injected into every compilation
+`str` is a built-in tablet, auto-injected into every compilation
 (including `--no-stdlib`). String literals produce `str` values;
 the bytes live in a deduped global constant.
 
@@ -395,7 +447,7 @@ level operations: `str_eq`, `str_starts_with`, `str_ends_with`,
 v0.2 when we commit to a dynamic-string allocation strategy
 (likely tablets-backed).
 
-### 4.8 Function types
+### 4.9 Function types
 
 Functions are not first-class in v0.1. A `fn` declaration introduces a
 name bound to a function; it can be called but not passed, stored, or
@@ -531,7 +583,7 @@ A program is a sequence of top-level declarations:
 
 ```
 program = decl*
-decl    = fn_decl | table_decl | struct_decl   // struct_decl v0.2
+decl    = fn_decl | table_decl | tablet_decl
 ```
 
 Compilation requires a function `fn main()` (unit return) or
@@ -696,8 +748,8 @@ Explicitly out of scope — to keep the compiler reachable:
   conversion, case-insensitive compare (deferred until we settle on
   tablets-backed dynamic strings in v0.2)
 - `read_line()` or any stdin-to-`str` intrinsic (same reason)
-- Struct field mutation (`p.x = 5`); whole-struct `mut` reassignment works
-- Recursive struct types (would require identified types + heap
+- Struct field mutation (`p.x = 5`); whole-tablet `mut` reassignment works
+- Recursive tablet types (would require identified types + heap
   indirection)
 - Reinterpret casts between same-layout structs — planned as the
   `impress` operator in v0.2 (see below)
@@ -716,8 +768,8 @@ step v: Vector = impress p as Vector
 
 Rationale for separating `impress` from `as`: `as` stays the safe,
 semantics-preserving numeric conversion operator; `impress` is the
-Babylonian-flavored escape hatch that treats the bits of one seal as
-though they had been pressed from a different-named seal of identical
+Babylonian-flavored escape hatch that treats the bits of one tablet as
+though they had been pressed from a different-named tablet of identical
 layout. Requires field-type-by-field-type equality between source and
 target structs; codegen is a no-op. A future trait-driven
 `into`-style conversion would be a third, distinct mechanism.
@@ -726,19 +778,20 @@ target structs; codegen is a no-op. A future trait-driven
 
 ```
 program     = decl*
-decl        = fn_decl | table_decl | struct_decl
+decl        = fn_decl | table_decl | tablet_decl
 fn_decl     = "fn" IDENT "(" params? ")" ("->" type)? block_expr
 params      = param ("," param)*
-param       = IDENT ":" type
+param       = "mut"? IDENT ":" type
 table_decl  = "table" IDENT "[" expr ".." expr "]" ":" type "=" expr
-struct_decl = ("struct" | "seal") IDENT "{" field ("," field)* ","? "}"
+tablet_decl = "tablet" IDENT "{" field ("," field)* ","? "}"
 field       = IDENT ":" type
 
 stmt        = binding | assign | aug_assign
             | while_stmt | for_stmt | yield_stmt | expr
 binding     = ("step" | "mut") IDENT (":" type)? "=" expr
-assign      = IDENT "=" expr
-aug_assign  = IDENT ("+=" | "-=" | "*=" | "/=" | "%=") expr
+assign      = lvalue "=" expr
+aug_assign  = lvalue ("+=" | "-=" | "*=" | "/=" | "%=") expr
+lvalue      = IDENT ("." IDENT)*
 while_stmt  = "while" expr block_expr
 for_stmt    = "for" IDENT "in" expr block_expr
 yield_stmt  = "yield" expr?
@@ -755,5 +808,5 @@ literal     = DEC_INT | HEX_INT | BIN_INT | SEX_LIT | CHAR | STRING | BOOL
 type        = prim
             | "tablets" "[" DEC_INT "]" type
             | "*" type                      // raw pointer
-            | IDENT                         // primitive, struct, or `str`
+            | IDENT                         // primitive, tablet, or `str`
 ```

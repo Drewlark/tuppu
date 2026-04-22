@@ -101,7 +101,7 @@ class Parser:
             else:
                 t = self.peek()
                 raise ParseError(
-                    f"expected 'fn', 'table', or 'struct' at top level, "
+                    f"expected 'fn', 'table', or 'tablet' at top level, "
                     f"got {t.kind.name}",
                     t.line, t.col,
                 )
@@ -143,7 +143,7 @@ class Parser:
 
     def parse_struct_decl(self) -> A.StructDecl:
         start = self.eat(Tok.STRUCT)
-        name = self.eat(Tok.IDENT, "struct name").value
+        name = self.eat(Tok.IDENT, "tablet name").value
         self.eat(Tok.LBRACE)
         fields: list[tuple[str, A.TypeExpr]] = []
         self.skip_newlines()
@@ -162,13 +162,13 @@ class Parser:
         self.eat(Tok.RBRACE)
         if not fields:
             raise ParseError(
-                f"struct {name!r} must declare at least one field",
+                f"tablet {name!r} must declare at least one field",
                 start.line, start.col,
             )
         return _at(start, A.StructDecl(name=name, fields=fields))
 
     def parse_struct_lit(self) -> A.StructLit:
-        name_tok = self.eat(Tok.IDENT, "struct name")
+        name_tok = self.eat(Tok.IDENT, "tablet name")
         self.eat(Tok.LBRACE)
         fields: list[tuple[str, A.Expr]] = []
         self.skip_newlines()
@@ -221,9 +221,11 @@ class Parser:
             self.eat(Tok.RBRACKET)
             element = self.parse_type()
             return _at(t, A.TypeTablets(size=size, element=element))
-        if t.kind is Tok.TABLET:
-            # `tablet T` — a handle into some `tablets[N]T`. Runtime
+        if t.kind is Tok.WEDGE:
+            # `wedge T` — a handle into some `tablets[N]T`. Runtime
             # footprint is a pointer; you get one from `tablets.push`.
+            # "Wedge" because cuneiform is literally wedge-writing, and
+            # a single wedge is the atom of a Mesopotamian mark.
             self.advance()
             element = self.parse_type()
             return _at(t, A.TypeHandle(element=element))

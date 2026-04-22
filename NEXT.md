@@ -18,29 +18,29 @@ front; imports and dynamic strings are queued behind it.
 
 What works:
 - Primitives: `i8..i64`, `u8..u64`, `bool`, `rat`, `sex`/`dish`.
-- **User-defined structs / seals** — nominal, by-value, forward refs
-  resolved via topological sort. `struct`/`seal` are interchangeable
+- **User-defined structs / tablets** — nominal, by-value, forward refs
+  resolved via topological sort. `tablet`/`tablet` are interchangeable
   keywords. Construction `Point { x: 3, y: 4 }`, field access `p.x`,
   structs as params/returns and in `mut` bindings. **Field mutation**
   `p.x = 5` and chained `l.a.x = 5` via GEP into the alloca; `p.x +=
   1` aug-assign also works. `step`-bound structs remain immutable.
-- **Variable-length strings** — `str` is a built-in seal
+- **Variable-length strings** — `str` is a built-in tablet
   `{ ptr: *u8, len: i64 }`, auto-injected. `fn f(s: str)`, `s.len`,
   `s[i]`, `print(s)`/`println(s)` via `write(2)` (embedded NULs
   survive). Stdlib `str_eq`/`str_starts_with`/`str_ends_with`/
   `str_is_empty`/`str_index_of`.
 - Raw pointer type `*T` — type-only, no expression-level ops.
-- **Recursive structs** via identified LLVM types. `seal Node {
-  next: tablet Node }` works, including mutually-recursive pairs.
+- **Recursive structs** via identified LLVM types. `wedge Node {
+  next: wedge Node }` works, including mutually-recursive pairs.
   Direct (no-indirection) cycles are rejected with a clear fix hint.
-- **Tablet handles** — `tablet T` is a handle into some
+- **Tablet handles** — `wedge T` is a handle into some
   `tablets[N]T`. Obtained from `tablets.push(x)`, compared with
   `==` / `!=`, auto-dereffed on `.field`. `lost` is the null handle.
 - **Auto-release** on `mut tablets[N]T` at scope exit — codegen
   inserts the release call; explicit `release` still works for
   early release and is de-duplicated against the auto path. Covers
   fall-through and `yield` (early-return) paths.
-- **Escape check** rejects returning a `tablet T` whose underlying
+- **Escape check** rejects returning a `wedge T` whose underlying
   tablets is declared locally — the common UAF pattern. Parameters
   and `lost` are safe to return.
 - **Mut parameters** — `fn f(mut x: T)` allocas the param so methods
@@ -52,7 +52,7 @@ What works:
 - **`elif` keyword** for chained conditionals — sugar over
   `else if`, both forms still parse.
 - **Did-you-mean suggestions** on undefined name, unknown function,
-  unknown struct, and unknown struct-field errors.
+  unknown tablet, and unknown tablet-field errors.
 - **`colophon` reserved keyword** — no semantics yet, held for a
   future use (file-level metadata preamble or tablets debug-name).
 - **`for name in iter { ... }`** — works over `str` (u8 bytes),
@@ -111,7 +111,7 @@ What doesn't yet:
 
 ## Priority order (agreed)
 
-1. ~~**Structs**~~ — **done.** See `examples/points.tpu`,
+1. ~~**Tablets**~~ — **done.** See `examples/points.tpu`,
    `tests/test_struct.py`.
 2. ~~**Better strings**~~ — **done.** See `examples/greeting.tpu`,
    `tests/test_string.py`, `stdlib/str.tpu`.
@@ -140,14 +140,14 @@ What doesn't yet:
 ## 1. Future: `impress` reinterpret cast
 
 Planned for v0.2 (documented in `SPEC.md` §14). Keeps `as` purely for
-safe numeric conversions while giving same-layout seal reinterpretation
+safe numeric conversions while giving same-layout tablet reinterpretation
 its own vivid, mildly-scary spelling:
 
 ```
 step v: Vector = impress p as Vector
 ```
 
-Rules: source and target must be seals (not primitives) with
+Rules: source and target must be tablets (not primitives) with
 byte-identical field layouts — same field *types* in declaration
 order, names need not match. Codegen is a no-op bitcast. A third
 mechanism (trait-driven `into`-style conversion) can layer on later
@@ -165,7 +165,7 @@ Example: `use stdlib/rat` imports all public decls from that file.
 ### Visibility
 - `fn foo(...)` is file-local by default.
 - `pub fn foo(...)` is exported / visible to `use`rs.
-- Same for `struct` / `seal` with a `pub` prefix.
+- Same for `tablet` / `tablet` with a `pub` prefix.
 
 ### Name resolution
 Simplest: `use stdlib/rat` copies all `pub` names from
@@ -233,7 +233,7 @@ A sex value is **digit-observed** if any of these reach it:
 - Printed via `print`/`println` (renders Babylonian).
 - Returned from a function whose return type is `sex` and the caller
   digit-observes the result.
-- Stored in a struct field of type `sex` that is later digit-observed.
+- Stored in a tablet field of type `sex` that is later digit-observed.
 - Passed as arg to a function whose param slot is `sex` and is
   digit-observed inside the callee.
 
@@ -244,7 +244,7 @@ A sex value is **rat-only** if its sole uses are:
 - Bound to a `: rat` typed slot (coercion forces to rat).
 
 For rat-only values, emit LLVM IR that uses the compact `{num, den}`
-struct directly and skip `__tuppu_sex_to_rat`.
+tablet directly and skip `__tuppu_sex_to_rat`.
 
 **Analysis shape:**
 - Whole-program (we don't have separate compilation).
@@ -258,7 +258,7 @@ struct directly and skip `__tuppu_sex_to_rat`.
 - `src/tuppu/escape.py` (new) — the analysis pass: walk AST, tag
   each sex-typed binding / expression with `digit_observed: bool`.
 - `src/tuppu/codegen.py` — consult escape tags at lowering time;
-  emit rat-form struct for rat-only sex values; the builtins
+  emit rat-form tablet for rat-only sex values; the builtins
   (add/sub, to_rat, int_to_sex) become no-ops for rat-only values.
 - `tests/test_sex.py` — verify the optimization fires on expected
   shapes (e.g., a purely arithmetic function should have zero
@@ -282,7 +282,7 @@ Notes for future-self (or future-user) reading scratch files:
   are very different values that print very differently. Get this
   wrong and `length_sq` gives `1613/720` instead of `8065/1`.
 - **Struct literal lookahead:** `Name { field : ...` parses as a
-  struct literal. To write a block with a leading identifier, avoid
+  tablet literal. To write a block with a leading identifier, avoid
   `{ ident : ... }` shape — but blocks should start with `step`,
   `mut`, etc., so this rarely bites.
 - **Tuppu uses newlines**, not `;`, as statement terminator.  `;`

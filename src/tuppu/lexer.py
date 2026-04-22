@@ -41,10 +41,11 @@ class Tok(Enum):
     YIELD = auto()
     AS = auto()
     TABLE = auto()
-    TABLET = auto()
     TABLETS = auto()
     RELEASE = auto()
-    STRUCT = auto()
+    STRUCT = auto()      # emitted by `tablet` keyword — product type decl
+    WEDGE = auto()       # emitted by `wedge` keyword — handle type (tablet ref)
+    SEAL = auto()        # reserved for future sum types; no semantics yet
     LOST = auto()
     COLOPHON = auto()    # reserved; no semantics yet (see NEXT.md)
 
@@ -103,14 +104,21 @@ KEYWORDS: dict[str, Tok] = {
     "yield": Tok.YIELD,
     "as": Tok.AS,
     "table": Tok.TABLE,
-    "tablet": Tok.TABLET,
+    # `tablet Name { field: ty, ... }` is a product type decl —
+    # an inscribed clay tablet with named fields. (Previously: struct/seal.)
+    "tablet": Tok.STRUCT,
+    # `tablets[N]T` is a chained-chunk growable storage of T. Plural of
+    # `tablet` — a chest of tablets.
     "tablets": Tok.TABLETS,
+    # `wedge T` is a handle into some `tablets[N]T` — cuneiform is
+    # "wedge-writing", so a wedge is the atom of a Mesopotamian mark:
+    # a single small reference to something larger.
+    "wedge": Tok.WEDGE,
     "release": Tok.RELEASE,
-    "struct": Tok.STRUCT,
-    # `seal` is the Babylonian-flavored alias for `struct`: cylinder seals
-    # were the native metaphor for nominal identity — a named, composite
-    # design pressed into clay to yield distinct impressions.
-    "seal": Tok.STRUCT,
+    # `seal Name { Variant, Variant, ... }` is reserved for future sum
+    # types — Kotlin/Scala precedent: a cylinder seal produces one of
+    # a fixed set of stamp designs.
+    "seal": Tok.SEAL,
     "lost": Tok.LOST,
     # `colophon` is reserved for a future use (file-level metadata
     # preamble, tablets debug-name, something along those lines) — the

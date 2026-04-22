@@ -1,6 +1,6 @@
 """Variable-length strings as the built-in `str` seal.
 
-Covers: string literal → str seal value, print dispatch via %.*s, field
+Covers: string literal → str tablet value, print dispatch via %.*s, field
 access `s.len`, byte indexing `s[i]`, passing strings as function args,
 and the stdlib helpers in `stdlib/str.tpu`."""
 from __future__ import annotations

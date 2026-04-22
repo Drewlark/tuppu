@@ -1,4 +1,4 @@
-// Byte-level string utilities for `str` (the built-in `seal str { ptr: *u8, len: i64 }`).
+// Byte-level string utilities for `str` (the built-in `tablet str { ptr: *u8, len: i64 }`).
 //
 // All functions operate on the existing bytes behind a `str` — no allocation,
 // no copying. Anything that *produces* a new string (concat, slice, to_upper)

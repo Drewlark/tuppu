@@ -21,7 +21,7 @@ def run(src: str, tmp_path: Path, stdin: bytes = b"") -> tuple[int, bytes, bytes
 
 def test_simple_struct_roundtrip(tmp_path):
     src = (
-        "struct Point { x: i64, y: i64 }\n"
+        "tablet Point { x: i64, y: i64 }\n"
         "fn main() -> i32 {\n"
         "  step p: Point = Point { x: 3, y: 4 }\n"
         "  println(p.x)\n"
@@ -36,7 +36,7 @@ def test_simple_struct_roundtrip(tmp_path):
 def test_struct_field_out_of_order_in_literal(tmp_path):
     # Literal order doesn't need to match declaration order.
     src = (
-        "struct Point { x: i64, y: i64 }\n"
+        "tablet Point { x: i64, y: i64 }\n"
         "fn main() -> i32 {\n"
         "  step p = Point { y: 10, x: 20 }\n"
         "  println(p.x)\n"
@@ -50,7 +50,7 @@ def test_struct_field_out_of_order_in_literal(tmp_path):
 
 def test_struct_with_mixed_field_types(tmp_path):
     src = (
-        "struct Flagged { n: i64, ok: bool }\n"
+        "tablet Flagged { n: i64, ok: bool }\n"
         "fn main() -> i32 {\n"
         "  step f = Flagged { n: 42, ok: true }\n"
         "  println(f.n)\n"
@@ -64,7 +64,7 @@ def test_struct_with_mixed_field_types(tmp_path):
 
 def test_struct_trailing_comma_in_decl_and_lit(tmp_path):
     src = (
-        "struct Point { x: i64, y: i64, }\n"
+        "tablet Point { x: i64, y: i64, }\n"
         "fn main() -> i32 {\n"
         "  step p = Point { x: 1, y: 2, }\n"
         "  println(p.x + p.y)\n"
@@ -77,7 +77,7 @@ def test_struct_trailing_comma_in_decl_and_lit(tmp_path):
 
 def test_struct_decl_spans_lines(tmp_path):
     src = (
-        "struct Point {\n"
+        "tablet Point {\n"
         "  x: i64,\n"
         "  y: i64,\n"
         "}\n"
@@ -94,11 +94,11 @@ def test_struct_decl_spans_lines(tmp_path):
     assert out == b"15\n"
 
 
-# --- struct as parameter / return type ------------------------------------
+# --- tablet as parameter / return type ------------------------------------
 
 def test_struct_as_parameter_and_return(tmp_path):
     src = (
-        "struct Point { x: i64, y: i64 }\n"
+        "tablet Point { x: i64, y: i64 }\n"
         "fn translate(p: Point, dx: i64, dy: i64) -> Point {\n"
         "  Point { x: p.x + dx, y: p.y + dy }\n"
         "}\n"
@@ -117,8 +117,8 @@ def test_struct_as_parameter_and_return(tmp_path):
 
 def test_nested_struct(tmp_path):
     src = (
-        "struct Point { x: i64, y: i64 }\n"
-        "struct Line { a: Point, b: Point }\n"
+        "tablet Point { x: i64, y: i64 }\n"
+        "tablet Line { a: Point, b: Point }\n"
         "fn main() -> i32 {\n"
         "  step l = Line {\n"
         "    a: Point { x: 0, y: 0 },\n"
@@ -137,8 +137,8 @@ def test_forward_declared_struct_reference(tmp_path):
     # Source-order forward reference: Line references Point declared later.
     # Codegen's topo sort must resolve this.
     src = (
-        "struct Line { a: Point, b: Point }\n"
-        "struct Point { x: i64, y: i64 }\n"
+        "tablet Line { a: Point, b: Point }\n"
+        "tablet Point { x: i64, y: i64 }\n"
         "fn main() -> i32 {\n"
         "  step l = Line {\n"
         "    a: Point { x: 1, y: 2 },\n"
@@ -156,7 +156,7 @@ def test_forward_declared_struct_reference(tmp_path):
 
 def test_mut_struct_reassign(tmp_path):
     src = (
-        "struct Point { x: i64, y: i64 }\n"
+        "tablet Point { x: i64, y: i64 }\n"
         "fn main() -> i32 {\n"
         "  mut p: Point = Point { x: 1, y: 2 }\n"
         "  p = Point { x: p.x + 10, y: p.y + 20 }\n"
@@ -169,11 +169,11 @@ def test_mut_struct_reassign(tmp_path):
     assert out == b"11\n22\n"
 
 
-# --- struct with rat field ------------------------------------------------
+# --- tablet with rat field ------------------------------------------------
 
 def test_struct_with_rat_field(tmp_path):
     src = (
-        "struct Weighted { value: rat, weight: i64 }\n"
+        "tablet Weighted { value: rat, weight: i64 }\n"
         "fn main() -> i32 {\n"
         "  step w = Weighted { value: 1;30, weight: 5 }\n"
         "  println(w.value)\n"
@@ -190,7 +190,7 @@ def test_struct_with_rat_field(tmp_path):
 def test_missing_field_rejected():
     with pytest.raises(CompileError, match="missing field"):
         compile_to_ir(
-            "struct Point { x: i64, y: i64 }\n"
+            "tablet Point { x: i64, y: i64 }\n"
             "fn main() -> i32 { step p = Point { x: 1 }\n 0 }\n"
         )
 
@@ -198,7 +198,7 @@ def test_missing_field_rejected():
 def test_extra_field_rejected():
     with pytest.raises(CompileError, match="unknown field"):
         compile_to_ir(
-            "struct Point { x: i64, y: i64 }\n"
+            "tablet Point { x: i64, y: i64 }\n"
             "fn main() -> i32 { step p = Point { x: 1, y: 2, z: 3 }\n 0 }\n"
         )
 
@@ -208,7 +208,7 @@ def test_wrong_field_type_rejected():
     # i64 → bool is explicitly-cast-only.
     with pytest.raises(CompileError, match="expected"):
         compile_to_ir(
-            "struct Flagged { n: i64, ok: bool }\n"
+            "tablet Flagged { n: i64, ok: bool }\n"
             "fn main() -> i32 { step f = Flagged { n: 1, ok: 42 }\n 0 }\n"
         )
 
@@ -216,7 +216,7 @@ def test_wrong_field_type_rejected():
 def test_unknown_field_access_rejected():
     with pytest.raises(CompileError, match="no field"):
         compile_to_ir(
-            "struct Point { x: i64, y: i64 }\n"
+            "tablet Point { x: i64, y: i64 }\n"
             "fn main() -> i32 { step p = Point { x: 1, y: 2 }\n println(p.z)\n 0 }\n"
         )
 
@@ -224,19 +224,19 @@ def test_unknown_field_access_rejected():
 def test_duplicate_struct_rejected():
     with pytest.raises(CompileError, match="duplicate struct"):
         compile_to_ir(
-            "struct Point { x: i64 }\n"
-            "struct Point { y: i64 }\n"
+            "tablet Point { x: i64 }\n"
+            "tablet Point { y: i64 }\n"
             "fn main() -> i32 { 0 }\n"
         )
 
 
 def test_struct_shadowing_primitive_rejected():
-    # Parser rejects `i64` as a struct name because `i64` is a type keyword,
+    # Parser rejects `i64` as a tablet name because `i64` is a type keyword,
     # not an identifier — giving defense-in-depth against clashes with
     # built-in types.
-    with pytest.raises(CompileError, match="struct name"):
+    with pytest.raises(CompileError, match="tablet name"):
         compile_to_ir(
-            "struct i64 { x: i64 }\n"
+            "tablet i64 { x: i64 }\n"
             "fn main() -> i32 { 0 }\n"
         )
 
@@ -244,7 +244,7 @@ def test_struct_shadowing_primitive_rejected():
 def test_empty_struct_rejected():
     with pytest.raises(CompileError, match="at least one field"):
         compile_to_ir(
-            "struct Empty {}\n"
+            "tablet Empty {}\n"
             "fn main() -> i32 { 0 }\n"
         )
 
@@ -259,43 +259,21 @@ def test_unknown_struct_in_literal_rejected():
 def test_recursive_struct_rejected():
     with pytest.raises(CompileError, match="recursive"):
         compile_to_ir(
-            "struct Node { value: i64, next: Node }\n"
+            "tablet Node { value: i64, next: Node }\n"
             "fn main() -> i32 { 0 }\n"
         )
 
 
-# --- seal alias ------------------------------------------------------------
+# --- `seal` reserved for future sum types ----------------------------------
 
-def test_seal_is_alias_for_struct(tmp_path):
-    # `seal` is the Babylonian-flavored alias — same AST, same semantics.
-    src = (
-        "seal Point { x: i64, y: i64 }\n"
-        "fn main() -> i32 {\n"
-        "  step p = Point { x: 5, y: 6 }\n"
-        "  println(p.x + p.y)\n"
-        "  0\n"
-        "}\n"
-    )
-    _, out, _ = run(src, tmp_path)
-    assert out == b"11\n"
-
-
-def test_seal_and_struct_interop(tmp_path):
-    # One type declared with `struct`, another with `seal`, used together.
-    src = (
-        "struct Point { x: i64, y: i64 }\n"
-        "seal   Line  { a: Point, b: Point }\n"
-        "fn main() -> i32 {\n"
-        "  step l = Line {\n"
-        "    a: Point { x: 1, y: 2 },\n"
-        "    b: Point { x: 4, y: 6 },\n"
-        "  }\n"
-        "  println(l.b.x - l.a.x)\n"
-        "  0\n"
-        "}\n"
-    )
-    _, out, _ = run(src, tmp_path)
-    assert out == b"3\n"
+def test_seal_keyword_is_reserved(tmp_path):
+    # Using `seal` as a product-type decl now fails — the keyword is
+    # reserved for future sum types. Users should write `tablet` instead.
+    with pytest.raises(CompileError):
+        compile_to_ir(
+            "seal Point { x: i64, y: i64 }\n"
+            "fn main() -> i32 { 0 }\n"
+        )
 
 
 # --- does-not-collide-with-blocks regression ------------------------------
@@ -334,7 +312,7 @@ def test_while_with_ident_body_still_parses(tmp_path):
 
 def test_field_assign_simple(tmp_path):
     src = (
-        "seal Point { x: i64, y: i64 }\n"
+        "tablet Point { x: i64, y: i64 }\n"
         "fn main() -> i32 {\n"
         "  mut p: Point = Point { x: 3, y: 4 }\n"
         "  p.x = 99\n"
@@ -350,7 +328,7 @@ def test_field_assign_simple(tmp_path):
 def test_field_assign_aug_op(tmp_path):
     # `p.x += 1` also parses — aug-assign works on field targets now.
     src = (
-        "seal Point { x: i64, y: i64 }\n"
+        "tablet Point { x: i64, y: i64 }\n"
         "fn main() -> i32 {\n"
         "  mut p: Point = Point { x: 10, y: 0 }\n"
         "  p.x += 5\n"
@@ -364,10 +342,10 @@ def test_field_assign_aug_op(tmp_path):
 
 
 def test_field_assign_nested(tmp_path):
-    # Multi-level field chains GEP through each struct level.
+    # Multi-level field chains GEP through each tablet level.
     src = (
-        "seal Point { x: i64, y: i64 }\n"
-        "seal Line { a: Point, b: Point }\n"
+        "tablet Point { x: i64, y: i64 }\n"
+        "tablet Line { a: Point, b: Point }\n"
         "fn main() -> i32 {\n"
         "  mut l: Line = Line { a: Point { x: 0, y: 0 }, b: Point { x: 0, y: 0 } }\n"
         "  l.a.x = 7\n"
@@ -385,7 +363,7 @@ def test_field_assign_preserves_other_fields(tmp_path):
     # Mutating one field must not disturb siblings — confirms we GEP
     # into the alloca rather than reassigning the whole struct.
     src = (
-        "seal P { x: i64, y: i64, z: i64 }\n"
+        "tablet P { x: i64, y: i64, z: i64 }\n"
         "fn main() -> i32 {\n"
         "  mut p: P = P { x: 1, y: 2, z: 3 }\n"
         "  p.y = 99\n"
@@ -403,7 +381,7 @@ def test_field_assign_to_step_rejected():
     # step-bound structs are immutable; field assign is a codegen error.
     with pytest.raises(CompileError, match="step binding"):
         compile_to_ir(
-            "seal P { x: i64 }\n"
+            "tablet P { x: i64 }\n"
             "fn main() -> i32 {\n"
             "  step p = P { x: 1 }\n"
             "  p.x = 2\n"
@@ -415,7 +393,7 @@ def test_field_assign_to_step_rejected():
 def test_field_assign_type_mismatch():
     with pytest.raises(CompileError, match="assignment target has type i64"):
         compile_to_ir(
-            "seal P { x: i64 }\n"
+            "tablet P { x: i64 }\n"
             "fn main() -> i32 {\n"
             "  mut p: P = P { x: 0 }\n"
             "  p.x = rat(1, 2)\n"
@@ -434,20 +412,20 @@ def test_non_lvalue_assignment_rejected():
         )
 
 
-# --- tablet handles + recursive structs ------------------------------------
+# --- wedge handles + recursive structs ------------------------------------
 
 def test_linked_list_basic(tmp_path):
     # Build a linked list via tablets.push returning a handle, walk via
     # auto-deref on `cur.value` / `cur.next`, terminate on `cur == lost`.
     src = (
-        "seal Node { value: i64, next: tablet Node }\n"
+        "tablet Node { value: i64, next: wedge Node }\n"
         "fn main() -> i32 {\n"
         "  mut lib: tablets[16]Node\n"
-        "  mut head: tablet Node = lost\n"
+        "  mut head: wedge Node = lost\n"
         "  head = lib.push(Node { value: 3, next: head })\n"
         "  head = lib.push(Node { value: 2, next: head })\n"
         "  head = lib.push(Node { value: 1, next: head })\n"
-        "  mut cur: tablet Node = head\n"
+        "  mut cur: wedge Node = head\n"
         "  while cur != lost {\n"
         "    println(cur.value)\n"
         "    cur = cur.next\n"
@@ -461,17 +439,17 @@ def test_linked_list_basic(tmp_path):
 
 
 def test_mutually_recursive_structs(tmp_path):
-    # A references B via tablet B and vice versa — identified types
+    # A references B via wedge B and vice versa — identified types
     # resolve both forward references cleanly.
     src = (
-        "seal Even { v: i64, down: tablet Odd }\n"
-        "seal Odd  { v: i64, down: tablet Even }\n"
+        "tablet Even { v: i64, down: wedge Odd }\n"
+        "tablet Odd  { v: i64, down: wedge Even }\n"
         "fn main() -> i32 {\n"
         "  mut pool_e: tablets[8]Even\n"
         "  mut pool_o: tablets[8]Odd\n"
-        "  step e0: tablet Even = pool_e.push(Even { v: 0, down: lost })\n"
-        "  step o1: tablet Odd  = pool_o.push(Odd  { v: 1, down: e0 })\n"
-        "  step e2: tablet Even = pool_e.push(Even { v: 2, down: o1 })\n"
+        "  step e0: wedge Even = pool_e.push(Even { v: 0, down: lost })\n"
+        "  step o1: wedge Odd  = pool_o.push(Odd  { v: 1, down: e0 })\n"
+        "  step e2: wedge Even = pool_e.push(Even { v: 2, down: o1 })\n"
         "  println(e2.v)\n"
         "  println(e2.down.v)\n"
         "  println(e2.down.down.v)\n"
@@ -486,11 +464,11 @@ def test_mutually_recursive_structs(tmp_path):
 
 def test_lost_equality(tmp_path):
     src = (
-        "seal N { v: i64, next: tablet N }\n"
+        "tablet N { v: i64, next: wedge N }\n"
         "fn main() -> i32 {\n"
         "  mut lib: tablets[4]N\n"
-        "  step a: tablet N = lost\n"
-        "  step b: tablet N = lib.push(N { v: 7, next: lost })\n"
+        "  step a: wedge N = lost\n"
+        "  step b: wedge N = lib.push(N { v: 7, next: lost })\n"
         "  if a == lost { println(1) } else { println(0) }\n"
         "  if b == lost { println(0) } else { println(1) }\n"
         "  if a == b    { println(0) } else { println(1) }\n"
@@ -502,10 +480,10 @@ def test_lost_equality(tmp_path):
     assert out == b"1\n1\n1\n"
 
 
-def test_recursive_struct_without_pointer_rejected():
-    with pytest.raises(CompileError, match="recursively contained without pointer indirection"):
+def test_recursive_tablet_without_indirection_rejected():
+    with pytest.raises(CompileError, match="recursively contained without indirection"):
         compile_to_ir(
-            "seal Node { v: i64, child: Node }\n"
+            "tablet Node { v: i64, child: Node }\n"
             "fn main() -> i32 { 0 }\n"
         )
 
@@ -513,10 +491,10 @@ def test_recursive_struct_without_pointer_rejected():
 # --- escape check: no returning local-rooted handles -----------------------
 
 def test_escape_rejects_return_of_local_push():
-    with pytest.raises(CompileError, match="cannot return a tablet handle"):
+    with pytest.raises(CompileError, match="cannot return a wedge handle"):
         compile_to_ir(
-            "seal Node { value: i64, next: tablet Node }\n"
-            "fn build() -> tablet Node {\n"
+            "tablet Node { value: i64, next: wedge Node }\n"
+            "fn build() -> wedge Node {\n"
             "  mut lib: tablets[8]Node\n"
             "  lib.push(Node { value: 1, next: lost })\n"
             "}\n"
@@ -525,12 +503,12 @@ def test_escape_rejects_return_of_local_push():
 
 
 def test_escape_rejects_return_of_tainted_binding():
-    with pytest.raises(CompileError, match="cannot return a tablet handle"):
+    with pytest.raises(CompileError, match="cannot return a wedge handle"):
         compile_to_ir(
-            "seal Node { value: i64, next: tablet Node }\n"
-            "fn build() -> tablet Node {\n"
+            "tablet Node { value: i64, next: wedge Node }\n"
+            "fn build() -> wedge Node {\n"
             "  mut lib: tablets[8]Node\n"
-            "  step h: tablet Node = lib.push(Node { value: 1, next: lost })\n"
+            "  step h: wedge Node = lib.push(Node { value: 1, next: lost })\n"
             "  h\n"
             "}\n"
             "fn main() -> i32 { 0 }\n"
@@ -538,10 +516,10 @@ def test_escape_rejects_return_of_tainted_binding():
 
 
 def test_escape_rejects_yielded_local_handle():
-    with pytest.raises(CompileError, match="cannot return a tablet handle"):
+    with pytest.raises(CompileError, match="cannot return a wedge handle"):
         compile_to_ir(
-            "seal Node { value: i64, next: tablet Node }\n"
-            "fn build() -> tablet Node {\n"
+            "tablet Node { value: i64, next: wedge Node }\n"
+            "fn build() -> wedge Node {\n"
             "  mut lib: tablets[8]Node\n"
             "  yield lib.push(Node { value: 1, next: lost })\n"
             "}\n"
@@ -552,10 +530,10 @@ def test_escape_rejects_yielded_local_handle():
 def test_escape_accepts_lost_return(tmp_path):
     # `lost` has no provenance — always safe to return.
     src = (
-        "seal Node { value: i64, next: tablet Node }\n"
-        "fn empty() -> tablet Node { lost }\n"
+        "tablet Node { value: i64, next: wedge Node }\n"
+        "fn empty() -> wedge Node { lost }\n"
         "fn main() -> i32 {\n"
-        "  step h: tablet Node = empty()\n"
+        "  step h: wedge Node = empty()\n"
         "  if h == lost { println(1) } else { println(0) }\n"
         "  0\n"
         "}\n"
@@ -570,18 +548,18 @@ def test_mut_tablets_param_pass_through(tmp_path):
     # Callee pushes into caller's tablets — mutations must persist so
     # the eventual release actually frees the chunks allocated here.
     src = (
-        "seal Node { value: i64, next: tablet Node }\n"
-        "fn push_front(mut store: tablets[16]Node, head: tablet Node, v: i64) -> tablet Node {\n"
+        "tablet Node { value: i64, next: wedge Node }\n"
+        "fn push_front(mut store: tablets[16]Node, head: wedge Node, v: i64) -> wedge Node {\n"
         "  store.push(Node { value: v, next: head })\n"
         "}\n"
         "fn main() -> i32 {\n"
         "  mut lib: tablets[16]Node\n"
-        "  mut head: tablet Node = lost\n"
+        "  mut head: wedge Node = lost\n"
         "  head = push_front(lib, head, 3)\n"
         "  head = push_front(lib, head, 2)\n"
         "  head = push_front(lib, head, 1)\n"
         "  println(lib.len)\n"
-        "  mut cur: tablet Node = head\n"
+        "  mut cur: wedge Node = head\n"
         "  while cur != lost {\n"
         "    println(cur.value)\n"
         "    cur = cur.next\n"

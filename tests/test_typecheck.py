@@ -263,7 +263,7 @@ def test_suggest_typo_unknown_function():
 
 def test_suggest_typo_struct_field():
     fails(
-        "seal Point { x: i64, y: i64 }\n"
+        "tablet Point { x: i64, y: i64 }\n"
         "fn main() -> i32 {\n"
         "  step p = Point { x: 1, y: 2 }\n"
         "  println(p.ex)\n"
@@ -275,7 +275,7 @@ def test_suggest_typo_struct_field():
 
 def test_suggest_typo_unknown_struct():
     fails(
-        "seal Tablet { id: i64 }\n"
+        "tablet Tablet { id: i64 }\n"
         "fn main() -> i32 {\n"
         "  step t = Tablt { id: 1 }\n"
         "  0\n"

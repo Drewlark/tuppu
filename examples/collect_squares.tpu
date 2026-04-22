@@ -1,5 +1,5 @@
 // Collect the first N squares into a tablets container, then print them.
-// Each tablet holds 4 elements, so 10 squares allocate 3 linked chunks.
+// Each wedge holds 4 elements, so 10 squares allocate 3 linked chunks.
 //
 // Demonstrates the full tablets lifecycle: zero-init via `mut x: T` (no
 // initializer), repeated `.push(v)` with automatic chunk allocation, O(i/N)

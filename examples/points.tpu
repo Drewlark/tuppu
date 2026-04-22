@@ -1,12 +1,12 @@
 // Demonstrates user-defined structs: declaration, construction, field
 // access, nested structs, and pass-by-value as function arguments.
 
-struct Point {
+tablet Point {
   x: i64,
   y: i64,
 }
 
-struct Line {
+tablet Line {
   a: Point,
   b: Point,
 }
