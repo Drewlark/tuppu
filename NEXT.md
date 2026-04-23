@@ -800,6 +800,118 @@ path) or lowers to a 2-element `TabletsLit` followed by a call
   registration — same as other heap-producing rvalues.
 
 
+## 6. Fn pointers across colophon (primitives-only)
+
+**Goal.** Let users hand a Tuppu fn to libc callbacks (`signal`,
+`atexit`, `qsort`) and receive C fn pointers back (`signal`'s
+return value). Unlocks a big chunk of real programs — signal
+handlers for SIGCHLD-reaping in the HTTP-server example, atexit
+for cleanup, qsort for any sorting workload — without committing
+to the full closure machinery or the "marshaled callback" design
+that would be required for `str`/`struct`/`wedge` across the C
+boundary.
+
+### The rule: primitives-only in callback signatures
+
+A `colophon fn` may contain `fn(prim, prim, ...) -> prim` (or
+`fn(prims) -> void`) in its parameter or return types, where
+`prim` is any integer type (`i8..i64`, `u8..u64`) or `bool`. Any
+other type — `str`, user tablets, `tablets[N]T`, `wedge T`,
+`buffer[N]T`, nested `fn` — is **rejected at colophon
+declaration time** with a clear "callback signatures are
+primitives-only for now" error.
+
+This is a semantic restriction, not a safety one: the C side
+invokes the fn with raw register-passing conventions, so any
+Tuppu-level marshaling (cap=0 str neutering, struct-field zeroing)
+would never fire. Primitives already round-trip by the C-ABI
+default, which is also LLVM's default calling convention for
+Tuppu fns — so no wrapper code is needed at either end.
+
+### Grammar / syntax
+
+Already parses (we have `TypeFn` from first-class fn values).
+This proposal is purely a typecheck allow-list extension —
+no grammar changes.
+
+```
+colophon fn signal(signum: i32, handler: fn(i32)) -> fn(i32)
+colophon fn atexit(cb: fn()) -> i32
+
+fn on_sigchld(sig: i32) { /* reap zombies */ }
+fn main() -> i32 {
+  step old = signal(17 as i32, on_sigchld)   // SIGCHLD
+  0
+}
+```
+
+### Typecheck
+
+- `_register_colophon`'s FFI allow-list grows: `TyFn` accepted
+  iff all params are primitive-or-bool AND ret is primitive-or-
+  bool-or-unit. Nested `TyFn` inside a `TyFn` signature rejected
+  at v0.1 (keeps the rule dead simple; can relax later).
+- Passing a Tuppu fn name at the call site: the existing
+  first-class-fn-value path types it as `TyFn(params, ret)`.
+  `_coerces_to(TyFn, TyFn)` check verifies signature match —
+  already almost-working because colophons can't be passed as
+  values (we keep that rejection), but regular fns can.
+- Receiving a `fn(...)` return from a colophon: the return value
+  is typed as the declared `TyFn`, which can then be bound,
+  passed to another colophon, or invoked (the existing
+  `_tc_fn_value_call` already handles this).
+
+### Codegen
+
+- `_colophon_c_ty`: recognize `ir.FunctionType.as_pointer()` and
+  pass through unchanged — LLVM lowers to the platform's fn-
+  pointer ABI. C's `void (*)(int)` becomes `void (i32)*` on our
+  side; identical representation.
+- `_gen_colophon_call`: when a fn-value arg is emitted, the
+  existing `_gen_expr(Ident(fn_name))` already yields the LLVM
+  function pointer — no marshaling wrapper needed. No cleanup,
+  no neutering; primitives go straight across.
+- `_declare_colophon`: lower `fn(prim) -> prim` param types
+  directly. No special case.
+
+### Edge cases
+
+- **Calling a received C fn pointer**: `old(1 as i32)` goes
+  through `_gen_fn_value_call`, which emits an indirect call.
+  Same path as a Tuppu fn-value call. The cleanup/neutering
+  logic in that path is currently keyed on element types, so
+  primitives skip it automatically.
+- **Passing `lost` or `fn`-valued null**: defer. `lost` is
+  handle-typed; we'd need a fn-type null literal. Users who
+  need "no handler" can define a Tuppu no-op fn and pass that.
+- **Var-args callbacks** (`printf`-style): rejected. Callbacks
+  with `...` C-level varargs aren't common and our FFI doesn't
+  model them anywhere.
+
+### Files to touch
+
+- `src/tuppu/typecheck.py` — `_register_colophon`'s allow-list:
+  accept `TyFn` with primitive-only signature; reject nested /
+  str / struct / wedge inside the TyFn.
+- `src/tuppu/codegen/__init__.py` — `_colophon_c_ty` pass-through
+  for fn-pointer types; signal to the signature assembly that no
+  marshaling wrapper is needed.
+- `tests/test_colophon_fnptr.py` — new. `signal` roundtrip, the
+  "SIGCHLD reaper" use case, `atexit`, rejection for
+  `fn(str) -> i32` and `fn() -> Row`, receiving-and-calling a
+  returned fn pointer.
+
+### Payoff
+
+The HTTP server's zombie-reaping story: `signal(SIGCHLD, SIG_IGN
+or reaper_fn)`. The `atexit` path for clean shutdown. `qsort`
+once we also add a way to pass mutable storage (closely coupled
+to pointer-to-primitive access; out of scope for this proposal
+but unblocked by primitives-only FFI). ~50 lines of compiler
+code. Strict subset of full closures — doesn't preclude closures
+later.
+
+
 ## Common pitfalls users hit
 
 Notes for future-self (or future-user) reading scratch files:
