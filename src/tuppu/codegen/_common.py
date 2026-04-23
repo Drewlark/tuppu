@@ -84,6 +84,10 @@ class TabletsInfo:
     get: ir.Function
     get_addr: ir.Function
     release: ir.Function
+    # `clone(src_ptr) -> tablets_ty` — deep-copy. Built lazily on first
+    # use via `_get_tablets_clone` so plain scalar-element tablets that
+    # never get cloned don't pay for the helper.
+    clone: ir.Function | None = None
 
 
 # Names that the user cannot shadow — they resolve to compiler intrinsics.

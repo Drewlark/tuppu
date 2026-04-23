@@ -28,20 +28,20 @@ class TabletsMixin:
             if val is None:
                 raise CodegenError("tablets.push argument has no value")
             val = self._coerce(val, info.elem_ty)
-            # Container ownership transfer: if the element type is
-            # cleanup-bearing and the arg is an Ident naming a locally-
-            # owned binding, the tablets takes over the heap bytes —
-            # remove the caller's cleanup so its scope-exit release
-            # doesn't race with the tablets's own element-walk on
-            # release. Safe because the SSA value we just loaded is
-            # a copy of the header that the tablets now owns; the
-            # caller's slot still has readable ptr/len, its cap is
-            # the only thing that matters for release semantics.
-            if (
-                isinstance(arg_expr, A.Ident)
-                and self._is_cleanup_bearing_ty(info.elem_ty)
-            ):
-                self._transfer_cleanup_into_container(arg_expr.name)
+            # Container ownership: a cleanup-bearing value going into
+            # the container either transfers from its current owner
+            # (single-owner discipline; no clone) or gets deep-cloned
+            # (source is a borrow / rvalue-we-don't-own — the container
+            # needs fresh bytes so it can release safely without
+            # dangling when the source's lifetime ends).
+            if self._is_cleanup_bearing_ty(info.elem_ty):
+                transferred = False
+                if isinstance(arg_expr, A.Ident):
+                    transferred = self._transfer_cleanup_into_container(
+                        arg_expr.name,
+                    )
+                if not transferred:
+                    val = self._deep_clone_if_cleanup_bearing(val)
             # Push returns a pointer to the just-written slot — this is
             # the `tablet T` handle the user sees. Callers in statement
             # position ignore it.
@@ -439,6 +439,104 @@ class TabletsMixin:
         b.store(null_node, tail_addr)
         b.store(ir.Constant(I64, 0), len_addr)
         b.ret_void()
+        return fn
+
+    def _get_tablets_clone(self, info: TabletsInfo) -> ir.Function:
+        """Lazily build + cache the deep-clone helper for a tablets type.
+        Clone walks the source chain, clones each element if it's
+        cleanup-bearing (str/struct/nested-tablets), and pushes into a
+        fresh tablets. Result is returned by value — caller allocas the
+        slot. Used by struct-clone when a field is tablets-typed and
+        by the push path when the source is a borrow."""
+        if info.clone is not None:
+            return info.clone
+        info.clone = self._build_tablets_clone(
+            info.N, info.elem_ty, info.node_ty, info.tablets_ty,
+            info.push, info.tablets_ty.elements,  # unused, kept for signature shape
+        )
+        return info.clone
+
+    def _build_tablets_clone(
+        self, N: int, elem_ty: ir.Type,
+        node_ty: ir.IdentifiedStructType, tablets_ty: ir.LiteralStructType,
+        push: ir.Function, _suffix_elements,
+    ) -> ir.Function:
+        # Recover the suffix from push's name: "__tuppu_tbls_<suffix>_push".
+        push_name = push.name
+        suffix = push_name[len("__tuppu_tbls_"): -len("_push")]
+
+        fn = ir.Function(
+            self.module,
+            ir.FunctionType(tablets_ty, [tablets_ty.as_pointer()]),
+            name=f"__tuppu_tbls_{suffix}_clone",
+        )
+        fn.args[0].name = "src"
+        src_ptr = fn.args[0]
+
+        ZERO_I32 = ir.Constant(I32, 0)
+        null_node = ir.Constant(node_ty.as_pointer(), None)
+
+        entry    = fn.append_basic_block("entry")
+        chunks   = fn.append_basic_block("chunks")
+        chunk_bd = fn.append_basic_block("chunk.body")
+        slots    = fn.append_basic_block("slots")
+        slot_bd  = fn.append_basic_block("slot.body")
+        advance  = fn.append_basic_block("advance")
+        done     = fn.append_basic_block("done")
+
+        b = ir.IRBuilder(entry)
+        # Fresh dest tablets lives on the stack for the duration of
+        # this fn; we load-and-return it at the end.
+        dest_slot = b.alloca(tablets_ty, name="dest")
+        b.store(ir.Constant(tablets_ty, None), dest_slot)
+        head = b.load(b.gep(src_ptr, [ZERO_I32, ZERO_I32], inbounds=True))
+        b.branch(chunks)
+
+        b.position_at_end(chunks)
+        cur_phi = b.phi(node_ty.as_pointer(), "cur")
+        cur_phi.add_incoming(head, entry)
+        is_null = b.icmp_signed("==", cur_phi, null_node)
+        b.cbranch(is_null, done, chunk_bd)
+
+        b.position_at_end(chunk_bd)
+        used = b.load(b.gep(
+            cur_phi, [ZERO_I32, ir.Constant(I32, 1)], inbounds=True,
+        ))
+        b.branch(slots)
+
+        b.position_at_end(slots)
+        i_phi = b.phi(I64, "i")
+        i_phi.add_incoming(ir.Constant(I64, 0), chunk_bd)
+        cont = b.icmp_signed("<", i_phi, used)
+        b.cbranch(cont, slot_bd, advance)
+
+        b.position_at_end(slot_bd)
+        slot_ptr = b.gep(
+            cur_phi, [ZERO_I32, ZERO_I32, i_phi], inbounds=True,
+        )
+        elem = b.load(slot_ptr)
+        # Save builder so _deep_clone_if_cleanup_bearing sees this
+        # function's context while it emits the clone call.
+        saved = self.builder
+        self.builder = b
+        try:
+            cloned = self._deep_clone_if_cleanup_bearing(elem)
+        finally:
+            self.builder = saved
+        b.call(push, [dest_slot, cloned])
+        i_next = b.add(i_phi, ir.Constant(I64, 1))
+        i_phi.add_incoming(i_next, b.block)
+        b.branch(slots)
+
+        b.position_at_end(advance)
+        next_node = b.load(b.gep(
+            cur_phi, [ZERO_I32, ir.Constant(I32, 2)], inbounds=True,
+        ))
+        cur_phi.add_incoming(next_node, b.block)
+        b.branch(chunks)
+
+        b.position_at_end(done)
+        b.ret(b.load(dest_slot))
         return fn
 
     def _element_release_fn(self, elem_ty: ir.Type) -> "ir.Function | None":

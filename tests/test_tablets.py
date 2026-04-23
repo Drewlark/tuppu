@@ -768,6 +768,102 @@ def test_lvalue_index_rejects_step_binding():
         )
 
 
+def test_index_borrow_push_into_other_tablets_deep_clones(tmp_path):
+    # `step p = a[i]` is a borrow into a's chunk. `b.push(p)` must
+    # deep-clone so releasing `a` doesn't dangle `b`'s entry. Before
+    # the push-path deep-clone fix, `b[0].val` after `release a`
+    # read freed bytes and printed garbage.
+    src = (
+        "tablet Entry { key: str, val: str }\n"
+        "fn main() -> i32 {\n"
+        "  mut a: tablets[4]Entry\n"
+        "  mut b: tablets[4]Entry\n"
+        "  step _x = a.push(Entry { key: \"k\" + \"\", val: \"v\" + \"1\" })\n"
+        "  step p = a[0]\n"
+        "  step _y = b.push(p)\n"
+        "  release a\n"
+        "  println(b[0].val)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"v1\n"
+
+
+def test_struct_with_tablets_field_scope_release(tmp_path):
+    # A struct with a tablets field, indexed after nested push. The
+    # scope-exit struct-release walks each field: str release, then
+    # tablets release (which walks chunks and frees contained strs).
+    # A prior bug in the non-Ident tablets-index path (f1.locals[0])
+    # forgot to apply _read_borrow, leading to a double-free SIGABRT.
+    src = (
+        "tablet Frame { name: str, locals: tablets[4]str }\n"
+        "fn main() -> i32 {\n"
+        "  mut f1: Frame = Frame { name: \"main\", locals: tablets[4]str { } }\n"
+        "  f1.locals.push(\"x\")\n"
+        "  println(f1.name)\n"
+        "  println(f1.locals[0])\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"main\nx\n"
+
+
+def test_return_struct_with_tablets_field_deep_clones(tmp_path):
+    # get_frame returns store[i], a struct whose `locals` field is a
+    # tablets[4]str. The clone-on-return path must deep-clone every
+    # cleanup-bearing field — including the tablets, which needs its
+    # chunk chain walked and each element cloned. Previously raised
+    # "deep-cloning a tablets field isn't supported yet".
+    src = (
+        "tablet Frame { name: str, locals: tablets[4]str }\n"
+        "fn get_frame(store: tablets[4]Frame, i: i64) -> Frame {\n"
+        "  store[i]\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  mut store: tablets[4]Frame\n"
+        "  mut f1: Frame = Frame { name: \"main\", locals: tablets[4]str { } }\n"
+        "  f1.locals.push(\"x\")\n"
+        "  f1.locals.push(\"y\")\n"
+        "  step _ = store.push(f1)\n"
+        "  step got = get_frame(store, 0)\n"
+        "  println(got.name)\n"
+        "  println(got.locals[0])\n"
+        "  println(got.locals[1])\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"main\nx\ny\n"
+
+
+def test_struct_lit_with_borrow_field_deep_clones(tmp_path):
+    # Outer struct literal takes a field value from a borrow Ident
+    # (here `p` sourced from store[0]). The struct-lit path must
+    # deep-clone the borrow so Outer owns independent bytes;
+    # releasing the source tablets must not dangle Outer's copy.
+    src = (
+        "tablet Inner { s: str }\n"
+        "tablet Outer { inner: Inner }\n"
+        "fn main() -> i32 {\n"
+        "  mut store: tablets[4]Inner\n"
+        "  step _x = store.push(Inner { s: \"hi\" + \"!\" })\n"
+        "  step p = store[0]\n"
+        "  step o = Outer { inner: p }\n"
+        "  release store\n"
+        "  println(o.inner.s)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hi!\n"
+
+
 def test_auto_release_inner_block_only(tmp_path):
     # A mut tablets declared in a nested block should release at that
     # block's end, independent of the outer function.

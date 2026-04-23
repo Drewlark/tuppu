@@ -1773,12 +1773,9 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         return self._deep_clone_if_cleanup_bearing(val)
 
     def _deep_clone_if_cleanup_bearing(self, val: ir.Value) -> ir.Value:
-        """Deep-clone `val` if it's a cleanup-bearing type — str, or a
-        user struct whose fields recursively require cloning. Scalars
-        pass through unchanged. A tablets-holding struct raises a
-        codegen error from `_get_struct_clone`: cloning a tablets
-        requires walking + cloning each element, which isn't
-        implemented."""
+        """Deep-clone `val` if it's a cleanup-bearing type — str, a
+        user struct whose fields recursively require cloning, or a
+        tablets value. Scalars pass through unchanged."""
         assert self.builder is not None
         if self._is_str_value(val.type):
             return self.builder.call(self._get_str_clone(), [val])
@@ -1789,13 +1786,13 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             return self.builder.call(
                 self._get_struct_clone(val.type), [val],
             )
-        # Bare tablets return from Field/Index — rare; reject clearly.
-        if self._tablets_info_for(val.type) is not None:
-            raise CodegenError(
-                "returning a tablets value via Field/Index isn't "
-                "supported — cloning a tablets requires walking + "
-                "cloning each element, which isn't implemented. "
-                "Return a wedge handle or restructure the fn."
+        info = self._tablets_info_for(val.type)
+        if info is not None:
+            # Tablets clone takes a pointer; spill the SSA to a temp.
+            src_slot = self._alloca_entry(val.type, ".tbls.clone.src")
+            self.builder.store(val, src_slot)
+            return self.builder.call(
+                self._get_tablets_clone(info), [src_slot],
             )
         return val
 
@@ -1956,12 +1953,13 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
     def _struct_as_borrow(
         self, val: ir.Value, struct_ty: ir.Type,
     ) -> ir.Value:
-        """Produce a view of `val` with every cleanup-bearing field
-        neutered: str fields get cap=0, tablets fields get zero-init
-        {head=null, tail=null, len=0}, nested cleanup structs recurse.
-        Used at call sites for struct-valued args so the callee's
-        cleanup-frame release becomes a no-op on every owning field —
-        caller retains sole ownership of the heap bytes."""
+        """Produce a view of `val` with every str field forced to cap=0
+        and every nested cleanup struct recursively neutered. Tablets
+        fields are left intact — they lack a cap-style sentinel, so
+        zeroing them would destroy read access. The push / struct-lit /
+        assign code paths deep-clone on borrow inputs, so the borrow
+        view is safe to copy around without aliasing the container's
+        chunks at a release site."""
         assert self.builder is not None
         fields = self._struct_fields_for(struct_ty)
         if fields is None:
@@ -1973,9 +1971,6 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 old = b.extract_value(result, i)
                 borrowed = self._str_as_borrow(old)
                 result = b.insert_value(result, borrowed, i)
-                continue
-            if self._tablets_info_for(fty) is not None:
-                result = b.insert_value(result, ir.Constant(fty, None), i)
                 continue
             if (
                 self._struct_fields_for(fty) is not None
@@ -2062,11 +2057,8 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         for a user struct: `__tuppu_struct_<name>_clone(src: struct_ty)
         -> struct_ty`. Returns a fresh value with cloned str fields
         (new heap allocations), recursively-cloned nested struct
-        fields, and scalar fields copied by value. Rejects tablets
-        fields — cloning those requires walking and cloning each
-        element, which is a bigger-scope piece of work; users
-        needing to return a struct-with-tablets-field should
-        restructure or clone manually."""
+        fields, deep-cloned tablets fields, and scalar fields copied
+        by value."""
         cached = self._struct_clone_cache.get(id(struct_ty))
         if cached is not None:
             return cached
@@ -2092,13 +2084,25 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 cloned = b.call(self._get_str_clone(), [field_val])
                 result = b.insert_value(result, cloned, i)
                 continue
-            if self._tablets_info_for(fty) is not None:
-                raise CodegenError(
-                    f"struct {name!r}: deep-cloning a tablets field "
-                    f"isn't supported yet. Returning a struct that "
-                    f"holds tablets by Field/Index isn't supported — "
-                    f"restructure or construct a fresh struct."
-                )
+            info = self._tablets_info_for(fty)
+            if info is not None:
+                # Tablets clone takes a pointer — spill the extracted
+                # SSA field value into a local slot first.
+                src_slot = b.alloca(fty, name=".tbls.field.src")
+                b.store(field_val, src_slot)
+                # Save/restore self.builder so the clone builder (which
+                # may recursively call into struct/tablets helpers and
+                # uses self.builder internally) sees this context.
+                saved = self.builder
+                self.builder = b
+                try:
+                    cloned = b.call(
+                        self._get_tablets_clone(info), [src_slot],
+                    )
+                finally:
+                    self.builder = saved
+                result = b.insert_value(result, cloned, i)
+                continue
             if (
                 self._struct_fields_for(fty) is not None
                 and self._struct_needs_cleanup(fty)
@@ -2161,18 +2165,19 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 self.builder.call(
                     self._get_struct_release(slot_ty), [slot_ptr],
                 )
-        self.builder.store(self._coerce(value, slot_ty), slot_ptr)
-        # Ownership transfer: if the RHS is an Ident whose cleanup is
-        # registered, the assignment target now owns those bytes. The
-        # source binding's scope-exit release would race with the
-        # target's release (mut binding cleanup / struct or tablets
-        # walk) and double-free. Matches the transfer semantics at
-        # push / struct-lit sites.
-        if (
-            isinstance(a.value, A.Ident)
-            and self._is_cleanup_bearing_ty(slot_ty)
-        ):
-            self._transfer_cleanup_into_container(a.value.name)
+        # Ownership into the slot: transfer from an owning Ident or
+        # deep-clone a borrow so the slot's release doesn't double-
+        # free against the source. Matches push / struct-lit shape.
+        coerced = self._coerce(value, slot_ty)
+        if self._is_cleanup_bearing_ty(slot_ty):
+            transferred = False
+            if isinstance(a.value, A.Ident):
+                transferred = self._transfer_cleanup_into_container(
+                    a.value.name,
+                )
+            if not transferred:
+                coerced = self._deep_clone_if_cleanup_bearing(coerced)
+        self.builder.store(coerced, slot_ptr)
 
     def _lvalue_slot(self, target: A.Expr) -> tuple[ir.Value, ir.Type]:
         """Resolve an lvalue to (pointer-to-slot, value-type-at-slot).
@@ -3443,14 +3448,20 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 raise CodegenError(
                     f"tablet {e.name!r} field {fname!r}: initializer has no value"
                 )
-            # Ownership transfer: if the field holds a cleanup-bearing
-            # type and the initializer is an Ident naming a locally-
-            # owned binding, take over its cleanup. Without this, the
-            # source binding's scope-exit release would free bytes the
-            # new struct holds, causing a UAF when the struct outlives
-            # the source (e.g. pushed into a long-lived tablets).
-            if isinstance(fexpr, A.Ident) and self._is_cleanup_bearing_ty(fty):
-                self._transfer_cleanup_into_container(fexpr.name)
+            # Ownership: cleanup-bearing fields take over their source's
+            # cleanup (if the initializer is an owning Ident) or get a
+            # deep-clone of the value (if the source is a borrow /
+            # rvalue with no transferable cleanup). Keeps the new
+            # struct as sole owner of its heap bytes so a later
+            # release walk is safe.
+            if self._is_cleanup_bearing_ty(fty):
+                transferred = False
+                if isinstance(fexpr, A.Ident):
+                    transferred = self._transfer_cleanup_into_container(
+                        fexpr.name,
+                    )
+                if not transferred:
+                    fv = self._deep_clone_if_cleanup_bearing(fv)
             value = self.builder.insert_value(value, self._coerce(fv, fty), i)
         return value
 
@@ -3557,7 +3568,9 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         # form. The Ident fast path above only fires for direct
         # tablets bindings; here we spill to a temp alloca so the
         # runtime get() call has a pointer to walk. Reads only; writes
-        # would need an lvalue slot rooted at a mut binding.
+        # would need an lvalue slot rooted at a mut binding. The read
+        # is a borrow — cleanup markers neutered so the caller can't
+        # double-free against the container's own release walk.
         if target is not None:
             info = self._tablets_info_for(target.type)
             if info is not None:
@@ -3569,7 +3582,8 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 self.builder.store(target, slot)
                 length = self.builder.extract_value(target, 2)
                 self._emit_dynamic_bounds_trap(idx, length)
-                return self.builder.call(info.get, [slot, idx])
+                val = self.builder.call(info.get, [slot, idx])
+                return self._read_borrow(val)
 
         raise CodegenError("indexing is only supported on tables, tablets, and str")
 
