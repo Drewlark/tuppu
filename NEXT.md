@@ -1010,6 +1010,23 @@ pressure before committing to one.
   full str ownership story. Overdue but purely editorial — cut
   a half-day when the feature surface stabilizes.
 
+### Deep-clone for struct-with-tablets-field
+
+Returning a struct via Field/Index currently deep-clones through
+str and nested struct fields. A tablets-holding struct field
+raises a clear codegen error — cloning a tablets means walking
+the chunk chain and cloning each element, which is real work
+compared to the str / nested-struct cases.
+
+Scope: generate a per-(N, T) tablets-clone helper that
+allocates a fresh header, iterates the source chain, and pushes
+each element (cloned if cleanup-bearing) into the new tablets.
+Recursive with the struct-clone path for element types that
+themselves need cloning. ~60-80 lines in tablets.py plus wiring.
+
+No user code hits this today, but the error path is a known
+rough edge. File as a medium-priority cleanup.
+
 ### Known friction spots worth a look
 
 - **Struct returns across colophon.** Currently rejected — we
