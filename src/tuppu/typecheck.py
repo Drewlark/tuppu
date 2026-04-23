@@ -212,6 +212,35 @@ INTRINSIC_NAMES = {
     "bytes_to_str", "buffer_to_str",
 }
 
+# The fixed set of operator-overload op names users may declare with
+# `gloss <op>(...)`. Each maps to the operator symbol it implements,
+# an arity ("bin" / "un"), and whether the return type is fixed.
+#
+# `eq` produces `==`; the typechecker also derives `!=` by negating
+# the result, so users don't (and shouldn't) declare `gloss ne`.
+# Ordering ops are separate for v1 — no `cmp`-returning-`Ordering`
+# convenience layer. Might add one later.
+GLOSS_OPS: dict[str, tuple[str, str, "str | None"]] = {
+    # name      -> (op_symbol, arity, fixed_return_type_name_or_None)
+    "add":      ("+",  "bin", None),
+    "sub":      ("-",  "bin", None),
+    "mul":      ("*",  "bin", None),
+    "div":      ("/",  "bin", None),
+    "mod":      ("%",  "bin", None),
+    # Comparisons must return bool — the control-flow machinery
+    # downstream of `if` / `while` depends on it.
+    "eq":       ("==", "bin", "bool"),
+    "lt":       ("<",  "bin", "bool"),
+    "le":       ("<=", "bin", "bool"),
+    "gt":       (">",  "bin", "bool"),
+    "ge":       (">=", "bin", "bool"),
+    # Unary ops are free to return any type — e.g. `!flag` on a
+    # user Flag might flip it and return another Flag, or `-v` on
+    # a Vector returns a Vector.
+    "neg":      ("-",  "un",  None),
+    "not":      ("!",  "un",  None),
+}
+
 # Canonical tablets chunk size used when synthesising literals for
 # variadic call arguments and when resolving `tablets[...]T` param
 # markers. Sixteen is big enough to hold most variadic calls in one
@@ -308,6 +337,16 @@ class Checker:
         # the collected trailing arguments. Codegen consults this to
         # emit the literal once for the last param slot.
         self.variadic_lit_for_call: dict[int, "A.TabletsLit"] = {}
+        # Operator-overload dispatch table. Keys are (op, lhs_ty, rhs_ty)
+        # for binary ops or (op, operand_ty, None) for unary, where
+        # `op` is one of the GLOSS_OPS names. Values are the mangled
+        # internal fn name — codegen resolves through self.functions
+        # like any other fn call. Populated by `_register_gloss`.
+        self.gloss_dispatch: dict[tuple[str, Ty, "Ty | None"], str] = {}
+        # Per-expression sideband: Binary / Unary node id → mangled
+        # gloss fn name. Codegen consults this to emit a call through
+        # the user-defined overload instead of the built-in op lowering.
+        self.gloss_call_for_node: dict[int, str] = {}
         # IfExpr AST node ids appearing in statement position — i.e.
         # as a bare `ExprStmt` inside a block or a while body, where
         # the value is provably discarded. Populated by `_tc_stmt`,
@@ -351,18 +390,24 @@ class Checker:
                 self._resolve_seal_variants(d)
         # Phase 1: function signatures (parameter and return types can now
         # reference any struct). Colophons declare externs and join the
-        # same fn table so call sites resolve uniformly.
+        # same fn table so call sites resolve uniformly. Gloss decls
+        # register in both the fn table (under a mangled name) and the
+        # operator dispatch table.
         for d in self.prog.decls:
             if isinstance(d, A.FnDecl):
                 self._register_fn(d)
             elif isinstance(d, A.ColophonDecl):
                 self._register_colophon(d)
+            elif isinstance(d, A.GlossDecl):
+                self._register_gloss(d)
         for d in self.prog.decls:
             if isinstance(d, A.TableDecl):
                 self._register_table(d)
         for d in self.prog.decls:
             if isinstance(d, A.FnDecl):
                 self._check_fn_body(d)
+            elif isinstance(d, A.GlossDecl):
+                self._check_gloss_body(d)
 
     # --- registration ------------------------------------------------
 
@@ -505,6 +550,22 @@ class Checker:
                 fn.line, fn.col,
             )
         self.fns[fn.name] = TyFn(params=params, ret=ret, is_variadic=is_variadic)
+        # Did-you-mean warning: users who write `fn add(a: Vec, b: Vec)
+        # -> Vec` on user types probably meant `gloss add`. Warn but
+        # don't reject — the regular fn may be intentional.
+        if fn.name in GLOSS_OPS and not is_variadic:
+            _sym, arity, _fixed_ret = GLOSS_OPS[fn.name]
+            expected_arity = 2 if arity == "bin" else 1
+            if len(params) == expected_arity and any(
+                isinstance(p, (TyStruct, TySeal)) for p in params
+            ):
+                self._warn(
+                    f"fn {fn.name!r} has a signature that looks like an "
+                    f"operator overload on user types; did you mean "
+                    f"`gloss {fn.name}`? (if you meant a regular fn, "
+                    f"ignore this)",
+                    fn.line, fn.col,
+                )
         if fn.name == "main":
             if ret != I32:
                 raise CheckError(
@@ -592,6 +653,132 @@ class Checker:
         # Tracked so codegen can emit extern declarations instead of
         # trying to lower a body.
         self.colophons.add(c.name)
+
+    def _register_gloss(self, g: A.GlossDecl) -> None:
+        """Validate a gloss decl, register it in the dispatch table
+        keyed by (op, lhs_ty, rhs_ty), and mint a mangled name for
+        the fn table so codegen can emit a regular call. Enforces:
+          - op must be a known gloss-op name
+          - arity matches the op (binary vs unary)
+          - operand types must be user tablets or seals (not primitives)
+          - return type matches any fixed constraint (`eq` -> bool, etc.)
+          - no duplicate registration for the same (op, lhs, rhs)"""
+        if g.op not in GLOSS_OPS:
+            valid = ", ".join(sorted(GLOSS_OPS))
+            raise CheckError(
+                f"gloss {g.op!r}: unknown operator name; valid names are "
+                f"{valid}",
+                g.line, g.col,
+            )
+        _sym, arity, fixed_ret = GLOSS_OPS[g.op]
+        expected_arity = 2 if arity == "bin" else 1
+        if len(g.params) != expected_arity:
+            raise CheckError(
+                f"gloss {g.op!r}: expects {expected_arity} param(s), "
+                f"got {len(g.params)}",
+                g.line, g.col,
+            )
+
+        params = tuple(
+            self._resolve_type(p.type, f"gloss {g.op!r} param {p.name!r}")
+            for p in g.params
+        )
+        ret = (
+            self._resolve_type(g.return_type, f"gloss {g.op!r} return type")
+            if g.return_type else UNIT
+        )
+
+        # Operand-type restriction: at least one operand must be a
+        # user-defined type (TyStruct or TySeal). Overloading
+        # primitive+primitive would shadow built-ins and produce
+        # surprising behavior; we reject at decl.
+        def is_user_type(t: Ty) -> bool:
+            return isinstance(t, (TyStruct, TySeal))
+        if not any(is_user_type(p) for p in params):
+            raise CheckError(
+                f"gloss {g.op!r}: at least one operand must be a user "
+                f"tablet or seal (can't overload operators for "
+                f"primitive+primitive combinations)",
+                g.line, g.col,
+            )
+
+        if fixed_ret is not None:
+            expected_ret = PRIM_TYPES[fixed_ret]
+            if ret != expected_ret:
+                raise CheckError(
+                    f"gloss {g.op!r}: return type must be {fixed_ret}, "
+                    f"got {ret}",
+                    g.line, g.col,
+                )
+
+        # Dispatch key: (op, lhs, rhs). For unary ops, rhs=None.
+        lhs_ty = params[0]
+        rhs_ty = params[1] if arity == "bin" else None
+        key = (g.op, lhs_ty, rhs_ty)
+        if key in self.gloss_dispatch:
+            raise CheckError(
+                f"gloss {g.op!r}: duplicate definition for operand "
+                f"types ({lhs_ty}" + (f", {rhs_ty}" if rhs_ty else "") + ")",
+                g.line, g.col,
+            )
+
+        mangled = self._gloss_mangled_name(g.op, lhs_ty, rhs_ty)
+        if mangled in self.fns:
+            raise CheckError(
+                f"gloss {g.op!r}: internal mangled name {mangled!r} "
+                f"collides with an existing declaration",
+                g.line, g.col,
+            )
+        self.fns[mangled] = TyFn(params=params, ret=ret)
+        self.gloss_dispatch[key] = mangled
+        self.fn_type_params[mangled] = ()
+
+    def _gloss_mangled_name(
+        self, op: str, lhs: Ty, rhs: "Ty | None",
+    ) -> str:
+        """Deterministic internal symbol for a gloss dispatch entry.
+        Stable across compilations (used only within one program, so
+        uniqueness is the only requirement)."""
+        def tag(t: Ty) -> str:
+            if isinstance(t, TyStruct):
+                base = t.name
+                if t.args:
+                    base += "__" + "_".join(tag(a) for a in t.args)
+                return base
+            if isinstance(t, TySeal):
+                base = t.name
+                if t.args:
+                    base += "__" + "_".join(tag(a) for a in t.args)
+                return base
+            if isinstance(t, TyInt):
+                return str(t)
+            if isinstance(t, TyBool):
+                return "bool"
+            return str(t).replace(" ", "_")
+        if rhs is None:
+            return f"__gloss_{op}_{tag(lhs)}"
+        return f"__gloss_{op}_{tag(lhs)}_{tag(rhs)}"
+
+    def _check_gloss_body(self, g: A.GlossDecl) -> None:
+        """Typecheck a gloss body as if it were a regular fn — same
+        rules, same param binding, same tail-return semantics. The
+        only difference is the name under which it's registered."""
+        _sym, arity, _ = GLOSS_OPS[g.op]
+        params = tuple(
+            self._resolve_type(p.type, f"gloss {g.op!r} param {p.name!r}")
+            for p in g.params
+        )
+        rhs_ty = params[1] if arity == "bin" else None
+        mangled = self._gloss_mangled_name(g.op, params[0], rhs_ty)
+        fake_fn = A.FnDecl(
+            name=mangled,
+            params=g.params,
+            return_type=g.return_type,
+            body=g.body,
+            line=g.line,
+            col=g.col,
+        )
+        self._check_fn_body(fake_fn)
 
     def _register_table(self, t: A.TableDecl) -> None:
         elem = self._resolve_type(t.element_type, f"element type of table {t.name!r}")
@@ -1065,15 +1252,54 @@ class Checker:
             if isinstance(ty, TyRat): return ty
             # Negating a dish preserves the dish type — it's lossless.
             if isinstance(ty, TyDish): return ty
+            # User type: dispatch to gloss_neg if declared.
+            gloss_ret = self._gloss_lookup_unary("neg", ty, e)
+            if gloss_ret is not None:
+                return gloss_ret
             raise CheckError(
                 f"unary -: requires an integer, rat, or dish, got {ty}", e.line, e.col,
             )
         if e.op == "!":
             if isinstance(ty, TyBool): return BOOL
+            gloss_ret = self._gloss_lookup_unary("not", ty, e)
+            if gloss_ret is not None:
+                return gloss_ret
             raise CheckError(
                 f"unary !: requires a bool, got {ty}", e.line, e.col,
             )
         raise CheckError(f"unknown unary operator {e.op!r}", e.line, e.col)
+
+    def _gloss_lookup_unary(
+        self, op_name: str, operand: Ty, e: A.Unary,
+    ) -> "Ty | None":
+        key = (op_name, operand, None)
+        mangled = self.gloss_dispatch.get(key)
+        if mangled is None:
+            return None
+        fn_ty = self.fns[mangled]
+        # Record so codegen can route to the mangled fn call.
+        self.gloss_call_for_node[id(e)] = mangled
+        return fn_ty.ret
+
+    def _gloss_lookup_binary(
+        self, op_name: str, lhs: Ty, rhs: Ty, e: A.Binary,
+    ) -> "Ty | None":
+        key = (op_name, lhs, rhs)
+        mangled = self.gloss_dispatch.get(key)
+        if mangled is None:
+            return None
+        fn_ty = self.fns[mangled]
+        self.gloss_call_for_node[id(e)] = mangled
+        return fn_ty.ret
+
+    # Reverse map: operator symbol -> gloss-op name for dispatch lookup.
+    # Comparisons map to their matching gloss-op; `!=` derives from
+    # `eq` with a negation applied at typecheck time (see below).
+    _BIN_OP_GLOSS = {
+        "+": "add", "-": "sub", "*": "mul", "/": "div", "%": "mod",
+        "==": "eq", "!=": "eq",
+        "<": "lt", "<=": "le", ">": "gt", ">=": "ge",
+    }
 
     def _tc_binary(self, e: A.Binary) -> Ty:
         lhs = self._tc_expr(e.lhs)
@@ -1131,6 +1357,14 @@ class Checker:
                     e.line, e.col,
                 )
                 return RAT
+            # User-defined operator overload via `gloss`: dispatch on
+            # the exact (lhs, rhs) type pair. Registered fns live in
+            # `gloss_dispatch`; a miss falls through to the error.
+            gloss_name = self._BIN_OP_GLOSS.get(op)
+            if gloss_name is not None:
+                gloss_ret = self._gloss_lookup_binary(gloss_name, lhs, rhs, e)
+                if gloss_ret is not None:
+                    return gloss_ret
             raise CheckError(
                 f"{op} requires matching integer, rat, or dish operands, "
                 f"got {lhs} and {rhs}",
@@ -1169,6 +1403,13 @@ class Checker:
                 and lhs.name == rhs.name
             ):
                 return BOOL
+            # User-defined comparison via `gloss`. `!=` dispatches to
+            # `gloss eq` and the codegen emits `!eq(a, b)`.
+            gloss_name = self._BIN_OP_GLOSS.get(op)
+            if gloss_name is not None:
+                gloss_ret = self._gloss_lookup_binary(gloss_name, lhs, rhs, e)
+                if gloss_ret is not None:
+                    return gloss_ret
             raise CheckError(
                 f"{op} requires matching comparable operands, got {lhs} and {rhs}",
                 e.line, e.col,

@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **553 tests passing.**
+- **567 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -155,6 +155,18 @@ What works:
   from compiler intrinsic to `stdlib/str.tpu` as a plain Tuppu fn.
   The binary `+` / `+=` operator on strs still uses the native
   single-malloc fast path. See `tests/test_variadic.py`.
+- **Operator overloads via `gloss` keyword.** `gloss add(a: Vec,
+  b: Vec) -> Vec { ... }` registers a Tuppu fn as the dispatch
+  target for `+` on two Vecs. Internal mangling (`__gloss_add_
+  Vec_Vec`) keeps the user's `fn add` namespace free — you can
+  have both a plain `fn add` and a `gloss add` coexist. Supported
+  ops: `add sub mul div mod` (binary arith), `eq` (auto-derives
+  `!=`), `lt le gt ge` (separate, no `Ordering` type at v1),
+  `neg not` (unary). At least one operand must be a user tablet
+  or seal; primitive-primitive overloads are rejected. Did-you-
+  mean warning fires when a user writes `fn add(T, T) -> T` where
+  T is a user type — nudges them toward `gloss add` without
+  rejecting. See `tests/test_gloss.py`.
 - **Primitive-only fn pointers across colophon.** `colophon fn
   atexit(cb: fn())` and `colophon fn signal(sig: i32, handler:
   fn(i32)) -> fn(i32)` both type-check and run. Tuppu fn names
@@ -963,7 +975,7 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 553 passing.
+2. `.venv/bin/pytest` — expect 567 passing.
 3. `git log --oneline -15` — recent timeline: sum types + generic
    monomorphization, str ownership sentinel on fn args, slicing,
    str_buf pattern via tablets-backed byte buffer + `bytes_to_str`,
@@ -989,6 +1001,8 @@ If starting a fresh session after this compact:
    - ~~**§6. Fn pointers across colophon (primitives-only)**~~ —
      done 2026-04-23. `signal` / `atexit` work; callback sigs must
      be `fn(prim, ...) -> prim`.
+   - ~~**Operator overloads via `gloss`**~~ — done 2026-04-23.
+     `gloss add(a: Vec, b: Vec) -> Vec`. See `tests/test_gloss.py`.
 6. `FUTURE_OPTIMIZATIONS.md` (gitignored) captures design sketches
    for a `--strict-dish` flag, the SEX 20→16 byte shrink, SIMD carry
    in sex_add, and other perf/language ideas. Don't forget on the

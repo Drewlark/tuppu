@@ -219,6 +219,8 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 self._declare_fn(decl)
             elif isinstance(decl, A.ColophonDecl):
                 self._declare_colophon(decl)
+            elif isinstance(decl, A.GlossDecl):
+                self._declare_gloss(decl)
             elif isinstance(decl, A.TableDecl):
                 pass  # handled in phase 2 after function decls are visible
             elif isinstance(decl, A.StructDecl):
@@ -245,6 +247,8 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 if decl.type_params:
                     continue
                 self._gen_fn_body(decl)
+            elif isinstance(decl, A.GlossDecl):
+                self._gen_gloss_body(decl)
         return self.module
 
     def _declare_fn(self, fn: A.FnDecl) -> None:
@@ -275,6 +279,55 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         for i, p in enumerate(fn.params):
             llvm_fn.args[i].name = p.name
         self.functions[fn.name] = llvm_fn
+
+    def _declare_gloss(self, g: A.GlossDecl) -> None:
+        """Forward-declare a gloss fn under its mangled internal name.
+        Mirrors `_declare_fn` but resolves the name through the
+        checker's mangle scheme so operator dispatch can `self.functions
+        [mangled]` like any other fn."""
+        from ..typecheck import GLOSS_OPS
+        if self._checker is None:
+            raise CodegenError("gloss decl requires a typechecker pass")
+        # Rebuild the mangled name from the decl's operand types.
+        param_tys = tuple(
+            self._checker._resolve_type(p.type, "gloss param")
+            for p in g.params
+        )
+        _sym, arity, _ = GLOSS_OPS[g.op]
+        rhs_ty = param_tys[1] if arity == "bin" else None
+        mangled = self._checker._gloss_mangled_name(g.op, param_tys[0], rhs_ty)
+        fake_fn = A.FnDecl(
+            name=mangled,
+            params=g.params,
+            return_type=g.return_type,
+            body=g.body,
+            line=g.line,
+            col=g.col,
+        )
+        self._declare_fn(fake_fn)
+
+    def _gen_gloss_body(self, g: A.GlossDecl) -> None:
+        """Emit the body of a gloss decl — identical to a regular fn
+        body, just under the mangled name registered during
+        `_declare_gloss`."""
+        from ..typecheck import GLOSS_OPS
+        assert self._checker is not None
+        param_tys = tuple(
+            self._checker._resolve_type(p.type, "gloss param")
+            for p in g.params
+        )
+        _sym, arity, _ = GLOSS_OPS[g.op]
+        rhs_ty = param_tys[1] if arity == "bin" else None
+        mangled = self._checker._gloss_mangled_name(g.op, param_tys[0], rhs_ty)
+        fake_fn = A.FnDecl(
+            name=mangled,
+            params=g.params,
+            return_type=g.return_type,
+            body=g.body,
+            line=g.line,
+            col=g.col,
+        )
+        self._gen_fn_body(fake_fn)
 
     def _declare_colophon(self, c: A.ColophonDecl) -> None:
         """Forward-declare a libc extern. The LLVM signature uses C-ABI
@@ -2226,8 +2279,54 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         for release_fn, ptr, _name in reversed(frame):
             self.builder.call(release_fn, [ptr])
 
+    def _gen_gloss_call(
+        self, mangled: str, arg_exprs: list[A.Expr],
+    ) -> ir.Value:
+        """Emit a call to a gloss-registered fn under its mangled name.
+        Reuses the regular fn-call marshaling — str cap=0 neutering,
+        struct-field zeroing, anonymous cleanup for heap-owning rvalue
+        args — so operator overloads inherit the same ownership rules
+        every other Tuppu call has. No marshaling wrapper: the callee
+        is just a regular Tuppu fn, dispatched by typechecker lookup
+        instead of source-level name."""
+        assert self.builder is not None
+        fn = self.functions.get(mangled)
+        if fn is None:
+            raise CodegenError(
+                f"gloss dispatch: fn {mangled!r} not declared"
+            )
+        call_args: list[ir.Value] = []
+        for arg_expr, expected_ty in zip(arg_exprs, fn.args):
+            v = self._gen_expr(arg_expr)
+            if v is None:
+                raise CodegenError("gloss arg has no value")
+            coerced = self._coerce(v, expected_ty.type)
+            if self._is_str_value(expected_ty.type):
+                self._register_str_rvalue_cleanup(coerced, arg_expr)
+                coerced = self._str_as_borrow(coerced)
+            elif (
+                self._struct_fields_for(expected_ty.type) is not None
+                and self._struct_needs_cleanup(expected_ty.type)
+            ):
+                self._register_struct_rvalue_cleanup(
+                    coerced, arg_expr, expected_ty.type,
+                )
+                coerced = self._struct_as_borrow(coerced, expected_ty.type)
+            call_args.append(coerced)
+        return self.builder.call(fn, call_args)
+
     def _gen_unary(self, e: A.Unary) -> ir.Value:
         assert self.builder is not None
+        # User-defined overload: the checker marked the node with a
+        # mangled fn name. Dispatch by emitting a regular call — the
+        # fn lives in self.functions under the mangle.
+        if (
+            self._checker is not None
+            and id(e) in self._checker.gloss_call_for_node
+        ):
+            return self._gen_gloss_call(
+                self._checker.gloss_call_for_node[id(e)], [e.operand],
+            )
         operand = self._gen_expr(e.operand)
         if operand is None:
             raise CodegenError(f"unary {e.op} operand has no value")
@@ -2251,6 +2350,18 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
 
     def _gen_binary(self, e: A.Binary) -> ir.Value:
         assert self.builder is not None
+        # User-defined overload: checker marked the node with a mangled
+        # fn name. Emit a call; for `!=` the checker routes via `eq`
+        # and we negate the result here.
+        if (
+            self._checker is not None
+            and id(e) in self._checker.gloss_call_for_node
+        ):
+            mangled = self._checker.gloss_call_for_node[id(e)]
+            result = self._gen_gloss_call(mangled, [e.lhs, e.rhs])
+            if e.op == "!=":
+                return self.builder.not_(result)
+            return result
         lhs = self._gen_expr(e.lhs)
         rhs = self._gen_expr(e.rhs)
         if lhs is None or rhs is None:

@@ -102,15 +102,41 @@ class Parser:
                 decls.append(self.parse_seal_decl())
             elif self.check(Tok.COLOPHON):
                 decls.append(self.parse_colophon())
+            elif self.check(Tok.GLOSS):
+                decls.append(self.parse_gloss())
             else:
                 t = self.peek()
                 raise ParseError(
-                    f"expected 'fn', 'table', 'tablet', 'seal', or 'colophon' "
-                    f"at top level, got {t.kind.name}",
+                    f"expected 'fn', 'table', 'tablet', 'seal', 'colophon', "
+                    f"or 'gloss' at top level, got {t.kind.name}",
                     t.line, t.col,
                 )
             self.skip_newlines()
         return A.Program(decls)
+
+    def parse_gloss(self) -> A.GlossDecl:
+        """`gloss <op>(params) -> type { body }` — operator overload.
+        `<op>` is one of the fixed gloss-op names (`add`, `eq`, etc.);
+        the typechecker validates the specific name + arity against
+        the operator it implements."""
+        start = self.eat(Tok.GLOSS)
+        op = self.eat(Tok.IDENT, "operator name after 'gloss'").value
+        self.eat(Tok.LPAREN)
+        params: list[A.Param] = []
+        if not self.check(Tok.RPAREN):
+            params.append(self.parse_param())
+            while self.check(Tok.COMMA):
+                self.advance()
+                params.append(self.parse_param())
+        self.eat(Tok.RPAREN)
+        return_type: A.TypeExpr | None = None
+        if self.check(Tok.ARROW):
+            self.advance()
+            return_type = self.parse_type()
+        body = self.parse_block()
+        return _at(start, A.GlossDecl(
+            op=op, params=params, return_type=return_type, body=body,
+        ))
 
     def parse_colophon(self) -> A.ColophonDecl:
         """`colophon fn name(params) -> type` — declare an external C

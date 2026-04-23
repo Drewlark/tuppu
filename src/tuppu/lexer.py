@@ -50,6 +50,7 @@ class Tok(Enum):
     MATCH = auto()       # emitted by `match` keyword — pattern-match expr
     LOST = auto()
     COLOPHON = auto()    # reserved; no semantics yet (see NEXT.md)
+    GLOSS = auto()       # emitted by `gloss` keyword — operator overload decl
 
     # type keywords (value: str — "i64", "bool", etc.)
     TYPE_KW = auto()
@@ -133,6 +134,11 @@ KEYWORDS: dict[str, Tok] = {
     # Babylonian colophon being the scribe's tag at the end of a tablet.
     # Reserving the word now so users can't accidentally claim it.
     "colophon": Tok.COLOPHON,
+    # `gloss <op>(a: T, b: U) -> V { ... }` is an operator overload —
+    # a marginal annotation that assigns meaning to an operator symbol
+    # for user types, mirroring the ancient scribal practice of
+    # writing a gloss above a word to explain its reading.
+    "gloss": Tok.GLOSS,
     "true": Tok.TRUE,
     "false": Tok.FALSE,
 }

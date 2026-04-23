@@ -443,6 +443,24 @@ class SealDecl:
     col:  int = _pos()
 
 @dataclass
+class GlossDecl:
+    """An operator-overload declaration: `gloss add(a: Vector, b: Vector)
+    -> Vector { ... }`. The scribe's gloss — a marginal note that
+    assigns meaning to a symbol. Parses like `fn` but with a fixed
+    set of op names (`add`, `sub`, `mul`, `div`, `mod`, `eq`, `lt`,
+    `le`, `gt`, `ge`, `neg`, `not`). Registered in a dispatch table
+    keyed by (op, lhs_ty, rhs_ty); binary/unary ops on user types
+    look up the table before erroring. Internal LLVM symbol gets a
+    `__gloss_<op>_<lhs>_<rhs>` mangling so users retain full freedom
+    over the plain `add` / `eq` namespace."""
+    op: str                     # one of the fixed gloss op names
+    params: list[Param]
+    return_type: TypeExpr | None
+    body: Block
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
 class ColophonDecl:
     """An external declaration — the Tuppu scribe's pointer at a
     function that lives outside the tablet. Parses like `fn` but has
@@ -462,7 +480,7 @@ class ColophonDecl:
     col:  int = _pos()
 
 
-Decl = Union[FnDecl, TableDecl, StructDecl, SealDecl, ColophonDecl]
+Decl = Union[FnDecl, TableDecl, StructDecl, SealDecl, ColophonDecl, GlossDecl]
 
 @dataclass
 class Program:
