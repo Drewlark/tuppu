@@ -657,3 +657,142 @@ def test_generic_missing_type_arg_rejected():
             "  0\n"
             "}\n"
         )
+
+
+# --- struct field auto-release --------------------------------------------
+#
+# A user struct that transitively holds cleanup-bearing fields (str,
+# tablets, or another such struct) participates in scope-exit release.
+# Without this, every Foo { name: str_concat(...) } would leak the
+# name bytes the moment Foo went out of scope.
+
+def test_struct_with_str_field_no_leak(tmp_path):
+    # Stress loop — a per-iteration leak would show up as unbounded
+    # RSS. Correctness proxy: finish cleanly with expected output.
+    src = (
+        "tablet Row { label: str }\n"
+        "fn main() -> i32 {\n"
+        "  mut i: i64 = 0\n"
+        "  while i < 1000 {\n"
+        "    step r: Row = Row { label: str_concat(\"hi \", int_to_str(i)) }\n"
+        "    println(r.label)\n"
+        "    i = i + 1\n"
+        "  }\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out, _ = run(src, tmp_path)
+    assert rc == 0
+    lines = out.split(b"\n")
+    assert lines[0] == b"hi 0"
+    assert lines[999] == b"hi 999"
+
+
+def test_struct_with_tablets_field_no_leak(tmp_path):
+    src = (
+        "tablet Buf { bytes: tablets[4]u8 }\n"
+        "fn main() -> i32 {\n"
+        "  mut i: i64 = 0\n"
+        "  while i < 500 {\n"
+        "    mut b: Buf\n"
+        "    b.bytes.push(72 as u8)\n"
+        "    b.bytes.push(105 as u8)\n"
+        "    i = i + 1\n"
+        "  }\n"
+        "  println(\"done\")\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out, _ = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"done\n"
+
+
+def test_struct_nested_cleanup(tmp_path):
+    # Outer struct's release recursively drains Inner, which drains
+    # its str field. IR should contain both struct releases plus the
+    # str release that Inner dispatches to.
+    src = (
+        "tablet Inner { s: str }\n"
+        "tablet Outer { inner: Inner }\n"
+        "fn main() -> i32 {\n"
+        "  mut o: Outer = Outer { inner: Inner { s: str_concat(\"a\", \"b\") } }\n"
+        "  println(o.inner.s)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"ab\n"
+    ir = compile_to_ir(src)
+    assert "__tuppu_struct_Outer_release" in ir
+    assert "__tuppu_struct_Inner_release" in ir
+
+
+def test_struct_without_cleanup_has_no_release_fn():
+    # A struct of plain i64 fields shouldn't emit a release fn —
+    # keeps the IR lean and makes the predicate observable.
+    src = (
+        "tablet Point { x: i64, y: i64 }\n"
+        "fn main() -> i32 {\n"
+        "  step p: Point = Point { x: 1, y: 2 }\n"
+        "  println(p.x + p.y)\n"
+        "  0\n"
+        "}\n"
+    )
+    ir = compile_to_ir(src)
+    assert "__tuppu_struct_Point_release" not in ir
+
+
+def test_struct_returned_transfers_cleanup(tmp_path):
+    # Ownership transfer on tail return extends to struct returns:
+    # the heap str inside the returned Row must survive the callee's
+    # scope-exit release.
+    src = (
+        "tablet Row { label: str }\n"
+        "fn build() -> Row {\n"
+        "  step r: Row = Row { label: str_concat(\"hello\", \"!\") }\n"
+        "  r\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  step r2: Row = build()\n"
+        "  println(r2.label)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"hello!\n"
+
+
+def test_struct_passed_to_fn_caller_retains_ownership(tmp_path):
+    # Caller holds a Row with a heap str; show() reads through its
+    # non-mut param. The callee must not register cleanup for the
+    # non-mut struct param (would double-free), and the caller must
+    # still be able to read the str after the call.
+    src = (
+        "tablet Row { label: str }\n"
+        "fn show(r: Row) { println(r.label) }\n"
+        "fn main() -> i32 {\n"
+        "  step r: Row = Row { label: str_concat(\"hi\", \"!\") }\n"
+        "  show(r)\n"
+        "  println(r.label)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"hi!\nhi!\n"
+
+
+def test_struct_reassignment_releases_old(tmp_path):
+    # Reassigning a whole struct-with-cleanup binding must release the
+    # old value first so the old heap str / chunks don't leak.
+    src = (
+        "tablet Row { label: str }\n"
+        "fn main() -> i32 {\n"
+        "  mut r: Row = Row { label: str_concat(\"first\", \"\") }\n"
+        "  r = Row { label: str_concat(\"second\", \"\") }\n"
+        "  println(r.label)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"second\n"

@@ -1075,8 +1075,11 @@ class Checker:
         return ty
 
     def _tc_call(self, e: A.Call, expected: Ty | None = None) -> Ty:
-        # Method call on a tablets variable: t.push(x), t.release(), ...
-        if isinstance(e.callee, A.Field) and isinstance(e.callee.target, A.Ident):
+        # Method call on a tablets receiver. The receiver may be a bare
+        # Ident (t.push) or a field chain rooted at one (buf.bytes.push);
+        # _tc_method_call routes through _tc_expr on the receiver so
+        # nested-field method dispatch works uniformly.
+        if isinstance(e.callee, A.Field):
             return self._tc_method_call(e)
 
         if not isinstance(e.callee, A.Ident):
@@ -1296,10 +1299,19 @@ class Checker:
         return str_ty
 
     def _tc_method_call(self, e: A.Call) -> Ty:
-        assert isinstance(e.callee, A.Field) and isinstance(e.callee.target, A.Ident)
-        recv_name = e.callee.target.name
+        assert isinstance(e.callee, A.Field)
         method = e.callee.name
-        recv_ty = self._lookup(recv_name, e.line, e.col)
+        # Resolve the receiver's type via the general expression path so
+        # a chained `buf.bytes` (Field) routes through field-typecheck
+        # and yields the correct TyTablets for the inner field.
+        recv_ty = self._tc_expr(e.callee.target)
+        # Report receiver shape in errors: an Ident receiver gives the
+        # old "recv is X, not a tablets" message, field chains name the
+        # expression structure.
+        recv_name = (
+            e.callee.target.name if isinstance(e.callee.target, A.Ident)
+            else "<field expression>"
+        )
 
         if isinstance(recv_ty, TyTablets):
             if method == "push":

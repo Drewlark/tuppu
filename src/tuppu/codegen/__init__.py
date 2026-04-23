@@ -66,6 +66,10 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         self._sex_to_str: ir.Function | None = None
         self._memcpy: ir.Function | None = None
         self._snprintf: ir.Function | None = None
+        # Per-struct release fns, keyed by id() of the LLVM struct type.
+        # Built lazily; only emitted for structs that transitively hold
+        # cleanup-bearing fields (str / tablets / nested cleanup struct).
+        self._struct_release_cache: dict[int, ir.Function] = {}
         # table name -> (global array, length, lo bound, element LLVM type)
         self._tables: dict[str, tuple[ir.GlobalVariable, int, int, ir.Type]] = {}
         # Tablets monomorphizations: key is (N, str(elem_type)).
@@ -1317,11 +1321,20 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             self._bind(b.name, Variable(is_mut=True, ir_ref=slot, value_ty=init_val.type))
             self._maybe_register_cleanup(b.name, init_val.type, slot)
         else:
-            # Step-bound str still needs cleanup (it may be heap-owned).
-            # Spill to a dedicated slot solely for the release path; keep
-            # the SSA value as the access path so reads stay direct and
-            # reassignment remains impossible at the source level.
-            if self._is_str_value(init_val.type):
+            # Step-bound cleanup-bearing values need a slot so the
+            # scope-exit release can see them. Covers the built-in str
+            # and any user struct that transitively holds cleanup-
+            # bearing fields. The SSA value stays the read path (reads
+            # remain direct, reassignment impossible), the slot exists
+            # purely for release dispatch.
+            needs_slot = (
+                self._is_str_value(init_val.type)
+                or (
+                    self._struct_fields_for(init_val.type) is not None
+                    and self._struct_needs_cleanup(init_val.type)
+                )
+            )
+            if needs_slot:
                 assert self.builder is not None
                 cleanup_slot = self._alloca_entry(init_val.type, f"{b.name}.cleanup")
                 self.builder.store(init_val, cleanup_slot)
@@ -1331,17 +1344,99 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
     def _maybe_register_cleanup(
         self, name: str, value_ty: ir.Type, slot: ir.Value,
     ) -> None:
-        """If `value_ty` is a cleanup-having type (tablets or str),
-        record a release call for the innermost cleanup frame so it
-        fires automatically at scope exit."""
+        """If `value_ty` is a cleanup-having type, record a release call
+        for the innermost cleanup frame so it fires automatically at
+        scope exit. Handled: tablets, the built-in str, and user
+        structs that (transitively) hold any of those."""
+        if not self._cleanup_frames:
+            return
         info = self._tablets_info_for(value_ty)
-        if info is not None and self._cleanup_frames:
+        if info is not None:
             self._cleanup_frames[-1].append((info.release, slot, name))
             return
-        if self._is_str_value(value_ty) and self._cleanup_frames:
+        if self._is_str_value(value_ty):
             self._cleanup_frames[-1].append(
                 (self._get_str_release(), slot, name),
             )
+            return
+        if (
+            self._struct_fields_for(value_ty) is not None
+            and self._struct_needs_cleanup(value_ty)
+        ):
+            self._cleanup_frames[-1].append(
+                (self._get_struct_release(value_ty), slot, name),
+            )
+
+    def _struct_needs_cleanup(self, struct_ty: ir.Type) -> bool:
+        """Does this user struct (transitively) hold any cleanup-bearing
+        fields? Walks the declared field list — str, tablets, and nested
+        user structs that themselves need cleanup all count. Pointer /
+        handle fields don't — they borrow into some other storage whose
+        owner does the release."""
+        fields = self._struct_fields_for(struct_ty)
+        if fields is None:
+            return False
+        for _name, fty in fields:
+            if self._is_str_value(fty):
+                return True
+            if self._tablets_info_for(fty) is not None:
+                return True
+            if self._struct_fields_for(fty) is not None:
+                if self._struct_needs_cleanup(fty):
+                    return True
+        return False
+
+    def _get_struct_release(self, struct_ty: ir.Type) -> ir.Function:
+        """Build (once, caching by LLVM-type identity) a release fn for
+        a user struct: `__tuppu_struct_<name>_release(s: *struct_ty)`.
+        GEPs to each cleanup-bearing field and dispatches to the
+        appropriate release — str, tablets, or nested struct. Fields
+        without cleanup are skipped entirely."""
+        cached = self._struct_release_cache.get(id(struct_ty))
+        if cached is not None:
+            return cached
+        name = self._struct_name_for(struct_ty) or "anon"
+        fn = ir.Function(
+            self.module,
+            ir.FunctionType(ir.VoidType(), [struct_ty.as_pointer()]),
+            name=f"__tuppu_struct_{name}_release",
+        )
+        # Cache before body-build so any recursive call through a nested
+        # struct field (via another _get_struct_release) sees the in-
+        # progress function rather than rebuilding it.
+        self._struct_release_cache[id(struct_ty)] = fn
+
+        entry = fn.append_basic_block("entry")
+        b = ir.IRBuilder(entry)
+        s_ptr = fn.args[0]
+        fields = self._struct_fields_for(struct_ty) or []
+        for i, (_fname, fty) in enumerate(fields):
+            if self._is_str_value(fty):
+                field_ptr = b.gep(
+                    s_ptr, [ir.Constant(I32, 0), ir.Constant(I32, i)],
+                    inbounds=True,
+                )
+                b.call(self._get_str_release(), [field_ptr])
+                continue
+            info = self._tablets_info_for(fty)
+            if info is not None:
+                field_ptr = b.gep(
+                    s_ptr, [ir.Constant(I32, 0), ir.Constant(I32, i)],
+                    inbounds=True,
+                )
+                b.call(info.release, [field_ptr])
+                continue
+            if (
+                self._struct_fields_for(fty) is not None
+                and self._struct_needs_cleanup(fty)
+            ):
+                field_ptr = b.gep(
+                    s_ptr, [ir.Constant(I32, 0), ir.Constant(I32, i)],
+                    inbounds=True,
+                )
+                b.call(self._get_struct_release(fty), [field_ptr])
+        b.ret_void()
+        return fn
 
     def _register_str_rvalue_cleanup(
         self, val: ir.Value, src: A.Expr,
@@ -1375,12 +1470,24 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         value = self._gen_expr(a.value)
         if value is None:
             raise CodegenError("assignment RHS has no value")
-        # Mut str reassignment: release the old value before overwriting.
-        # The old value may be heap-owned (cap > 0) or borrowed (cap = 0);
-        # __tuppu_str_release handles both (free if cap > 0, else no-op).
-        # Without this, any prior heap ptr leaks on reassign.
+        # Reassignment: release the old value before overwriting.
+        # Covers every cleanup-bearing slot type — str (cap-sentinel
+        # no-ops borrows), tablets (frees the chunk chain), or a
+        # user struct that transitively owns cleanup-bearing fields.
+        # Without this, any prior heap state leaks on reassign.
         if self._is_str_value(slot_ty):
             self.builder.call(self._get_str_release(), [slot_ptr])
+        else:
+            info = self._tablets_info_for(slot_ty)
+            if info is not None:
+                self.builder.call(info.release, [slot_ptr])
+            elif (
+                self._struct_fields_for(slot_ty) is not None
+                and self._struct_needs_cleanup(slot_ty)
+            ):
+                self.builder.call(
+                    self._get_struct_release(slot_ty), [slot_ptr],
+                )
         self.builder.store(self._coerce(value, slot_ty), slot_ptr)
 
     def _lvalue_slot(self, target: A.Expr) -> tuple[ir.Value, ir.Type]:
@@ -1743,16 +1850,36 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         raise CodegenError(f"unsupported binary op: {op}")
 
     def _gen_call(self, e: A.Call) -> ir.Value | None:
-        # Method call on a tablets value: t.push(x), etc.
-        if isinstance(e.callee, A.Field) and isinstance(e.callee.target, A.Ident):
-            try:
-                var = self._lookup(e.callee.target.name)
-            except CodegenError:
-                var = None
-            if var is not None:
-                info = self._tablets_info_for(var.value_ty)
-                if info is not None:
-                    return self._gen_tablets_method(info, var, e.callee.name, e.args)
+        # Method call on a tablets receiver — plain Ident or a field
+        # chain rooted at one. For the field-chain case (buf.bytes.push)
+        # we GEP through the struct to the tablets slot and dispatch on
+        # a synthetic mut Variable referencing that inner slot.
+        if isinstance(e.callee, A.Field):
+            if isinstance(e.callee.target, A.Ident):
+                try:
+                    var = self._lookup(e.callee.target.name)
+                except CodegenError:
+                    var = None
+                if var is not None:
+                    info = self._tablets_info_for(var.value_ty)
+                    if info is not None:
+                        return self._gen_tablets_method(
+                            info, var, e.callee.name, e.args,
+                        )
+            elif isinstance(e.callee.target, A.Field):
+                try:
+                    slot_ptr, slot_ty = self._lvalue_slot(e.callee.target)
+                except CodegenError:
+                    slot_ptr = None
+                if slot_ptr is not None:
+                    info = self._tablets_info_for(slot_ty)
+                    if info is not None:
+                        inner = Variable(
+                            is_mut=True, ir_ref=slot_ptr, value_ty=slot_ty,
+                        )
+                        return self._gen_tablets_method(
+                            info, inner, e.callee.name, e.args,
+                        )
 
         if not isinstance(e.callee, A.Ident):
             raise CodegenError("only direct function calls are supported")

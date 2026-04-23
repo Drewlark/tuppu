@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **463 tests passing.**
+- **469 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -64,6 +64,21 @@ What works:
   inserts the release call; explicit `release` still works for
   early release and is de-duplicated against the auto path. Covers
   fall-through and `yield` (early-return) paths.
+- **Struct field auto-release** — a user struct (mut or step) that
+  transitively holds cleanup-bearing fields (str, tablets, nested
+  structs) gets a generated `__tuppu_struct_<name>_release` that
+  GEPs to each owning field and dispatches the appropriate
+  release. Recursive: Outer release calls Inner release calls
+  str/tablets release. Plain structs (no cleanup fields) emit no
+  release fn. Reassignment of a cleanup-bearing struct slot
+  releases the old value before the store. Tail-return ownership
+  transfer extends to structs — returning a local mut/step struct
+  binding hands ownership out to the caller's binding.
+- **Nested tablets-method dispatch** — `buf.bytes.push(b)` works
+  when `buf` is a mut struct and `bytes` is a `tablets[N]T` field;
+  codegen GEPs to the inner slot and dispatches on a synthetic mut
+  reference. Root must still be a mut Ident so the lvalue
+  machinery has a slot to mutate.
 - **Escape check** rejects returning a `wedge T` whose underlying
   tablets is declared locally — the common UAF pattern. Parameters
   and `lost` are safe to return.
@@ -464,7 +479,7 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 463 passing.
+2. `.venv/bin/pytest` — expect 469 passing.
 3. `git log --oneline -12` — recent timeline: sex Phase 3a/3b,
    struct field mutation, codegen.py split into mixins package,
    elif + did-you-mean, recursive tablets + wedge handles + auto-
