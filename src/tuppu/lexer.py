@@ -524,6 +524,18 @@ class Lexer:
             self._emit(kind, None, line, col)
             return
 
+        # `;` shows up here only when it doesn't sit between two digit
+        # groups (which is the sexagesimal radix form `1;30` handled in
+        # `_scan_number`). A bare `;` almost always means the user
+        # typed it as a statement separator — tell them what Tuppu
+        # uses instead so they don't hunt for the real issue.
+        if c == ";":
+            raise LexError(
+                "unexpected ';' — Tuppu uses newlines as statement "
+                "separators; ';' is reserved for sexagesimal literals "
+                "like `1;30`",
+                line, col,
+            )
         raise LexError(f"unexpected character {c!r}", line, col)
 
 

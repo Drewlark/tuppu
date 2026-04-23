@@ -205,14 +205,20 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
     def gen(self, prog: A.Program) -> ir.Module:
         self.comptime = Comptime(prog)
 
-        # Phase 0: build struct LLVM types. Ordered so a struct referenced by
-        # a later struct (or by function signatures) is always ready.
-        self._register_structs(
-            [d for d in prog.decls if isinstance(d, A.StructDecl)]
-        )
-        self._register_seals(
-            [d for d in prog.decls if isinstance(d, A.SealDecl)]
-        )
+        # Phase 0: build struct + seal LLVM types. Interleave declaration
+        # and body-resolution so a struct field of seal type (or vice
+        # versa) can see the identified type of the other form before
+        # we compute layouts.
+        struct_decls = [
+            d for d in prog.decls if isinstance(d, A.StructDecl)
+        ]
+        seal_decls = [
+            d for d in prog.decls if isinstance(d, A.SealDecl)
+        ]
+        self._register_structs_declare(struct_decls)
+        self._register_seals_declare(seal_decls)
+        self._register_structs_resolve(struct_decls)
+        self._register_seals_resolve(seal_decls)
 
         # Generic fns are monomorphized lazily at call sites, so we
         # don't declare/emit them here — just stash the AST.
@@ -791,29 +797,30 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         )
 
     def _register_structs(self, decls: list[A.StructDecl]) -> None:
-        """Build LLVM types for user-defined tablets.
+        """Facade: declare then resolve. Callers that don't need to
+        interleave with seals can use this single-shot entry point."""
+        self._register_structs_declare(decls)
+        self._register_structs_resolve(decls)
 
-        Two phases enable recursive and mutually-recursive types: first
-        we declare every tablet name as an empty identified LLVM type;
-        then we resolve field types now that every name is visible, so
-        `wedge Node` inside `Node`'s body resolves cleanly.
-
-        Generic tablets (those with type parameters) are NOT emitted
-        here — we can't compute a layout without concrete type args.
-        Their AST declarations are stashed for on-demand specialization
-        via `_get_monomorph_struct(name, concrete_arg_tys)`."""
+    def _register_structs_declare(self, decls: list[A.StructDecl]) -> None:
+        """Phase A of struct registration: declare every tablet as an
+        empty identified LLVM type. Splitting declare from resolve lets
+        us interleave with seal registration so struct fields of seal
+        type (and vice versa) can see the identified type."""
         self._generic_struct_decls: dict[str, A.StructDecl] = {
             d.name: d for d in decls if d.type_params
         }
-        decls = [d for d in decls if not d.type_params]
-        by_name = {d.name: d for d in decls}
-
-        # Phase A: declare empty identified types for every struct.
-        for d in decls:
+        concrete = [d for d in decls if not d.type_params]
+        for d in concrete:
             if d.name in self._struct_types:
                 raise CodegenError(f"duplicate struct {d.name!r}")
             ident_ty = self.module.context.get_identified_type(d.name)
             self._struct_types[d.name] = ident_ty
+
+    def _register_structs_resolve(self, decls: list[A.StructDecl]) -> None:
+        """Phase B/C: cycle-check and resolve each struct's body."""
+        concrete = [d for d in decls if not d.type_params]
+        by_name = {d.name: d for d in concrete}
 
         # Phase B: detect direct cycles (cycle in the "inline contains"
         # graph). A field whose type is another struct by value — or an
@@ -821,7 +828,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         # that's a pointer or tablets does NOT (the recursion goes
         # through heap indirection, so size is finite).
         direct_deps: dict[str, set[str]] = {}
-        for d in decls:
+        for d in concrete:
             deps: set[str] = set()
             for _fname, ftype in d.fields:
                 if isinstance(ftype, A.TypeName) and ftype.name in by_name:
@@ -853,7 +860,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
 
         # Phase C: resolve all bodies. Identified types support
         # `set_body(*field_tys)` exactly once.
-        for d in decls:
+        for d in concrete:
             field_tys = [self._lower_type(ftype) for _, ftype in d.fields]
             self._struct_types[d.name].set_body(*field_tys)
             self._struct_fields[d.name] = list(
@@ -1002,28 +1009,32 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
     # --- seals (sum types) ---------------------------------------------
 
     def _register_seals(self, decls: list["A.SealDecl"]) -> None:
-        """Phase 0c for sum types. Declares an identified LLVM type per
-        seal and computes its layout `{ i8 tag, [N x i64] payload }` so
-        variants can be constructed / matched by bitcasting the payload
-        slot to the appropriate variant struct.
+        """Facade: declare then resolve. Used when seals don't need to
+        interleave with struct registration."""
+        self._register_seals_declare(decls)
+        self._register_seals_resolve(decls)
 
-        Generic seals (those with type parameters) are stashed for on-
-        demand monomorphization — layout depends on concrete arg types
-        (payload width differs between `Option<i64>` and `Option<str>`),
-        so we can't emit one up front."""
+    def _register_seals_declare(self, decls: list["A.SealDecl"]) -> None:
+        """Phase A of seal registration: declare an empty identified
+        LLVM type per concrete seal. Generic seals are stashed for on-
+        demand monomorphization — their layout depends on concrete
+        type args so we can't emit one up front."""
         self._generic_seal_decls = {
             d.name: d for d in decls if d.type_params
         }
-        concrete = [d for d in decls if not d.type_params]
-        # Phase A: declare empty identified types so mutually-recursive
-        # seal-to-seal references resolve during body lowering.
-        for d in concrete:
+        for d in decls:
+            if d.type_params:
+                continue
             if d.name in self._seal_types:
                 raise CodegenError(f"duplicate seal {d.name!r}")
             ident_ty = self.module.context.get_identified_type(d.name)
             self._seal_types[d.name] = ident_ty
-        # Phase B: compute each seal's payload layout.
-        for d in concrete:
+
+    def _register_seals_resolve(self, decls: list["A.SealDecl"]) -> None:
+        """Phase B: compute each concrete seal's payload layout."""
+        for d in decls:
+            if d.type_params:
+                continue
             self._finalize_seal(d.name, d, arg_tys=())
 
     def _finalize_seal(
@@ -2349,6 +2360,19 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             self.builder.unreachable()
             return None
 
+        # Statement-position if (typechecker marked it as discarded):
+        # arms may have different shapes/types — the value is unused,
+        # so fall through to merge and return None. Check this BEFORE
+        # the arm-shape / type-match checks because a then-arm ending
+        # in a void call vs an else-arm ending in an Assign is a
+        # shape mismatch the user shouldn't have to reconcile.
+        in_stmt_position = (
+            self._checker is not None
+            and id(e) in self._checker.stmt_if_nodes
+        )
+        if in_stmt_position:
+            return None
+
         # One side diverged — the value, if any, comes from the other.
         if then_diverged:
             return else_val
@@ -2356,25 +2380,17 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             return then_val
 
         # Both sides reach merge.
-        # Statement-position if (typechecker marked it as discarded):
-        # arms may have different types. Skip phi construction — the
-        # value is unused, so we just return None once both branches
-        # have merged.
-        in_stmt_position = (
-            self._checker is not None
-            and id(e) in self._checker.stmt_if_nodes
-        )
-        if in_stmt_position:
-            return None
         if then_val is None and else_val is None:
             return None
         if then_val is None or else_val is None:
             raise CodegenError(
-                "if arms disagree: one has a trailing expression, the other does not"
+                "if arms disagree: one has a trailing expression, the other does not",
+                e.line, e.col,
             )
         if then_val.type != else_val.type:
             raise CodegenError(
-                f"if arms have different types: {then_val.type} vs {else_val.type}"
+                f"if arms have different types: {then_val.type} vs {else_val.type}",
+                e.line, e.col,
             )
         phi = self.builder.phi(then_val.type)
         phi.add_incoming(then_val, then_end)

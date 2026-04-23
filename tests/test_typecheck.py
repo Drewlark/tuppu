@@ -63,19 +63,12 @@ def test_if_stmt_elif_chain_also_relaxed():
     compile_to_ir(src)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "KNOWN_BUGS.md Bug 1: if arm with a void-Call tail vs arm "
-        "with an Assign stmt (no tail) codegens to 'if arms "
-        "disagree', even though the if sits as a bare ExprStmt in "
-        "a while body (value is discarded). _gen_if_expr's "
-        "statement-position check comes after the arms-disagree "
-        "check."
-    ),
-    strict=True,
-)
 def test_if_stmt_arm_shape_mismatch(tmp_path):
-    from pathlib import Path
+    # then-arm ends in a void Call; else-arm ends in an Assign with no
+    # tail. The if sits as a bare ExprStmt in a while body, so its value
+    # is discarded — arms need not unify in shape. Used to fail with
+    # "if arms disagree: one has a trailing expression..." before
+    # _gen_if_expr learned to short-circuit in stmt position.
     import subprocess
     from tuppu.driver import compile_to_binary
     src = (

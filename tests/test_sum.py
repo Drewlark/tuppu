@@ -285,17 +285,6 @@ def test_match_scrutinee_must_be_seal(tmp_path):
         compile_to_ir(src)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "KNOWN_BUGS.md Bug 2: recursive seal via tablet wrapper — "
-        "seal E references tablet N which holds an E field. Fails "
-        "with \"type E not supported in this stage\" because codegen "
-        "lowers seal fields before the identified type is declared. "
-        "Needs the two-phase pattern that tablets-recursion already "
-        "uses."
-    ),
-    strict=True,
-)
 def test_recursive_seal_via_tablet_wrapper(tmp_path):
     src = (
         "tablet N { e: E }\n"

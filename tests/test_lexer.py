@@ -145,6 +145,17 @@ def test_two_semicolons_in_sex_is_error():
         lex("1;30;45")
 
 
+def test_bare_semicolon_gives_statement_separator_hint():
+    # Muscle memory from C/JS/Rust puts `;` between statements. The
+    # plain "unexpected character" error is useless for onboarding —
+    # tell users where `;` actually belongs.
+    with pytest.raises(
+        LexError,
+        match="newlines as statement separators",
+    ):
+        lex("foo(); bar()")
+
+
 def test_sex_place_over_59_is_error():
     with pytest.raises(LexError, match="must be < 60"):
         lex("1 60")

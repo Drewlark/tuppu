@@ -1010,8 +1010,7 @@ class Checker:
             # `if` used as a bare statement — the value is provably
             # discarded, so arms don't need to unify. Mark the node
             # before typechecking so `_tc_if` sees the flag.
-            if isinstance(s.expr, A.IfExpr):
-                self._mark_stmt_if(s.expr)
+            self._mark_discarded_expr(s.expr)
             self._tc_expr(s.expr)
             return
         raise CheckError(
@@ -1076,6 +1075,7 @@ class Checker:
         self._push()
         try:
             self._bind(f.name, element_ty, f.line, f.col)
+            self._mark_discarded_expr(f.body.tail)
             self._tc_block(f.body, allow_nonbool_tail=True)
         finally:
             self._pop()
@@ -1103,6 +1103,9 @@ class Checker:
                 f"while condition must be a bool, got {cond_ty}",
                 w.line, w.col,
             )
+        # Loop body's tail value is always discarded — if its tail is
+        # an IfExpr, arms don't need to unify.
+        self._mark_discarded_expr(w.body.tail)
         self._tc_block(w.body, allow_nonbool_tail=True)
 
     def _tc_yield(self, y: A.YieldStmt) -> None:
@@ -2152,12 +2155,32 @@ class Checker:
             self._pop()
 
     def _mark_stmt_if(self, e: A.IfExpr) -> None:
-        """Mark an IfExpr (and any elif chain) as statement-position so
-        the arm-unification rule relaxes everywhere the discarded-
-        value context extends."""
-        self.stmt_if_nodes.add(id(e))
-        if isinstance(e.else_, A.IfExpr):
-            self._mark_stmt_if(e.else_)
+        """Back-compat shim: mark an IfExpr as stmt-position. Prefer
+        `_mark_discarded_expr` for new call sites — it also dives into
+        block tails and arm tails."""
+        self._mark_discarded_expr(e)
+
+    def _mark_discarded_expr(self, e: A.Expr | None) -> None:
+        """Walk every tail position whose value is provably discarded and
+        mark each IfExpr found along the way. Handles `else if` chains
+        (both elif-form and nested `if` in an arm's tail) and blocks
+        standing in for either arm."""
+        if e is None:
+            return
+        if isinstance(e, A.IfExpr):
+            self.stmt_if_nodes.add(id(e))
+            # Arm tails inherit stmt-position: the arm's value is what
+            # the if yields, and the if's value is discarded.
+            if isinstance(e.then, A.Block):
+                self._mark_discarded_expr(e.then.tail)
+            if e.else_ is None:
+                return
+            if isinstance(e.else_, A.IfExpr):
+                self._mark_discarded_expr(e.else_)
+            elif isinstance(e.else_, A.Block):
+                self._mark_discarded_expr(e.else_.tail)
+        elif isinstance(e, A.Block):
+            self._mark_discarded_expr(e.tail)
 
     def _tc_if(self, e: A.IfExpr, expected: Ty | None = None) -> Ty:
         cond_ty = self._tc_expr(e.cond)
