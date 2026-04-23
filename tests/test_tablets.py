@@ -8,11 +8,23 @@ import pytest
 
 from tuppu.codegen import CodegenError
 from tuppu.errors import CompileError
-from tuppu.driver import compile_to_binary, compile_to_ir
+from tuppu.driver import (
+    compile_files_to_binary, compile_to_binary, compile_to_ir, stdlib_files,
+)
 
 
 def run(src: str, tmp_path: Path) -> tuple[int, bytes]:
     binary = compile_to_binary(src, tmp_path, name="prog")
+    result = subprocess.run([str(binary)], capture_output=True)
+    return result.returncode, result.stdout
+
+
+def run_with_stdlib(src: str, tmp_path: Path) -> tuple[int, bytes]:
+    user_file = tmp_path / "main.tpu"
+    user_file.write_text(src)
+    binary = compile_files_to_binary(
+        stdlib_files() + [user_file], tmp_path, name="prog",
+    )
     result = subprocess.run([str(binary)], capture_output=True)
     return result.returncode, result.stdout
 
@@ -324,6 +336,80 @@ def test_tablets_index_returns_borrow(tmp_path):
     )
     _, out = run(src, tmp_path)
     assert out == b"ab\ncd\n"
+
+
+@pytest.mark.xfail(
+    reason=(
+        "Copying an Index-borrowed struct value and re-pushing into a "
+        "tablets creates two entries sharing the same cap>0 str bytes; "
+        "the release walk frees them both, double-freeing. The fix "
+        "belongs with the broader 'struct-copy ownership' story — "
+        "either neuter field caps on Index reads, or clone fields on "
+        "push of an Index-sourced struct. Filed under NEXT.md §7."
+    ),
+    strict=True,
+)
+def test_reindex_and_repush_struct_double_free(tmp_path):
+    src = (
+        "tablet Entry { key: str, val: str }\n"
+        "fn find(mut store: tablets[4]Entry, key: str) -> wedge Entry {\n"
+        "  mut i: i64 = 0\n"
+        "  while i < store.len {\n"
+        "    step cur = store[i]\n"
+        "    if str_eq(cur.key, key) { yield store.push(cur) }\n"
+        "    i = i + 1\n"
+        "  }\n"
+        "  lost\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  mut store: tablets[4]Entry\n"
+        "  step _a = store.push(Entry { key: \"k\", val: \"v\" + \"1\" })\n"
+        "  step h = find(store, \"k\")\n"
+        "  if h != lost { println(h.val) }\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run_with_stdlib(src, tmp_path)
+    assert rc == 0
+    assert out == b"v1\n"
+
+
+def test_yield_field_of_wedge_no_double_free(tmp_path):
+    # The hashmap `get(key) -> str` pattern. A fn walks a tablets to
+    # find a matching Entry and yields `cur.val` (a Field read of a
+    # wedge-dereferenced struct). The returned str's bytes live in
+    # the tablets, not in the callee — so the callee must hand the
+    # caller a borrow (cap=0) so the caller's scope-exit cleanup
+    # doesn't race with the tablets's own release walk.
+    src = (
+        "tablet Entry { key: str, val: str }\n"
+        "fn get(mut store: tablets[4]Entry, key: str) -> str {\n"
+        "  mut i: i64 = 0\n"
+        "  while i < store.len {\n"
+        "    step cur = store[i]\n"
+        "    if str_eq(cur.key, key) { yield cur.val }\n"
+        "    i = i + 1\n"
+        "  }\n"
+        "  \"none\"\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  mut store: tablets[4]Entry\n"
+        "  step _a = store.push(Entry {\n"
+        "    key: \"a\" + \"1\", val: \"x\" + \"1\",\n"
+        "  })\n"
+        "  step _b = store.push(Entry {\n"
+        "    key: \"b\" + \"2\", val: \"y\" + \"2\",\n"
+        "  })\n"
+        "  step found = get(store, \"b2\")\n"
+        "  println(found)\n"
+        "  step missing = get(store, \"nope\")\n"
+        "  println(missing)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run_with_stdlib(src, tmp_path)
+    assert rc == 0
+    assert out == b"y2\nnone\n"
 
 
 def test_tablets_len_from_fn_return(tmp_path):

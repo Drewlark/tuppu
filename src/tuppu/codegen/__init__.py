@@ -697,10 +697,28 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                     )
                 expected = self._lower_type(fn.return_type)
                 coerced = self._coerce(value, expected)
+                # Tail-return borrow neutering: if the body's tail is
+                # a Field or Index (reading from a struct / container
+                # the callee doesn't own), hand the caller a cap=0
+                # borrow so its scope-exit cleanup won't double-free.
+                tail_expr = self._block_tail_expr(fn.body)
+                if tail_expr is not None:
+                    coerced = self._neuter_return_if_borrow(coerced, tail_expr)
                 self._emit_frame_cleanups(self._cleanup_frames[-1])
                 self.builder.ret(coerced)
         finally:
             self._cleanup_frames.pop()
+
+    def _block_tail_expr(self, e: "A.Expr") -> "A.Expr | None":
+        """Find the source expression for a fn/block's tail value, if
+        any. Drills through nested blocks so `{ ... { x.y } }` returns
+        the same expr as `x.y`. Returns None if the tail is missing
+        or the expression has no value."""
+        if isinstance(e, A.Block):
+            if e.tail is None:
+                return None
+            return self._block_tail_expr(e.tail)
+        return e
 
     def _is_terminated(self) -> bool:
         assert self.builder is not None
@@ -1699,6 +1717,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         if val is None:
             raise CodegenError("yield value diverged")
         coerced = self._coerce(val, ret_ty)
+        coerced = self._neuter_return_if_borrow(coerced, y.value)
         # Unwind every live cleanup frame (inner-to-outer) before the
         # ret. The return value has already been captured into `coerced`
         # so it doesn't matter if the cleanup invalidates heap memory
@@ -1706,6 +1725,35 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         # soon-released tablets.
         self._emit_all_cleanups_for_early_return()
         self.builder.ret(coerced)
+
+    def _neuter_return_if_borrow(
+        self, val: ir.Value, expr: "A.Expr",
+    ) -> ir.Value:
+        """When a fn returns a cleanup-bearing value that the callee
+        doesn't own — a Field read off a struct, an Index into a
+        container, etc. — we hand the caller a BORROW (cap=0 for str,
+        zero cleanup markers for struct). Without this, the caller's
+        scope-exit release would free bytes the source container
+        still references, double-freeing when the container itself
+        is released.
+
+        The borrow-back means the caller should not outlive the
+        container. In practice the container is usually in the
+        caller's own scope (or an outer one), so lifetime nests
+        correctly. Patterns that genuinely need ownership should
+        explicitly clone — e.g. `yield str_clone(cur.val)` — since
+        the compiler can't tell without escape analysis whether the
+        caller will outlive the source."""
+        if not isinstance(expr, (A.Field, A.Index)):
+            return val
+        if self._is_str_value(val.type):
+            return self._str_as_borrow(val)
+        if (
+            self._struct_fields_for(val.type) is not None
+            and self._struct_needs_cleanup(val.type)
+        ):
+            return self._struct_as_borrow(val, val.type)
+        return val
 
     def _emit_all_cleanups_for_early_return(self) -> None:
         """Emit release calls for every live cleanup frame in the

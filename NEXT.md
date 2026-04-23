@@ -1010,6 +1010,27 @@ pressure before committing to one.
   full str ownership story. Overdue but purely editorial — cut
   a half-day when the feature surface stabilizes.
 
+### Known bugs filed here, tests pending
+
+- **Copying an Index-borrowed struct, then re-pushing.** `step cur =
+  store[i]` is an Index-init borrow (correct). If the user then
+  `store.push(cur)` (or pushes into a different tablets), the second
+  container gets a copy of the struct with cap>0 str fields *shared*
+  with the original. Release walks on both containers will hit the
+  same ptr → double-free. See
+  `tests/test_tablets.py::test_reindex_and_repush_struct_double_free`
+  (xfail). The fix belongs with the broader "struct-copy ownership"
+  story: either neuter field caps on Index reads (consistent with
+  the "Index is a borrow" rule), or clone fields on push when the
+  source is Index-derived. Probably the former — matches how str
+  args get neutered at fn-call sites.
+
+- **`_gen_assign` transfer for Ident RHS.** Push and struct-lit both
+  transfer ownership from an Ident RHS; `_gen_assign` (covering
+  `mut x = owned_k`, `p.field = owned_k`, `t[i] = owned_k`) doesn't.
+  Not a blocker for the community's real code (they use push /
+  struct-lit exclusively), but a latent footgun worth closing.
+
 ### Known friction spots worth a look
 
 - **Struct returns across colophon.** Currently rejected — we
