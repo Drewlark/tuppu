@@ -494,6 +494,285 @@ For multiplication we'd get another SIMD surface on the partial
 products, but carry propagation dominates — so SIMD wins are
 smaller. Not the first priority.
 
+## 4. Fixed-size byte buffers — `buffer[N]u8`
+
+**Goal.** Raise the ceiling on byte-level FFI without breaking
+memory safety. User programs that talk to the kernel (the HTTP
+server + Mandelbrot examples) currently invent ugly workarounds
+like `tablet ByteSlot { b: u8 }` to get a single mutable byte
+they can pass to `recv`. A fixed-size, stack-allocated,
+bounds-checked byte buffer fixes this without reintroducing raw
+pointer ops.
+
+### Grammar / syntax
+
+```
+mut buf: buffer[1024]u8              // declaration + zero-init
+buf[i] = 0 as u8                      // write
+step b = buf[i]                       // read (bounds-checked)
+step n = buf.len                      // i64 constant = N
+
+colophon fn recv(fd: i32, mut buf: buffer[1024]u8, n: u64, flags: i32) -> i64
+colophon fn send(fd: i32, buf: buffer[1024]u8, n: u64, flags: i32) -> i64
+```
+
+The `mut buffer[N]T` param shape is the byte-buffer analogue of
+`mut tablets[N]T` — passes by pointer, callee reads/writes
+through it. Non-mut `buffer[N]T` also passes by pointer at the C
+ABI (array-to-pointer decay); our struct-by-value convention
+doesn't apply.
+
+### Why "buffer", not reintroduce `[N]u8`
+
+The old `[N]u8` syntax was retired when `str` landed. Different
+name avoids stale muscle memory. Also semantically distinct:
+`str` is value-semantics with hidden heap, `buffer` is
+stack-allocated and FFI-facing.
+
+### Memory safety preservation
+
+- Stack-allocated, lifetime = scope: no free semantics to leak.
+- Zero-init on declaration (same as `mut x: SomeStruct`).
+- Bounds-checked on `buf[i]` read and write (same
+  `_emit_dynamic_bounds_trap` we already use for tablets/str).
+- Returning `buffer[N]T` from a fn: **rejected at typecheck**
+  (the slot would dangle). Same rule should apply to storing in
+  a struct field initially — defer structs-of-buffer to a
+  follow-up if anyone asks.
+- FFI boundary risk (caller lying about `n`): identical to
+  today's `str` FFI where `write(fd, s, 999)` with a 10-byte str
+  already instructs the kernel to read past. Not a new hole.
+
+### Typecheck
+
+- New AST node `TypeBuffer(size: int, element: TypeExpr)`.
+- New `Ty` node `TyBuffer(size: int, element: Ty)`.
+- `TypeBuffer` resolves to `TyBuffer` in `_resolve_type`.
+- Index `buf[i]`: element type, integer-index required (mirrors
+  `str` / tablets indexing).
+- `buf.len`: `I64`, value known at compile time.
+- Return type `buffer[N]T`: error.
+- `buffer[N]T` as struct field: error for now.
+- Colophon FFI allow-list: accept `buffer[N]T` in parameters
+  (both mut and non-mut).
+
+### Codegen
+
+- `_lower_type(TypeBuffer)` → `ir.ArrayType(elem, N)`.
+- Binding: `alloca [N x elem]`, zero-init via
+  `store [N x elem] zeroinitializer, [N x elem]* %slot`.
+- Index read: `gep inbounds [N x i8], ptr %slot, i32 0, i64 %idx`
+  + `load`, preceded by bounds trap against `N`.
+- Index write: same GEP + `store` + bounds trap.
+- `.len`: compile-time `i64 N`, no load.
+- FFI call with buffer arg (mut or non-mut):
+  `gep inbounds [N x T], ptr %slot, i32 0, i32 0` → `T*`, pass
+  as `i8*`-decayed pointer (matches C calling convention).
+- Colophon signature LLVM type for `buffer[N]T` → `T*` (pointer
+  to element type).
+
+### Conversions
+
+- `buffer_to_str(buf: buffer[N]u8, n: i64) -> str` — new
+  intrinsic. Allocates heap `n+1`, memcpies `n` bytes, NUL-
+  terminates, returns heap-owned str. Parallel to
+  `bytes_to_str(tablets[N]u8)` but takes an explicit length
+  because buffers don't track "used bytes".
+- `str_to_buffer(s: str, mut buf: buffer[N]u8) -> i64` — stdlib
+  helper. memcpies `min(s.len, N)` bytes, returns bytes-copied.
+  Can be Tuppu-level on top of indexing.
+
+### Files to touch
+
+- `src/tuppu/ast.py` — `TypeBuffer` dataclass.
+- `src/tuppu/parser.py` — recognise `buffer[N]T` in `parse_type`.
+- `src/tuppu/lexer.py` — no new keyword (reuse IDENT or add
+  `BUFFER` token).
+- `src/tuppu/typecheck.py` — `TyBuffer`, `_resolve_type` branch,
+  index / field handling, FFI allow-list, return-type rejection.
+- `src/tuppu/codegen/__init__.py` — `_lower_type` branch, binding
+  path with zero-init, index read/write with bounds trap, FFI
+  arg passing, `buffer_to_str` intrinsic + dispatch.
+- `stdlib/str.tpu` — optional `str_to_buffer` helper.
+- `tests/test_buffer.py` — new. Basic use, bounds trap, FFI
+  roundtrip with a mock libc `memset`-style fn, return-type
+  rejection.
+- `examples/tcp_echo.tpu` or update `tcp_bind.tpu` to use
+  `buffer[1024]u8` for recv.
+
+### Payoff: rewriting `read_request` from the user's HTTP server
+
+```tuppu
+fn read_request(cfd: i32) {
+  mut buf: buffer[1024]u8
+  mut run: i64 = 0
+  mut done: bool = false
+  while !done {
+    step n: i64 = recv(cfd, buf, 1024 as u64, 0 as i32)
+    if n <= 0 { done = true }
+    else {
+      mut i: i64 = 0
+      while i < n {
+        step b: u8 = buf[i]
+        // state machine on \r\n\r\n ...
+        i = i + 1
+      }
+    }
+    if run == 4 { done = true }
+  }
+}
+```
+
+No more single-byte `ByteSlot` sink, no per-byte syscall.
+
+
+## 5. Tablets-literal syntax + variadic slice params
+
+**Goal.** Let users write `str_concat(a, b, c, d)` that reaches a
+Tuppu-level fn (not a compiler intrinsic) — the unlock that lets
+us migrate `str_concat`, future `print_fmt`, and any "take a
+bunch of the same thing" API into stdlib. Unlocks self-hosting
+of more of the stdlib and makes the language feel grown-up.
+
+### Two pieces, land together
+
+**Piece A: tablets-literal.** Syntax for constructing a
+pre-populated tablets value in one expression.
+
+```
+step nums: tablets[4]i64 = tablets[4]i64 { 1, 2, 3, 4 }
+step words = tablets[4]str { "alpha", "beta", "gamma", "delta" }
+```
+
+Without the explicit type annotation, the type can be inferred
+if the chunk size is known contextually — otherwise require the
+explicit `tablets[N]T { ... }` form. Keep inference minimal in
+v1.
+
+**Piece B: variadic param.** A single `tablets[...]T` param
+(must be last) collects the trailing args at the call site into
+a tablets literal.
+
+```
+fn str_concat(parts: tablets[...]str) -> str {
+  mut buf: tablets[64]u8
+  for p in parts {
+    str_buf_append(buf, p)
+  }
+  bytes_to_str(buf)
+}
+
+// Call site desugar:
+str_concat("a", "b", "c")
+// becomes
+str_concat(tablets[CANONICAL_N]str { "a", "b", "c" })
+```
+
+`CANONICAL_N` is a compiler-chosen chunk size (probably 16 — big
+enough to hold typical variadic calls in one chunk, not so big
+we waste memory on small calls).
+
+Splat syntax (`str_concat(existing_tablets...)`) is deferred —
+orthogonal, easy to add later.
+
+### Why this shape (not C varargs, not ownership tricks)
+
+Slice-passing is type-safe at every call site, composes with
+our existing iteration (`for p in parts`), needs no new runtime
+primitives beyond tablets literal construction. The tablets
+runtime struct `{ head, tail, len }` already doubles as a slice
+header — we just need a way to build one without `.push` in a
+loop.
+
+### Typecheck
+
+- New AST `TypeVariadicTablets(element: TypeExpr)` parsed from
+  `tablets[...]T`.
+- New AST `TabletsLit(size: int, element: TypeExpr | None,
+  fields: list[Expr])`.
+- `TyFn` gains `is_variadic: bool`; the last param's type
+  carries an "any N" flag.
+- Call typecheck: if callee is variadic, split args into
+  (fixed, variadic tail). Fixed args typecheck against named
+  params. Variadic tail typechecks against the element type and
+  gets wrapped into a synthetic `TabletsLit` node before
+  codegen.
+- In fn bodies, a variadic-typed param is treated as a regular
+  `tablets[CANONICAL_N]T` for all indexing / iteration / method
+  dispatch purposes.
+
+### Codegen
+
+- Tablets-literal: alloca a tablets header, push each element
+  one by one via the existing `__tuppu_tbls_<suffix>_push`.
+  Register for cleanup per the normal rules (mut binding
+  registers; rvalue in a call-arg position registers an
+  anonymous cleanup). Optimization for later: fast path for
+  known-small literals that fits in one chunk (single
+  `malloc(sizeof(node))`, write slots directly, bump `used` and
+  `len`).
+- Variadic call: emit the synthetic TabletsLit at the call site.
+  Pass by the mut-tablets-param convention (by pointer) so the
+  callee sees the same storage.
+- Cleanup on the synthetic literal: anonymous cleanup in the
+  caller's frame, same shape as other Call-rvalue args. Chunks
+  get released at caller scope exit.
+
+### Migration: self-hosted `str_concat`
+
+Once both pieces land, delete the compiler intrinsic and move
+the fn into `stdlib/str.tpu`:
+
+```
+// stdlib/str.tpu
+fn str_concat(parts: tablets[...]str) -> str {
+  mut buf: tablets[64]u8
+  for p in parts {
+    str_buf_append(buf, p)
+  }
+  bytes_to_str(buf)
+}
+```
+
+Same API, no compiler knowledge needed. The binary-plus operator
+`a + b` on strs either stays a compiler shortcut (2-arg fast
+path) or lowers to a 2-element `TabletsLit` followed by a call
+— performance-wise the fast path is worth keeping.
+
+### Files to touch
+
+- `src/tuppu/ast.py` — `TypeVariadicTablets`, `TabletsLit`.
+- `src/tuppu/parser.py` — parse `tablets[...]T` in types; parse
+  `tablets[N]T { a, b, c }` literal (add to `parse_prefix`
+  discrimination alongside struct lit).
+- `src/tuppu/typecheck.py` — `TyFn.is_variadic`,
+  `_tc_call`'s variadic branch, `TabletsLit` typecheck.
+- `src/tuppu/codegen/__init__.py` — `_gen_tablets_lit`, call-
+  site variadic argument collection.
+- `stdlib/str.tpu` — rewrite `str_concat` in Tuppu; delete
+  compiler intrinsic in follow-up commit once parity is proven.
+- `tests/test_variadic.py` — new. Arity 0, 1, 2+, mixed types
+  error, passing an existing tablets via splat (deferred /
+  error for now), self-hosted `str_concat` parity with old
+  intrinsic.
+
+### Edge cases to watch
+
+- Zero-arity variadic: `str_concat()` with no args. Call-site
+  builds an empty tablets literal. Callee handles empty
+  iteration. Output: empty str.
+- Variadic + expected-type threading for literals: a
+  `None`-shaped nullary variant in a variadic arg list needs
+  the per-arg expected type to pin `T`. Same bidirectional
+  machinery we use for seal inference already applies.
+- Recursion through variadic: no special handling — generic fn
+  rules apply if the variadic is polymorphic (`fn first<T>(xs:
+  tablets[...]T) -> T`).
+- Nested variadic calls (`f(g(a, b), c)`): ownership of the
+  inner tablets literal is handled by the Call-rvalue cleanup
+  registration — same as other heap-producing rvalues.
+
+
 ## Common pitfalls users hit
 
 Notes for future-self (or future-user) reading scratch files:
@@ -535,23 +814,32 @@ If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
 2. `.venv/bin/pytest` — expect 513 passing.
-3. `git log --oneline -12` — recent timeline: sex Phase 3a/3b,
-   struct field mutation, codegen.py split into mixins package,
-   elif + did-you-mean, recursive tablets + wedge handles + auto-
-   release + escape check, tablet/wedge/seal rename, minimal
-   generics (+ stdlib/list.tpu rewritten to `List<T>`), sum types
-   via `seal` + flat pattern `match` + bidirectional expected-type
-   threading.
+3. `git log --oneline -15` — recent timeline: sum types + generic
+   monomorphization, str ownership sentinel on fn args, slicing,
+   str_buf pattern via tablets-backed byte buffer + `bytes_to_str`,
+   ownership-transfer-on-tail-return, struct-field auto-release,
+   step-borrow rule + mut-struct-param neutering, lvalue indexing
+   (`arr[n].f = v`), colophon typed FFI (primitive / str / user-
+   tablet args, `mut` structs by pointer for sockaddr_in), real-
+   libc TCP bind demo, fn-as-value (no capture), variadic
+   `str_concat` + `s + t` / `s += t` operator, newline-inside-
+   `{}` is a statement terminator.
 4. Read `SPEC.md` §4.5 (tablets), §4.6 (wedges), §14 (non-goals).
-   SPEC.md does NOT yet describe `seal` / `match`; the source of
-   truth is `tests/test_sum.py` and `examples/omens.tpu`. A spec
-   update for sum types is queued.
-5. **Agreed next task: fn-as-value (no capture).** Function values
-   passed as params / stored in bindings / returned — no environment
-   capture yet. Type `fn(i64) -> i64`. Unlocks visitor patterns over
-   sums and is the smallest step toward full closures. After that:
-   closures → overloads → operator overloads → dynamic strings →
-   maps → file I/O. Self-hosting remains the multi-quarter goal.
+   SPEC.md does NOT yet describe `seal` / `match`, `colophon`,
+   fn-as-value, the full str ownership story, or lvalue indexing;
+   source of truth is the test files + this document. A SPEC
+   catch-up pass is overdue.
+5. **Agreed next tasks (in order):**
+   - **§4. `buffer[N]u8` — fixed-size byte buffer for FFI.** Raises
+     the ceiling on real networking. Closes the `ByteSlot { b: u8 }`
+     workaround. Small commit, well-specified above.
+   - **§5. Tablets literal + variadic slice params.** Unlocks
+     self-hosted `str_concat` (migrate the intrinsic to stdlib).
+     Bigger, higher-leverage; makes the stdlib story feel modern.
+   Both specs are fully fleshed out above with grammar, typecheck
+   rules, codegen sketches, file-touch lists, and migration paths.
+   After those: full closures (with capture) → overloads →
+   operator overloads → maps → file I/O.
 6. `FUTURE_OPTIMIZATIONS.md` (gitignored) captures design sketches
    for a `--strict-dish` flag, the SEX 20→16 byte shrink, SIMD carry
    in sex_add, and other perf/language ideas. Don't forget on the
