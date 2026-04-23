@@ -28,6 +28,14 @@ fn str_eq(a: str, b: str) -> bool {
   true
 }
 
+// `s == t` and `s != t` on str values go through this gloss entry
+// so the natural comparison syntax works without users having to
+// reach for `str_eq` explicitly. Semantics are identical to
+// `str_eq` — len + bytewise compare.
+gloss eq(a: str, b: str) -> bool {
+  str_eq(a, b)
+}
+
 fn str_starts_with(s: str, prefix: str) -> bool {
   if s.len < prefix.len { yield false }
   mut i: i64 = 0

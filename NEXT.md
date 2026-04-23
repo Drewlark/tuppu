@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **567 tests passing.**
+- **573 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -935,6 +935,97 @@ code. Strict subset of full closures — doesn't preclude closures
 later.
 
 
+## 7. Todo backlog (ideas floated, not specced)
+
+Rough list of things we've discussed but haven't designed in
+detail. Ordered by gut priority — sanity-check against user
+pressure before committing to one.
+
+### High-leverage, small-medium effort
+
+- **Print dispatch via `gloss show`.** Extend the gloss table
+  with `show(x: T) -> str`; `println(x)` on a user type looks it
+  up and calls it. Makes user tablets first-class in `println`
+  without forcing users to write `println(v.x, ", ", v.y)` by
+  hand. Probably 30–50 lines — dispatch mirrors the existing
+  gloss machinery, `_emit_one_print` adds a branch that checks
+  the sideband and calls the show fn before printing the
+  resulting str. Compounds with the gloss work we just did.
+
+- **File I/O wrappers in stdlib.** A new `stdlib/fs.tpu` that
+  wraps `open` / `read` / `write` / `close` / `stat` via
+  colophons + `buffer[N]u8`. Zero compiler work — pure
+  proof-of-capability. `read_file(path) -> str`,
+  `write_file(path, content)`, `read_line()` for stdin. Unblocks
+  a class of real programs (config readers, log processors,
+  one-shot scripts). Adjacent: `stdin` read wrapper for REPLs /
+  interactive tools.
+
+- **Maps / hash tables in Tuppu.** `stdlib/map.tpu` with a
+  robin-hood or open-addressed table, generic over `<K, V>`.
+  Unlocks symbol tables (so we can self-host the typechecker
+  one day), interning, lookup tables keyed by str. Medium-large
+  effort — needs a hashing story (probably start with u64 keys
+  only, add str hashing after) and a strategy for deletions.
+  All in pure Tuppu on top of tablets.
+
+### Nice-to-have, smaller effort
+
+- **Default `gloss eq` / `gloss ord` for more built-ins.** We
+  added `gloss eq` for `str`; same treatment could go to
+  `rat`, `dish` if they're not already handled by the primitive
+  path. Audit which types support `==` today.
+
+- **Type conversion dispatch.** User mentioned Python-style
+  `__repr__` / a general "how do I turn X into Y?" mechanism.
+  Could be `gloss to_str(x: T) -> str` (overlaps with `show`
+  above) or a broader `cast` dispatch that makes `v as Other`
+  callable for user types. Deferred — not a pressing need
+  while `show` + `to_str` cover the common case.
+
+### Bigger lifts, lower immediate demand
+
+- **Closures with environment capture.** The `gloss` + fn-as-
+  value + primitive-fn-pointer-across-colophon combo covers a
+  lot of what closures would. Real need hasn't surfaced yet.
+  Full closures need a captured-env layout story (stack vs heap,
+  lifetime/escape analysis, or a Rust-style `move` keyword).
+  Defer until a user says "I'm blocked on closures."
+
+- **Imports.** Sketched in §2 above. Stdlib auto-include still
+  works fine; pay this cost when stdlib outgrows the "one big
+  namespace" model. Probably when maps + fs + net wrappers all
+  land.
+
+- **`dish` 16-byte refactor.** Sketched in FUTURE_OPTIMIZATIONS.md.
+  Narrow perf win; don't do it until a profile demands it.
+
+- **Sex Phase 3c — escape-analysis rat-fallback.** Compile-time
+  pass that detects "this dish never leaks its digit form" and
+  lowers it to rat directly. Sketched in §3c above. Medium-large;
+  useful for hot sexagesimal arithmetic, not broadly critical.
+
+- **SPEC.md catch-up.** The spec hasn't covered `seal`,
+  `colophon`, fn-as-value, `buffer`, variadic, gloss, or the
+  full str ownership story. Overdue but purely editorial — cut
+  a half-day when the feature surface stabilizes.
+
+### Known friction spots worth a look
+
+- **Struct returns across colophon.** Currently rejected — we
+  punted on the platform-specific ABI story. Some libc fns
+  would benefit (e.g., `gettimeofday`-shaped). Probably narrow
+  and low-demand.
+
+- **`waitpid`-style int-output params.** Need pointer-to-primitive
+  across colophon. Would go well with the (deferred) primitive
+  pointer story.
+
+- **`SO_RCVTIMEO` / other socket options.** Needs
+  `setsockopt(fd, level, name, *void, len)` — opaque pointer
+  arg. Blocked on having some pointer-to-primitive story.
+
+
 ## Common pitfalls users hit
 
 Notes for future-self (or future-user) reading scratch files:
@@ -975,7 +1066,7 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 567 passing.
+2. `.venv/bin/pytest` — expect 573 passing.
 3. `git log --oneline -15` — recent timeline: sum types + generic
    monomorphization, str ownership sentinel on fn args, slicing,
    str_buf pattern via tablets-backed byte buffer + `bytes_to_str`,
