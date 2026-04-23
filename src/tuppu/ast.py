@@ -388,7 +388,27 @@ class SealDecl:
     line: int = _pos()
     col:  int = _pos()
 
-Decl = Union[FnDecl, TableDecl, StructDecl, SealDecl]
+@dataclass
+class ColophonDecl:
+    """An external declaration — the Tuppu scribe's pointer at a
+    function that lives outside the tablet. Parses like `fn` but has
+    no body. The compiler emits an LLVM extern and marshals args /
+    returns at each call site: `str` ↔ NUL-terminated cstring, ints
+    and bools pass directly. No type parameters (C has no generics),
+    no variadics (defer), no raw pointers in the signature —
+    everything that crosses the boundary is already a value type the
+    rest of Tuppu knows how to hold."""
+    name: str
+    params: list[Param]
+    return_type: TypeExpr | None
+    # Optional C symbol override — `colophon fn rename(...) = "real_c_name"(...)`
+    # is a future shape; for now `c_name` defaults to `name` at parse time.
+    c_name: str = ""
+    line: int = _pos()
+    col:  int = _pos()
+
+
+Decl = Union[FnDecl, TableDecl, StructDecl, SealDecl, ColophonDecl]
 
 @dataclass
 class Program:

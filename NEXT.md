@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **476 tests passing.**
+- **484 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -108,8 +108,17 @@ What works:
   `else if`, both forms still parse.
 - **Did-you-mean suggestions** on undefined name, unknown function,
   unknown tablet, and unknown tablet-field errors.
-- **`colophon` reserved keyword** — no semantics yet, held for a
-  future use (file-level metadata preamble or tablets debug-name).
+- **`colophon fn name(params) -> type`** — typed FFI to libc.
+  The scribe's endnote pointing outside the tablet. Declares an
+  extern the compiler emits at LLVM level and marshals at every
+  call site: Tuppu `str` becomes a fresh malloc'd NUL-terminated
+  cstr on the way out (freed after the call) and a heap-owned
+  Tuppu str on the way back via `strlen + malloc + memcpy`; NULL
+  returns yield an empty str. Integer primitives pass through;
+  `bool` widens to `i8` for C-ABI stability. First cut allows
+  ints, bool, and str; user tablets (for e.g. `sockaddr_in`) and
+  opaque handles are the next FFI landings. See
+  `tests/test_colophon.py` — `atoi`, `getenv`, `exit` as proofs.
 - **`for name in iter { ... }`** — works over `str` (u8 bytes),
   `tablets[N]T`, and comptime tables. Loop variable is step-bound.
 - **Mixed-width int comparisons** promote to the wider type (matches
@@ -495,7 +504,7 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 476 passing.
+2. `.venv/bin/pytest` — expect 484 passing.
 3. `git log --oneline -12` — recent timeline: sex Phase 3a/3b,
    struct field mutation, codegen.py split into mixins package,
    elif + did-you-mean, recursive tablets + wedge handles + auto-

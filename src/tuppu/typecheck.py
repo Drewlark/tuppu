@@ -269,6 +269,9 @@ class Checker:
         self.struct_type_params: dict[str, tuple[str, ...]] = {}
         # Generics: per-fn type-parameter names.
         self.fn_type_params: dict[str, tuple[str, ...]] = {}
+        # Names of colophon-declared externs — codegen emits extern
+        # declarations for these rather than bodies.
+        self.colophons: set[str] = set()
         # Type variables visible while resolving a specific generic body.
         # Maps the source-level name ("T") to a TyVar sentinel.
         self._active_type_vars: dict[str, "TyVar"] = {}
@@ -311,10 +314,13 @@ class Checker:
             elif isinstance(d, A.SealDecl):
                 self._resolve_seal_variants(d)
         # Phase 1: function signatures (parameter and return types can now
-        # reference any struct).
+        # reference any struct). Colophons declare externs and join the
+        # same fn table so call sites resolve uniformly.
         for d in self.prog.decls:
             if isinstance(d, A.FnDecl):
                 self._register_fn(d)
+            elif isinstance(d, A.ColophonDecl):
+                self._register_colophon(d)
         for d in self.prog.decls:
             if isinstance(d, A.TableDecl):
                 self._register_table(d)
@@ -442,6 +448,54 @@ class Checker:
                 raise CheckError(
                     f"main must declare -> i32, got -> {ret}", fn.line, fn.col,
                 )
+
+    def _register_colophon(self, c: A.ColophonDecl) -> None:
+        """Register an extern declaration in the fn table so call sites
+        resolve it like any other function. Signature types are
+        restricted to what the call-site marshaling knows how to
+        bridge: integer primitives, bool, and the built-in str
+        (marshaled to / from NUL-terminated C strings). Anything else
+        fails typecheck with a clear error — user tablets, tablets,
+        and handles will land in a follow-up."""
+        if c.name in INTRINSIC_NAMES:
+            raise CheckError(
+                f"cannot declare colophon {c.name!r}: name is a built-in intrinsic",
+                c.line, c.col,
+            )
+        if c.name in self.fns:
+            raise CheckError(
+                f"duplicate declaration {c.name!r}", c.line, c.col,
+            )
+        str_ty = self.structs.get("str")
+
+        def check_ffi_type(ty: Ty, where: str) -> None:
+            if _is_int(ty) or isinstance(ty, TyBool):
+                return
+            if str_ty is not None and ty == str_ty:
+                return
+            raise CheckError(
+                f"colophon {c.name!r}: {where} has type {ty}, which isn't "
+                f"marshalable across the C boundary yet (allowed: ints, "
+                f"bool, str)",
+                c.line, c.col,
+            )
+
+        params = tuple(
+            self._resolve_type(p.type, f"parameter {p.name!r} of colophon {c.name!r}")
+            for p in c.params
+        )
+        for p, pty in zip(c.params, params):
+            check_ffi_type(pty, f"parameter {p.name!r}")
+        ret = (
+            self._resolve_type(c.return_type, f"return type of colophon {c.name!r}")
+            if c.return_type else UNIT
+        )
+        if c.return_type is not None:
+            check_ffi_type(ret, "return type")
+        self.fns[c.name] = TyFn(params=params, ret=ret)
+        # Tracked so codegen can emit extern declarations instead of
+        # trying to lower a body.
+        self.colophons.add(c.name)
 
     def _register_table(self, t: A.TableDecl) -> None:
         elem = self._resolve_type(t.element_type, f"element type of table {t.name!r}")

@@ -100,15 +100,40 @@ class Parser:
                 decls.append(self.parse_struct_decl())
             elif self.check(Tok.SEAL):
                 decls.append(self.parse_seal_decl())
+            elif self.check(Tok.COLOPHON):
+                decls.append(self.parse_colophon())
             else:
                 t = self.peek()
                 raise ParseError(
-                    f"expected 'fn', 'table', 'tablet', or 'seal' at top "
-                    f"level, got {t.kind.name}",
+                    f"expected 'fn', 'table', 'tablet', 'seal', or 'colophon' "
+                    f"at top level, got {t.kind.name}",
                     t.line, t.col,
                 )
             self.skip_newlines()
         return A.Program(decls)
+
+    def parse_colophon(self) -> A.ColophonDecl:
+        """`colophon fn name(params) -> type` — declare an external C
+        function the compiler will emit as an extern and marshal at
+        every call site. No body, no generics."""
+        start = self.eat(Tok.COLOPHON)
+        self.eat(Tok.FN, "expected 'fn' after 'colophon'")
+        name = self.eat(Tok.IDENT, "external function name").value
+        self.eat(Tok.LPAREN)
+        params: list[A.Param] = []
+        if not self.check(Tok.RPAREN):
+            params.append(self.parse_param())
+            while self.check(Tok.COMMA):
+                self.advance()
+                params.append(self.parse_param())
+        self.eat(Tok.RPAREN)
+        return_type: A.TypeExpr | None = None
+        if self.check(Tok.ARROW):
+            self.advance()
+            return_type = self.parse_type()
+        return _at(start, A.ColophonDecl(
+            name=name, params=params, return_type=return_type, c_name=name,
+        ))
 
     def parse_fn(self) -> A.FnDecl:
         start = self.eat(Tok.FN)

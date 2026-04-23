@@ -130,6 +130,9 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         self._free: ir.Function | None = None
         self._write: ir.Function | None = None
         self._fflush: ir.Function | None = None
+        self._strlen: ir.Function | None = None
+        # Colophon decls by Tuppu-level name, for call-site marshaling.
+        self._colophon_decls: dict[str, A.ColophonDecl] = {}
 
     def _get_malloc(self) -> ir.Function:
         if self._malloc is None:
@@ -167,6 +170,19 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             )
         return self._fflush
 
+    def _get_strlen(self) -> ir.Function:
+        if self._strlen is None:
+            existing = self.module.globals.get("strlen")
+            if existing is not None:
+                self._strlen = existing
+            else:
+                self._strlen = ir.Function(
+                    self.module,
+                    ir.FunctionType(I64, [I8.as_pointer()]),
+                    name="strlen",
+                )
+        return self._strlen
+
     # --- top level ---
 
     def gen(self, prog: A.Program) -> ir.Module:
@@ -188,12 +204,16 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             if isinstance(d, A.FnDecl) and d.type_params
         }
 
-        # Phase 1: forward-declare all non-generic user functions.
+        # Phase 1: forward-declare all non-generic user functions, plus
+        # colophon externs (C functions the compiler marshals to / from
+        # at each call site).
         for decl in prog.decls:
             if isinstance(decl, A.FnDecl):
                 if decl.type_params:
                     continue
                 self._declare_fn(decl)
+            elif isinstance(decl, A.ColophonDecl):
+                self._declare_colophon(decl)
             elif isinstance(decl, A.TableDecl):
                 pass  # handled in phase 2 after function decls are visible
             elif isinstance(decl, A.StructDecl):
@@ -245,6 +265,159 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         for i, p in enumerate(fn.params):
             llvm_fn.args[i].name = p.name
         self.functions[fn.name] = llvm_fn
+
+    def _declare_colophon(self, c: A.ColophonDecl) -> None:
+        """Forward-declare a libc extern. The LLVM signature uses C-ABI
+        types (i8* for Tuppu str, i8 for bool, ints pass through) so the
+        Tuppu-level call site can marshal values at each boundary —
+        caller-side str gets a fresh NUL-terminated heap buffer, return
+        str gets copied into a Tuppu-owned heap str via strlen + memcpy.
+
+        Reserves the Tuppu name in both the fn table and a per-colophon
+        sideband so the call-site dispatch can recognise colophon calls
+        and pick the marshaling path."""
+        if c.name in INTRINSICS:
+            raise CodegenError(
+                f"cannot declare colophon {c.name!r}: name is a built-in intrinsic"
+            )
+        if c.name in self.functions:
+            raise CodegenError(f"duplicate declaration {c.name!r}")
+        c_sym = c.c_name or c.name
+        param_types = [
+            self._colophon_c_ty(self._lower_type(p.type)) for p in c.params
+        ]
+        ret_type = self._colophon_c_ty(
+            self._lower_type(c.return_type) if c.return_type
+            else ir.VoidType()
+        )
+        fn_type = ir.FunctionType(ret_type, param_types)
+        existing = self.module.globals.get(c_sym)
+        if existing is not None:
+            llvm_fn = existing
+        else:
+            llvm_fn = ir.Function(self.module, fn_type, name=c_sym)
+            for i, p in enumerate(c.params):
+                llvm_fn.args[i].name = p.name
+        self.functions[c.name] = llvm_fn
+        self._colophon_decls[c.name] = c
+
+    def _colophon_c_ty(self, ty: ir.Type) -> ir.Type:
+        """Map a Tuppu-side LLVM type to its C-ABI counterpart for
+        extern signatures. `str` becomes `i8*` (pointer to NUL-
+        terminated bytes); `bool` widens to `i8` for cross-platform
+        stability; integer types pass through unchanged."""
+        if isinstance(ty, ir.VoidType):
+            return ty
+        if self._is_str_value(ty):
+            return I8.as_pointer()
+        if ty == I1:
+            return I8
+        return ty
+
+    def _str_to_cstr(self, s_val: ir.Value) -> ir.Value:
+        """Emit `malloc(len+1) + memcpy(ptr, len) + NUL` to produce a
+        fresh NUL-terminated C string from a Tuppu str value. The
+        returned i8* is heap-owned by the call-site — it must be
+        freed after the extern call returns."""
+        assert self.builder is not None
+        b = self.builder
+        ptr = b.extract_value(s_val, 0)
+        length = b.extract_value(s_val, 1)
+        alloc_size = b.add(length, ir.Constant(I64, 1))
+        raw = b.call(self._get_malloc(), [alloc_size])
+        b.call(self._get_memcpy(), [raw, ptr, length])
+        b.store(ir.Constant(I8, 0), b.gep(raw, [length], inbounds=True))
+        return raw
+
+    def _cstr_to_str(self, cstr: ir.Value) -> ir.Value:
+        """Turn a C-returned i8* into a heap-owned Tuppu str via
+        `strlen + malloc + memcpy`. The original C pointer is left
+        untouched — Tuppu owns a copy — so callers returning pointers
+        into static storage (getenv) or the stack don't force
+        premature frees on the caller's side.
+
+        NULL returns (getenv on a missing var, etc.) yield an empty
+        borrow: `{ptr=null, len=0, cap=0}`. This collapses "not found"
+        with "found empty string"; stdlib wrappers can distinguish by
+        querying the raw env before the marshal if needed."""
+        assert self.builder is not None
+        b = self.builder
+        fn = b.function
+        is_null = b.icmp_signed(
+            "==", cstr, ir.Constant(I8.as_pointer(), None),
+        )
+        null_bb = fn.append_basic_block("cstr.null")
+        copy_bb = fn.append_basic_block("cstr.copy")
+        done_bb = fn.append_basic_block("cstr.done")
+        b.cbranch(is_null, null_bb, copy_bb)
+
+        b.position_at_end(null_bb)
+        empty = self._str_build_value_in(
+            b, ir.Constant(I8.as_pointer(), None),
+            ir.Constant(I64, 0), ir.Constant(I64, 0),
+        )
+        b.branch(done_bb)
+
+        b.position_at_end(copy_bb)
+        length = b.call(self._get_strlen(), [cstr])
+        alloc_size = b.add(length, ir.Constant(I64, 1))
+        raw = b.call(self._get_malloc(), [alloc_size])
+        b.call(self._get_memcpy(), [raw, cstr, length])
+        b.store(ir.Constant(I8, 0), b.gep(raw, [length], inbounds=True))
+        copied = self._str_build_value_in(b, raw, length, length)
+        b.branch(done_bb)
+
+        b.position_at_end(done_bb)
+        phi = b.phi(self._str_ty())
+        phi.add_incoming(empty, null_bb)
+        phi.add_incoming(copied, copy_bb)
+        return phi
+
+    def _gen_colophon_call(
+        self, decl: A.ColophonDecl, llvm_fn: ir.Function,
+        arg_exprs: list[A.Expr],
+    ) -> ir.Value | None:
+        """Lower a call to a colophon-declared extern. Marshals each
+        str arg to a fresh cstr buffer, widens bool to i8, passes
+        ints through; after the call, frees every cstr we allocated
+        and converts an i8* return back into a heap-owned Tuppu str.
+        Void return yields None."""
+        if len(arg_exprs) != len(decl.params):
+            raise CodegenError(
+                f"colophon {decl.name!r} expects {len(decl.params)} args, "
+                f"got {len(arg_exprs)}"
+            )
+        assert self.builder is not None
+        b = self.builder
+        call_args: list[ir.Value] = []
+        temp_cstrs: list[ir.Value] = []
+        for arg_expr, param in zip(arg_exprs, decl.params):
+            v = self._gen_expr(arg_expr)
+            if v is None:
+                raise CodegenError(
+                    f"colophon {decl.name!r} arg has no value"
+                )
+            param_ty = self._lower_type(param.type)
+            v = self._coerce(v, param_ty)
+            if self._is_str_value(param_ty):
+                cstr = self._str_to_cstr(v)
+                temp_cstrs.append(cstr)
+                call_args.append(cstr)
+            elif param_ty == I1:
+                call_args.append(b.zext(v, I8))
+            else:
+                call_args.append(v)
+        result = b.call(llvm_fn, call_args)
+        for cstr in temp_cstrs:
+            b.call(self._get_free(), [cstr])
+        if decl.return_type is None:
+            return None
+        ret_ty = self._lower_type(decl.return_type)
+        if self._is_str_value(ret_ty):
+            return self._cstr_to_str(result)
+        if ret_ty == I1:
+            return b.icmp_signed("!=", result, ir.Constant(I8, 0))
+        return result
 
     def _gen_fn_body(self, fn: A.FnDecl) -> None:
         if fn.name == "main":
@@ -2026,6 +2199,12 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             fn = self.functions.get(name)
         if fn is None:
             raise CodegenError(f"unknown function {name!r}")
+        # Colophon calls use a dedicated dispatch path that marshals
+        # each arg and return across the C-ABI boundary.
+        if name in self._colophon_decls:
+            return self._gen_colophon_call(
+                self._colophon_decls[name], fn, e.args,
+            )
         if len(e.args) != len(fn.args):
             raise CodegenError(
                 f"{name} expects {len(fn.args)} args, got {len(e.args)}"
