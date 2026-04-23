@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **469 tests passing.**
+- **476 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -74,6 +74,22 @@ What works:
   releases the old value before the store. Tail-return ownership
   transfer extends to structs — returning a local mut/step struct
   binding hands ownership out to the caller's binding.
+- **Step-binding borrow rule** — `step x = y` where y is an Ident
+  naming a cleanup-bearing binding is a borrow: x shares y's
+  metadata and doesn't register its own cleanup. `Variable.transfer_on_tail`
+  records the owner's entry name so returning x from a block
+  transfers y (the real owner) out of the cleanup frame.
+  Transitive: `step w = y; step v = w` has v transfer-chain
+  through to y. Prevents the double-free that plain duplicate-
+  registration produced at scope exit.
+- **Call-site neutering for cleanup-bearing struct args** — passing
+  a struct (str / tablets / nested cleanup) to any fn arg zeros
+  the cleanup markers on every heap-owning field in the callee's
+  view (cap=0 for str, zero-init for tablets, recurses). The
+  callee's mut-param cleanup then no-ops on every field while
+  the caller retains sole ownership. Fresh rvalues (struct
+  literals, Call results) get an anonymous slot in the caller's
+  frame so their heap fields free at scope exit.
 - **Nested tablets-method dispatch** — `buf.bytes.push(b)` works
   when `buf` is a mut struct and `bytes` is a `tablets[N]T` field;
   codegen GEPs to the inner slot and dispatches on a synthetic mut
@@ -479,7 +495,7 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 469 passing.
+2. `.venv/bin/pytest` — expect 476 passing.
 3. `git log --oneline -12` — recent timeline: sex Phase 3a/3b,
    struct field mutation, codegen.py split into mixins package,
    elif + did-you-mean, recursive tablets + wedge handles + auto-

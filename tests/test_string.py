@@ -304,6 +304,66 @@ def test_step_str_returned_as_tail_keeps_ownership(tmp_path):
     assert out == b"foobar\n"
 
 
+def test_step_borrow_does_not_double_free(tmp_path):
+    # `step x = y` where y owns a heap str shares y's metadata. Both
+    # x and y used to register cleanup, producing a double-free at
+    # scope exit (SIGABRT on macOS). The borrow rule skips x's
+    # registration; only y's owner releases.
+    src = (
+        'fn main() -> i32 {\n'
+        '  mut y: str = str_concat("hello", ", world")\n'
+        '  step x = y\n'
+        '  println(x)\n'
+        '  println(y)\n'
+        '  0\n'
+        '}\n'
+    )
+    rc, out, _ = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello, world\nhello, world\n"
+
+
+def test_step_borrow_chain_transfers_through(tmp_path):
+    # Chained borrows: `step w = y; step v = w`. v's transfer_on_tail
+    # must thread back through w to y (the real owner) so returning v
+    # hands heap ownership to the caller.
+    src = (
+        'fn build() -> str {\n'
+        '  mut y: str = str_concat("Ur", "uk")\n'
+        '  step w = y\n'
+        '  step v = w\n'
+        '  v\n'
+        '}\n'
+        'fn main() -> i32 {\n'
+        '  step msg = build()\n'
+        '  println(msg)\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"Uruk\n"
+
+
+def test_step_borrow_returned_as_tail_transfers_source(tmp_path):
+    # `step x = y; x` as the function tail: transfer-on-tail follows
+    # the borrow chain to the real owner (y) and deregisters that so
+    # the returned heap ptr is live in the caller's scope.
+    src = (
+        'fn build() -> str {\n'
+        '  mut y: str = str_concat("hi", "!")\n'
+        '  step x = y\n'
+        '  x\n'
+        '}\n'
+        'fn main() -> i32 {\n'
+        '  step msg = build()\n'
+        '  println(msg)\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"hi!\n"
+
+
 def test_tail_transfer_inside_if_arm(tmp_path):
     # The transfer happens at every block boundary: if-arm block
     # returns a locally-bound str, outer block returns the if result.

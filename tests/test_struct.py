@@ -763,6 +763,76 @@ def test_struct_returned_transfers_cleanup(tmp_path):
     assert out == b"hello!\n"
 
 
+def test_mut_struct_param_caller_retains_heap(tmp_path):
+    # `fn f(mut r: Row)` used to double-free: the callee's cleanup
+    # frame registered the param's alloca, so the str field's bytes
+    # got released at callee exit while the caller still held cap>0
+    # metadata for the same ptr. Call-site neutering zeros the
+    # cleanup markers in the callee's view so its release no-ops.
+    src = (
+        "tablet Row { label: str }\n"
+        "fn take(mut r: Row) {\n"
+        "  println(r.label)\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  step r: Row = Row { label: str_concat(\"hi\", \"!\") }\n"
+        "  take(r)\n"
+        "  println(r.label)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out, _ = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hi!\nhi!\n"
+
+
+def test_mut_struct_param_callee_can_reassign(tmp_path):
+    # With the neutering sentinel the callee's cleanup frame still
+    # sees the mut param, so reassigning to a fresh heap-owning
+    # value and then exiting the callee scope releases the new
+    # allocation correctly — caller's original remains untouched.
+    src = (
+        "tablet Row { label: str }\n"
+        "fn swap(mut r: Row) {\n"
+        "  r = Row { label: str_concat(\"local\", \"\") }\n"
+        "  println(r.label)\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  step r: Row = Row { label: str_concat(\"outer\", \"\") }\n"
+        "  swap(r)\n"
+        "  println(r.label)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out, _ = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"local\nouter\n"
+
+
+def test_rvalue_struct_arg_anonymous_cleanup(tmp_path):
+    # Passing a freshly-built struct-with-heap-field as an rvalue to
+    # a non-mut param must register an anonymous cleanup at the call
+    # site so the heap field's bytes don't orphan after the callee
+    # returns. Stress loop sanity-checks no leak.
+    src = (
+        "tablet Row { label: str }\n"
+        "fn build(n: i64) -> Row { Row { label: int_to_str(n) } }\n"
+        "fn take(r: Row) { println(r.label) }\n"
+        "fn main() -> i32 {\n"
+        "  mut i: i64 = 0\n"
+        "  while i < 500 {\n"
+        "    take(build(i))\n"
+        "    i = i + 1\n"
+        "  }\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out, _ = run(src, tmp_path)
+    assert rc == 0
+    assert out.split(b"\n")[0] == b"0"
+    assert out.split(b"\n")[499] == b"499"
+
+
 def test_struct_passed_to_fn_caller_retains_ownership(tmp_path):
     # Caller holds a Row with a heap str; show() reads through its
     # non-mut param. The callee must not register cleanup for the

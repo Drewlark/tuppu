@@ -65,6 +65,12 @@ class Variable:
     is_mut: bool
     ir_ref: ir.Value       # SSA value for step; alloca pointer for mut
     value_ty: ir.Type      # logical value type (not the pointer type)
+    # If this binding is a borrow — `step x = y` where y owns a
+    # cleanup-bearing value — records the cleanup-frame entry name to
+    # transfer instead of this binding's own name when the value
+    # escapes via tail-return. None for bindings that own their value
+    # (no source to redirect to) or that hold non-cleanup types.
+    transfer_on_tail: str | None = None
 
 
 @dataclass

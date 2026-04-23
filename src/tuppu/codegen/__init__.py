@@ -1327,19 +1327,49 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             # bearing fields. The SSA value stays the read path (reads
             # remain direct, reassignment impossible), the slot exists
             # purely for release dispatch.
-            needs_slot = (
+            #
+            # `step x = y` (Ident-init) is a BORROW: x shares y's
+            # heap bytes, y already owns, registering x would
+            # double-free at scope exit. Skip cleanup; record
+            # `transfer_on_tail` so if x flows out as a block-tail
+            # expression, we transfer ownership of the underlying
+            # owner instead of x itself. Field-init (`step x = r.name`)
+            # follows the same reasoning — the enclosing struct owns,
+            # x is a borrow — but there's no single Variable to
+            # transfer from; ownership stays with the struct.
+            needs_cleanup = (
                 self._is_str_value(init_val.type)
                 or (
                     self._struct_fields_for(init_val.type) is not None
                     and self._struct_needs_cleanup(init_val.type)
                 )
             )
-            if needs_slot:
+            transfer_on_tail = None
+            is_borrow_init = isinstance(b.init, (A.Ident, A.Field, A.StringLit))
+            if needs_cleanup and not is_borrow_init:
                 assert self.builder is not None
                 cleanup_slot = self._alloca_entry(init_val.type, f"{b.name}.cleanup")
                 self.builder.store(init_val, cleanup_slot)
                 self._maybe_register_cleanup(b.name, init_val.type, cleanup_slot)
-            self._bind(b.name, Variable(is_mut=False, ir_ref=init_val, value_ty=init_val.type))
+            elif needs_cleanup and isinstance(b.init, A.Ident):
+                # Redirect tail-transfer to the source. If the source is
+                # itself a borrow, chain through; if it's a param or
+                # untracked binding, transfer_on_tail stays None and the
+                # borrowed value leaves as-is (safe when the true owner
+                # lives in an outer scope).
+                try:
+                    src_var = self._lookup(b.init.name)
+                except CodegenError:
+                    src_var = None
+                if src_var is not None:
+                    if src_var.transfer_on_tail is not None:
+                        transfer_on_tail = src_var.transfer_on_tail
+                    elif self._frame_has_entry(b.init.name):
+                        transfer_on_tail = b.init.name
+            self._bind(b.name, Variable(
+                is_mut=False, ir_ref=init_val, value_ty=init_val.type,
+                transfer_on_tail=transfer_on_tail,
+            ))
 
     def _maybe_register_cleanup(
         self, name: str, value_ty: ir.Type, slot: ir.Value,
@@ -1385,6 +1415,58 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 if self._struct_needs_cleanup(fty):
                     return True
         return False
+
+    def _struct_as_borrow(
+        self, val: ir.Value, struct_ty: ir.Type,
+    ) -> ir.Value:
+        """Produce a view of `val` with every cleanup-bearing field
+        neutered: str fields get cap=0, tablets fields get zero-init
+        {head=null, tail=null, len=0}, nested cleanup structs recurse.
+        Used at call sites for struct-valued args so the callee's
+        cleanup-frame release becomes a no-op on every owning field —
+        caller retains sole ownership of the heap bytes."""
+        assert self.builder is not None
+        fields = self._struct_fields_for(struct_ty)
+        if fields is None:
+            return val
+        b = self.builder
+        result = val
+        for i, (_fname, fty) in enumerate(fields):
+            if self._is_str_value(fty):
+                old = b.extract_value(result, i)
+                borrowed = self._str_as_borrow(old)
+                result = b.insert_value(result, borrowed, i)
+                continue
+            if self._tablets_info_for(fty) is not None:
+                result = b.insert_value(result, ir.Constant(fty, None), i)
+                continue
+            if (
+                self._struct_fields_for(fty) is not None
+                and self._struct_needs_cleanup(fty)
+            ):
+                old = b.extract_value(result, i)
+                borrowed = self._struct_as_borrow(old, fty)
+                result = b.insert_value(result, borrowed, i)
+        return result
+
+    def _register_struct_rvalue_cleanup(
+        self, val: ir.Value, src: A.Expr, struct_ty: ir.Type,
+    ) -> None:
+        """Anonymous cleanup for a cleanup-bearing struct rvalue the
+        caller doesn't bind — e.g. `take(build_row())`. Skips Idents
+        and Fields (already owned by someone tracked); struct literals,
+        calls, etc. genuinely produce fresh owners that this scope
+        now holds."""
+        if isinstance(src, (A.Ident, A.Field)):
+            return
+        if not self._cleanup_frames:
+            return
+        assert self.builder is not None
+        slot = self._alloca_entry(val.type, ".struct.temp")
+        self.builder.store(val, slot)
+        self._cleanup_frames[-1].append(
+            (self._get_struct_release(struct_ty), slot, ".struct.temp"),
+        )
 
     def _get_struct_release(self, struct_ty: ir.Type) -> ir.Function:
         """Build (once, caching by LLVM-type identity) a release fn for
@@ -1705,17 +1787,32 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             self._cleanup_frames.pop()
 
     def _transfer_ownership_out(self, name: str) -> None:
-        """Remove `name`'s entry from the current cleanup frame, if any.
-        Used when a block's tail expression returns a locally-bound value
-        — ownership flows outward to the caller, so the scope-exit
-        release must not fire."""
+        """Remove the cleanup entry that owns the value flowing out via
+        `name`'s tail position. If `name` is a borrow (its Variable has
+        `transfer_on_tail` set), redirect to that source — the actual
+        heap owner. Used when a block's tail expression returns a
+        locally-bound value so the scope-exit release doesn't fire on
+        the escaping heap."""
         if not self._cleanup_frames:
             return
+        try:
+            var = self._lookup(name)
+        except CodegenError:
+            var = None
+        entry_name = (
+            var.transfer_on_tail if var is not None and var.transfer_on_tail
+            else name
+        )
         frame = self._cleanup_frames[-1]
-        for i, (_fn, _ptr, entry_name) in enumerate(frame):
-            if entry_name == name:
+        for i, (_fn, _ptr, fname) in enumerate(frame):
+            if fname == entry_name:
                 frame.pop(i)
                 return
+
+    def _frame_has_entry(self, name: str) -> bool:
+        if not self._cleanup_frames:
+            return False
+        return any(n == name for _fn, _ptr, n in self._cleanup_frames[-1])
 
     def _emit_frame_cleanups(
         self, frame: list[tuple[ir.Function, ir.Value, str]],
@@ -1957,13 +2054,24 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             if v is None:
                 raise CodegenError(f"argument {i} of call to {name} has no value")
             coerced = self._coerce(v, expected_ty)
-            # Str arg: transfer ownership to an anonymous local slot (so the
-            # heap bytes outlive this call and get freed at scope exit),
-            # then hand the callee a cap=0 borrow so its own cleanup frame
-            # can register the param without double-freeing.
+            # Cleanup-bearing args: transfer ownership of any fresh
+            # heap-owning rvalue to an anonymous slot in the current
+            # cleanup frame (so the bytes outlive the call and free at
+            # scope exit), then hand the callee a borrow — cap=0 for
+            # str, cleanup markers zeroed for struct fields — so the
+            # callee's own scope-exit release is a no-op on every
+            # heap-owning field. Caller retains sole ownership.
             if self._is_str_value(expected_ty):
                 self._register_str_rvalue_cleanup(coerced, arg)
                 coerced = self._str_as_borrow(coerced)
+            elif (
+                self._struct_fields_for(expected_ty) is not None
+                and self._struct_needs_cleanup(expected_ty)
+            ):
+                self._register_struct_rvalue_cleanup(
+                    coerced, arg, expected_ty,
+                )
+                coerced = self._struct_as_borrow(coerced, expected_ty)
             call_args.append(coerced)
         return self.builder.call(fn, call_args)
 
