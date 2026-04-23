@@ -511,16 +511,20 @@ class Parser:
         if t.kind is Tok.LOST:
             self.advance(); return _at(t, A.LostLit())
         if t.kind is Tok.IDENT:
-            # `Name { field : ...` is a struct literal. The 3-token lookahead
-            # (LBRACE IDENT COLON) avoids colliding with block expressions or
-            # `if x { body }` — a block's first token is never IDENT-COLON
-            # because bindings require `step`/`mut`.
-            if (
-                self.peek(1).kind is Tok.LBRACE
-                and self.peek(2).kind is Tok.IDENT
-                and self.peek(3).kind is Tok.COLON
-            ):
-                return self.parse_struct_lit()
+            # `Name { field : ...` is a struct literal. The lookahead
+            # skips any NEWLINE tokens between the `{` and the first
+            # field so multi-line struct literals still trigger the
+            # struct-lit parse path. A block's first token is never
+            # IDENT-COLON because bindings require `step`/`mut`.
+            if self.peek(1).kind is Tok.LBRACE:
+                i = 2
+                while self.peek(i).kind is Tok.NEWLINE:
+                    i += 1
+                if (
+                    self.peek(i).kind is Tok.IDENT
+                    and self.peek(i + 1).kind is Tok.COLON
+                ):
+                    return self.parse_struct_lit()
             self.advance(); return _at(t, A.Ident(name=t.value))
         if t.kind is Tok.TYPE_KW:
             # Type names double as identifiers in expression position so

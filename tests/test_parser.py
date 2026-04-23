@@ -288,3 +288,57 @@ def test_missing_rbrace_errors():
 def test_top_level_non_decl_errors():
     with pytest.raises(ParseError, match="top level"):
         parse(lex("step x = 5"))
+
+
+# --- newline-as-statement-terminator inside braces -------------------------
+#
+# Statements inside a fn body are terminated by newlines; a `(` at the
+# start of the next line must not be glued onto the prior line as a
+# call. Before the lexer change, bracket_depth > 0 inside `{}`
+# suppressed the NEWLINE, so `println(x)\n(1 + 2)` parsed as
+# `println(x)(1 + 2)` and tripped codegen's "only direct function
+# calls are supported" error.
+
+def test_paren_start_of_line_not_glued_to_prior_call():
+    prog = parse(lex(
+        "fn main() -> i32 {\n"
+        "  println(1)\n"
+        "  (2 + 3)\n"
+        "  0\n"
+        "}\n"
+    ))
+    fn = prog.decls[0]
+    assert isinstance(fn, A.FnDecl)
+    assert len(fn.body.stmts) == 2
+    first, second = fn.body.stmts
+    assert isinstance(first, A.ExprStmt)
+    assert isinstance(first.expr, A.Call)
+    assert isinstance(first.expr.callee, A.Ident)
+    assert first.expr.callee.name == "println"
+    assert isinstance(second, A.ExprStmt)
+    # The second statement should be a Binary (2 + 3), NOT a Call
+    # on println's return.
+    assert isinstance(second.expr, A.Binary)
+    assert second.expr.op == "+"
+
+
+def test_struct_literal_still_spans_lines():
+    # Regression guard: multi-line struct lits must still hit the
+    # struct-lit parse path. The lookahead skips NEWLINE tokens
+    # after `{` to find the first `IDENT COLON` pair.
+    prog = parse(lex(
+        "tablet Point { x: i64, y: i64 }\n"
+        "fn main() -> i32 {\n"
+        "  step p = Point {\n"
+        "    x: 7,\n"
+        "    y: 8,\n"
+        "  }\n"
+        "  0\n"
+        "}\n"
+    ))
+    fn = prog.decls[1]
+    assert isinstance(fn, A.FnDecl)
+    binding = fn.body.stmts[0]
+    assert isinstance(binding, A.Binding)
+    assert isinstance(binding.init, A.StructLit)
+    assert binding.init.name == "Point"

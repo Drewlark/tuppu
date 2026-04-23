@@ -497,9 +497,18 @@ class Lexer:
         if c in one_map:
             kind = one_map[c]
             self._advance()
-            if kind in (Tok.LPAREN, Tok.LBRACKET, Tok.LBRACE):
+            # Only `(` and `[` suppress newlines — they're always
+            # expression-continuation contexts (fn args, subscripts).
+            # `{` delimits both statement blocks (where newlines are
+            # genuine statement terminators) and struct / match /
+            # enum bodies (which use COMMA for separation); letting
+            # newlines through inside braces lets the parser see the
+            # terminator between `call()` on one line and `(expr)` on
+            # the next, while the specific parsers that care about
+            # multi-line layouts call `skip_newlines` explicitly.
+            if kind in (Tok.LPAREN, Tok.LBRACKET):
                 self.bracket_depth += 1
-            elif kind in (Tok.RPAREN, Tok.RBRACKET, Tok.RBRACE):
+            elif kind in (Tok.RPAREN, Tok.RBRACKET):
                 if self.bracket_depth > 0:
                     self.bracket_depth -= 1
             self._emit(kind, None, line, col)
