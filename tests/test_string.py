@@ -193,6 +193,78 @@ def test_bool_to_str(tmp_path):
     assert out == b"true\nfalse\n"
 
 
+def test_str_concat_variadic(tmp_path):
+    # `str_concat(a, b, c, ...)` takes any arity >= 2 and emits one
+    # linear-time join — single malloc, memcpy each part in order.
+    # Mixed literals and Call rvalues compose cleanly; any heap
+    # intermediates get freed at scope exit.
+    src = (
+        'fn main() -> i32 {\n'
+        '  println(str_concat("a", "b", "c"))\n'
+        '  println(str_concat("x=", int_to_str(7), " y=", int_to_str(9)))\n'
+        '  println(str_concat("", "u", "", "v", ""))\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"abc\nx=7 y=9\nuv\n"
+
+
+def test_str_plus_operator(tmp_path):
+    # `a + b` on strs lowers to the same single-malloc concat as
+    # str_concat — syntax sugar with identical semantics.
+    src = (
+        'fn main() -> i32 {\n'
+        '  step a = "hello"\n'
+        '  step b = ", "\n'
+        '  step c = "world"\n'
+        '  println(a + b + c)\n'
+        '  println("count=" + int_to_str(42))\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"hello, world\ncount=42\n"
+
+
+def test_str_plus_equals(tmp_path):
+    # `s += t` desugars to `s = s + t`; the mut-reassign machinery
+    # releases the old s before storing the new heap concat result,
+    # so the accumulator doesn't leak across iterations.
+    src = (
+        'fn main() -> i32 {\n'
+        '  mut acc: str = ""\n'
+        '  acc += "alpha "\n'
+        '  acc += "beta "\n'
+        '  acc += "gamma"\n'
+        '  println(acc)\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"alpha beta gamma\n"
+
+
+def test_str_plus_equals_loop_no_leak(tmp_path):
+    # Classic O(n²) accumulator shape. It IS quadratic in work but
+    # the ownership machinery still collects every intermediate —
+    # RSS stays bounded, no UAFs, just some wasted copies.
+    src = (
+        'fn main() -> i32 {\n'
+        '  mut acc: str = ""\n'
+        '  mut i: i64 = 0\n'
+        '  while i < 100 {\n'
+        '    acc += "x"\n'
+        '    i = i + 1\n'
+        '  }\n'
+        '  println(acc.len)\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"100\n"
+
+
 def test_concat_typed_parts_builds_log_line(tmp_path):
     # Realistic dynamic-string workflow: assemble a line from mixed
     # typed pieces via concat + to_str. All intermediates must free

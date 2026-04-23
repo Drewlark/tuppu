@@ -979,6 +979,12 @@ class Checker:
         dish_involved = isinstance(lhs, TyDish) or isinstance(rhs, TyDish)
 
         if op in ("+", "-", "*", "/", "%"):
+            # str + str = str_concat. Covers `s += t` via the parser's
+            # aug-assign desugar. Not a general operator-overload path —
+            # we know both sides statically and emit the concat inline.
+            str_ty = self.structs.get("str")
+            if op == "+" and str_ty is not None and lhs == str_ty and rhs == str_ty:
+                return str_ty
             if _is_int(lhs) and _is_int(rhs) and lhs == rhs:
                 return lhs
             if isinstance(lhs, TyRat) and isinstance(rhs, TyRat):
@@ -1325,9 +1331,9 @@ class Checker:
                 e.line, e.col,
             )
         if name == "str_concat":
-            if len(e.args) != 2:
+            if len(e.args) < 2:
                 raise CheckError(
-                    "str_concat(a, b) takes exactly two str arguments",
+                    "str_concat takes at least two str arguments",
                     e.line, e.col,
                 )
             for i, a in enumerate(e.args):

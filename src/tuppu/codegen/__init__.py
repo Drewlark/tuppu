@@ -2167,6 +2167,17 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             raise CodegenError(f"operand of binary {e.op} has no value")
         op = e.op
 
+        # str + str = concat. Reuses the same single-malloc emitter as
+        # the intrinsic, so `s + t` and `s += t` (which the parser
+        # desugars to `s = s + t`) both produce one heap allocation
+        # per combined op, not a chain.
+        if (
+            op == "+"
+            and self._is_str_value(lhs.type)
+            and self._is_str_value(rhs.type)
+        ):
+            return self._emit_str_concat([(lhs, e.lhs), (rhs, e.rhs)])
+
         # Mixed sex + int: promote the int to sex (int→sex is a
         # lossless base-60 decomposition) so the native digit-form path
         # handles the op.
@@ -2535,14 +2546,54 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
     # frame can register the param uniformly without double-free.
 
     def _gen_str_concat_call(self, args: list[A.Expr]) -> ir.Value:
+        """Variadic str concat: `str_concat(a, b, ..., z)` emits a
+        single linear-time join. See `_emit_str_concat` for the
+        mechanics."""
+        if len(args) < 2:
+            raise CodegenError(
+                "str_concat takes at least two arguments"
+            )
+        parts: list[tuple[ir.Value, A.Expr]] = []
+        for arg in args:
+            v = self._gen_expr(arg)
+            if v is None:
+                raise CodegenError("str_concat argument has no value")
+            parts.append((v, arg))
+        return self._emit_str_concat(parts)
+
+    def _emit_str_concat(
+        self, parts: list[tuple[ir.Value, A.Expr]],
+    ) -> ir.Value:
+        """Emit a single-malloc linear-time concat over pre-evaluated
+        str values — sum all part lengths, malloc once, memcpy each
+        part at a running offset, NUL-terminate. Linear in the total
+        output size regardless of arity, so `str_concat(h1, h2, h3,
+        h4, body)` reads like a log line and runs in one pass rather
+        than four nested chain allocations. The per-part AST is
+        carried through for rvalue-cleanup dispatch so any heap
+        intermediate (`foo() + "x"`) is released at scope exit."""
         assert self.builder is not None
-        a = self._gen_expr(args[0])
-        b = self._gen_expr(args[1])
-        if a is None or b is None:
-            raise CodegenError("str_concat argument has no value")
-        self._register_str_rvalue_cleanup(a, args[0])
-        self._register_str_rvalue_cleanup(b, args[1])
-        return self.builder.call(self._get_str_concat(), [a, b])
+        b = self.builder
+        for v, src in parts:
+            self._register_str_rvalue_cleanup(v, src)
+        # Extract ptr / len up front so the two passes (sum lengths,
+        # copy bytes) share the same SSA values.
+        ptrs_lens = [
+            (b.extract_value(v, 0), b.extract_value(v, 1))
+            for v, _src in parts
+        ]
+        total: ir.Value = ir.Constant(I64, 0)
+        for _, ln in ptrs_lens:
+            total = b.add(total, ln)
+        alloc_size = b.add(total, ir.Constant(I64, 1))
+        raw = b.call(self._get_malloc(), [alloc_size])
+        offset: ir.Value = ir.Constant(I64, 0)
+        for ptr, ln in ptrs_lens:
+            dst = b.gep(raw, [offset], inbounds=True)
+            b.call(self._get_memcpy(), [dst, ptr, ln])
+            offset = b.add(offset, ln)
+        b.store(ir.Constant(I8, 0), b.gep(raw, [total], inbounds=True))
+        return self._str_build_value_in(b, raw, total, total)
 
     def _gen_bytes_to_str_call(self, args: list[A.Expr]) -> ir.Value:
         """Lower `bytes_to_str(t)` — flatten a `tablets[N]u8` into a

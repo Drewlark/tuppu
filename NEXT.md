@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **509 tests passing.**
+- **513 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -52,7 +52,14 @@ What works:
   `str_ends_with`/`str_is_empty`/`str_index_of`/`str_find`/
   `str_contains`/`str_repeat`/`bool_to_str`/`rat_to_str`
   (last two were native, migrated to Tuppu now that the language
-  can express them).
+  can express them). **Variadic `str_concat`** — any arity ≥ 2,
+  emits one linear-time single-malloc join (sum lens, malloc,
+  memcpy each part at a running offset), so
+  `str_concat(h1, h2, h3, body)` is one allocation, not a nested
+  chain. **`s + t` and `s += t` on str values** — binary `+` on
+  two str operands lowers to the same emitter, so
+  `acc += int_to_str(i)` reads naturally. (Still O(n²) if used in
+  a loop — use the str_buf pattern for hot paths.)
 - Raw pointer type `*T` — type-only, no expression-level ops.
 - **Recursive structs** via identified LLVM types. `wedge Node {
   next: wedge Node }` works, including mutually-recursive pairs.
@@ -527,7 +534,7 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 509 passing.
+2. `.venv/bin/pytest` — expect 513 passing.
 3. `git log --oneline -12` — recent timeline: sex Phase 3a/3b,
    struct field mutation, codegen.py split into mixins package,
    elif + did-you-mean, recursive tablets + wedge handles + auto-
