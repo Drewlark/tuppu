@@ -92,12 +92,17 @@ INTRINSICS: frozenset[str] = frozenset({
     "print", "println", "read_int", "rat",
     # Dynamic-string intrinsics that return heap-owned `str` values.
     # Only the ones requiring native support (heap allocation or
-    # internal-field digit decomposition) live here; `bool_to_str`
-    # and `rat_to_str` are expressible in Tuppu itself, so they
-    # moved to stdlib/str.tpu.
-    "str_concat", "str_slice",
+    # internal-field digit decomposition) live here; `bool_to_str`,
+    # `rat_to_str`, and `str_concat` are expressible in Tuppu itself,
+    # so they moved to stdlib/str.tpu. The `str + str` binary operator
+    # still uses the native `_emit_str_concat` single-malloc fast path
+    # for the two-argument case.
+    "str_slice",
     "int_to_str", "sex_to_str",
     # Flatten a tablets[N]u8 into a heap-owned str — underpins the
     # growable str_buf pattern without a quadratic-rebuild trap.
     "bytes_to_str",
+    # buffer_to_str(buf, n) — copy n bytes out of a buffer[N]u8 into
+    # a heap-owned str. Paired with buffer[N]u8 for the FFI story.
+    "buffer_to_str",
 })

@@ -189,9 +189,12 @@ def test_colophon_name_collision_with_fn():
 
 
 def test_colophon_name_collision_with_intrinsic():
+    # str_slice remains a native intrinsic (it needs raw pointer math
+    # into the heap str buffer); declaring a colophon with that name
+    # collides with the compiler reserve.
     with pytest.raises(CompileError, match="built-in intrinsic"):
         compile_to_ir(
-            'colophon fn str_concat(a: str, b: str) -> str\n'
+            'colophon fn str_slice(s: str, lo: i64, hi: i64) -> str\n'
             'fn main() -> i32 { 0 }\n'
         )
 

@@ -106,6 +106,22 @@ fn str_buf_append(mut buf: tablets[64]u8, s: str) {
 
 // --- producers (heap-owned results) ---------------------------------------
 
+// Variadic join — `str_concat(a, b, c, ...)` walks each part's bytes
+// into a growable tablets buffer and flattens with `bytes_to_str` in
+// one pass. Linear in the total output size. The binary `+` / `+=`
+// operator on str values still uses the native single-malloc fast
+// path for the two-argument case; that path is cheaper for hot loops
+// that build up a result via repeated concat.
+fn str_concat(parts: tablets[...]str) -> str {
+  mut buf: tablets[64]u8
+  mut i: i64 = 0
+  while i < parts.len {
+    str_buf_append(buf, parts[i])
+    i = i + 1
+  }
+  bytes_to_str(buf)
+}
+
 // Repeat `s` `n` times — empty string for `n <= 0`. O(s.len · n)
 // total via the tablets-backed buffer — each push is amortized O(1)
 // and the final flatten is a single pass.

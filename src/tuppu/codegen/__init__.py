@@ -263,6 +263,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             # unchanged and any chunks the callee allocated would leak.
             if p.is_mut and self._tablets_info_for(t) is not None:
                 t = t.as_pointer()
+            # Variadic `tablets[...]T` param: call site builds the
+            # literal in the caller's frame; callee receives a pointer
+            # so indexing and iteration see the actual chunks.
+            elif isinstance(p.type, A.TypeVariadicTablets):
+                t = t.as_pointer()
             param_types.append(t)
         ret_type = self._lower_type(fn.return_type) if fn.return_type else ir.VoidType()
         fn_type = ir.FunctionType(ret_type, param_types)
@@ -299,6 +304,8 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             if p.is_mut and self._struct_fields_for(ty) is not None:
                 param_types.append(ty.as_pointer())
             else:
+                # Buffers always pass as `T*` regardless of mut —
+                # arrays can't be passed by value across C at all.
                 param_types.append(self._colophon_c_ty(ty))
         ret_type = self._colophon_c_ty(
             self._lower_type(c.return_type) if c.return_type
@@ -335,11 +342,15 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         """Map a Tuppu-side LLVM type to its C-ABI counterpart for
         extern signatures. `str` becomes `i8*` (pointer to NUL-
         terminated bytes); `bool` widens to `i8` for cross-platform
-        stability; integer types pass through unchanged."""
+        stability; integer types pass through unchanged. A
+        `buffer[N]T` decays to `T*` — the natural C-side shape for
+        byte-buffer-taking fns like `recv`/`send`."""
         if isinstance(ty, ir.VoidType):
             return ty
         if self._is_str_value(ty):
             return I8.as_pointer()
+        if isinstance(ty, ir.ArrayType):
+            return ty.element.as_pointer()
         if ty == I1:
             return I8
         return ty
@@ -458,6 +469,29 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         temp_cstrs: list[ir.Value] = []
         for arg_expr, param in zip(arg_exprs, decl.params):
             param_ty = self._lower_type(param.type)
+            # Buffer arg: decay to element pointer via GEP [0, 0]. The
+            # arg must name a buffer-typed mut binding so we can take
+            # the address of its alloca directly.
+            if isinstance(param_ty, ir.ArrayType):
+                if not isinstance(arg_expr, A.Ident):
+                    raise CodegenError(
+                        f"colophon {decl.name!r}: buffer arg must be a "
+                        f"buffer-typed Ident, got {type(arg_expr).__name__}"
+                    )
+                var = self._lookup(arg_expr.name)
+                if not var.is_mut or var.value_ty != param_ty:
+                    raise CodegenError(
+                        f"colophon {decl.name!r}: buffer arg "
+                        f"{arg_expr.name!r} must be a mut binding of "
+                        f"type {param_ty}"
+                    )
+                elem_ptr = b.gep(
+                    var.ir_ref,
+                    [ir.Constant(I32, 0), ir.Constant(I32, 0)],
+                    inbounds=True,
+                )
+                call_args.append(elem_ptr)
+                continue
             # Mut user-tablet arg: pass the caller's alloca address so
             # the callee can read/write through it (sockaddr out-params,
             # mut pointer-to-struct libc conventions). The call site
@@ -540,7 +574,12 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 is_mut_tablets = (
                     p.is_mut and self._tablets_info_for(param_decl_ty) is not None
                 )
-                if is_mut_tablets:
+                is_variadic = isinstance(p.type, A.TypeVariadicTablets)
+                if is_mut_tablets or is_variadic:
+                    # Either shape arrives as a pointer to the caller's
+                    # tablets storage; bind the incoming pointer directly
+                    # as the Variable's ir_ref so the body's indexing,
+                    # iteration, and method dispatch walk the real chunks.
                     self.scopes[-1][p.name] = Variable(
                         is_mut=True, ir_ref=arg, value_ty=param_decl_ty,
                     )
@@ -614,6 +653,16 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         if isinstance(t, A.TypeTablets):
             elem = self._lower_type(t.element)
             return self._get_tablets(t.size, elem).tablets_ty
+        if isinstance(t, A.TypeBuffer):
+            elem = self._lower_type(t.element)
+            return ir.ArrayType(elem, t.size)
+        if isinstance(t, A.TypeVariadicTablets):
+            # Resolved identically to a `tablets[VARIADIC_CHUNK_SIZE]T`
+            # — see typecheck VARIADIC_CHUNK_SIZE. The variadic marker
+            # is only meaningful at call sites.
+            from ..typecheck import VARIADIC_CHUNK_SIZE
+            elem = self._lower_type(t.element)
+            return self._get_tablets(VARIADIC_CHUNK_SIZE, elem).tablets_ty
         if isinstance(t, A.TypePointer):
             elem = self._lower_type(t.element)
             return elem.as_pointer()
@@ -1575,6 +1624,27 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             self._maybe_register_cleanup(b.name, ty, slot)
             return
 
+        # Tablets literal as initializer: `_gen_tablets_lit_addr` already
+        # alloca'd a slot, pushed elements, and registered a cleanup.
+        # Reuse that slot as the binding's storage — creating a second
+        # alloca would double-register cleanup and cause a double free.
+        if isinstance(b.init, A.TabletsLit):
+            slot = self._gen_tablets_lit_addr(b.init)
+            assert self.builder is not None
+            value_ty = slot.type.pointee
+            # Rename the anonymous cleanup entry for readable IR.
+            if self._cleanup_frames and self._cleanup_frames[-1]:
+                fn_rel, _ptr, _old = self._cleanup_frames[-1][-1]
+                self._cleanup_frames[-1][-1] = (fn_rel, slot, b.name)
+            # Step-bound tablets keeps pointer semantics too — reads go
+            # through the slot so `nums.len` and `nums[i]` don't need a
+            # mut binding. Reassignment is still rejected at typecheck
+            # / parse level.
+            self._bind(b.name, Variable(
+                is_mut=b.is_mut, ir_ref=slot, value_ty=value_ty,
+            ))
+            return
+
         init_val = self._gen_expr(b.init)
         if init_val is None:
             raise CodegenError(f"binding {b.name!r} has no value (initializer diverged)")
@@ -1871,31 +1941,39 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 f"tablet has no field {target.name!r}"
             )
         if isinstance(target, A.Index):
-            # lvalue indexing into a mut tablets: `arr[n] = v` or
-            # `arr[n].field = v`. Resolve the inner tablets binding,
+            # lvalue indexing into a mut tablets or buffer: `arr[n] = v`
+            # or `arr[n].field = v`. Resolve the inner binding,
             # bounds-check the index, and return the slot pointer
             # (not the loaded value) so Field chains built on top can
             # GEP through the struct.
             if not isinstance(target.target, A.Ident):
                 raise CodegenError(
-                    f"lvalue indexing: target must be a mut tablets "
-                    f"binding, got {type(target.target).__name__}"
+                    f"lvalue indexing: target must be a mut tablets or "
+                    f"buffer binding, got {type(target.target).__name__}"
                 )
             var = self._lookup(target.target.name)
             if not var.is_mut:
                 raise CodegenError(
                     f"cannot assign into step binding {target.target.name!r}"
                 )
-            info = self._tablets_info_for(var.value_ty)
-            if info is None:
-                raise CodegenError(
-                    f"lvalue indexing: {target.target.name!r} is not a "
-                    f"tablets (got {var.value_ty})"
-                )
             idx_val = self._gen_expr(target.index)
             if idx_val is None:
                 raise CodegenError("lvalue index has no value")
             idx_val = self._coerce(idx_val, I64)
+            if isinstance(var.value_ty, ir.ArrayType):
+                self._emit_bounds_trap(idx_val, var.value_ty.count)
+                slot = self.builder.gep(
+                    var.ir_ref,
+                    [ir.Constant(I32, 0), idx_val],
+                    inbounds=True,
+                )
+                return slot, var.value_ty.element
+            info = self._tablets_info_for(var.value_ty)
+            if info is None:
+                raise CodegenError(
+                    f"lvalue indexing: {target.target.name!r} is not a "
+                    f"tablets or buffer (got {var.value_ty})"
+                )
             len_addr = self.builder.gep(
                 var.ir_ref,
                 [ir.Constant(I32, 0), ir.Constant(I32, 2)],
@@ -1937,6 +2015,8 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             return self._gen_sex_lit(e)
         if isinstance(e, A.StructLit):
             return self._gen_struct_lit(e)
+        if isinstance(e, A.TabletsLit):
+            return self._gen_tablets_lit(e)
         if isinstance(e, A.Field):
             return self._gen_field(e)
         if isinstance(e, A.Index):
@@ -2022,6 +2102,16 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             return then_val
 
         # Both sides reach merge.
+        # Statement-position if (typechecker marked it as discarded):
+        # arms may have different types. Skip phi construction — the
+        # value is unused, so we just return None once both branches
+        # have merged.
+        in_stmt_position = (
+            self._checker is not None
+            and id(e) in self._checker.stmt_if_nodes
+        )
+        if in_stmt_position:
+            return None
         if then_val is None and else_val is None:
             return None
         if then_val is None or else_val is None:
@@ -2353,8 +2443,6 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             return self._gen_read_int(e.args)
         if name == "rat":
             return self._gen_rat_ctor(e.args)
-        if name == "str_concat":
-            return self._gen_str_concat_call(e.args)
         if name == "str_slice":
             return self._gen_str_slice_call(e.args)
         if name == "int_to_str":
@@ -2364,6 +2452,8 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             return self._gen_to_str_call(e.args, self._get_sex_to_str(), _SEX)
         if name == "bytes_to_str":
             return self._gen_bytes_to_str_call(e.args)
+        if name == "buffer_to_str":
+            return self._gen_buffer_to_str_call(e.args)
 
         # Generic fn call: look up the concrete type args inferred by
         # the checker and dispatch to (emitting if necessary) the
@@ -2409,6 +2499,21 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                     f"argument {i} of {name!r}: mut tablets parameter "
                     f"requires a mut tablets argument, got {var.value_ty}"
                 )
+            # Variadic tablets param receives a pointer; the arg is the
+            # synthesised literal from the checker. Build it in the
+            # caller's frame and pass the alloca pointer directly so
+            # the callee sees the real chunks. Cleanup registration
+            # happens inside `_gen_tablets_lit_addr`.
+            if (
+                isinstance(expected_ty, ir.PointerType)
+                and self._tablets_info_for(expected_ty.pointee) is not None
+                and isinstance(arg, A.TabletsLit)
+            ):
+                info = self._tablets_info_for(expected_ty.pointee)
+                call_args.append(
+                    self._gen_tablets_lit_addr(arg, elem_ty_hint=info.elem_ty),
+                )
+                continue
             v = self._gen_expr(arg)
             if v is None:
                 raise CodegenError(f"argument {i} of call to {name} has no value")
@@ -2613,6 +2718,67 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             )
         return self.builder.call(self._get_bytes_to_str(info.N), [v])
 
+    def _gen_buffer_to_str_call(self, args: list[A.Expr]) -> ir.Value:
+        """Lower `buffer_to_str(buf, n)` — copy the first `n` bytes of
+        a `buffer[N]u8` into a fresh heap-owned str. The arg must be
+        a buffer-typed Ident (so we can take the alloca's address);
+        `n` is bounds-checked against the buffer's compile-time size
+        at runtime."""
+        assert self.builder is not None
+        if len(args) != 2:
+            raise CodegenError("buffer_to_str takes exactly two arguments")
+        buf_expr = args[0]
+        if not isinstance(buf_expr, A.Ident):
+            raise CodegenError(
+                f"buffer_to_str: buffer argument must be an Ident, "
+                f"got {type(buf_expr).__name__}"
+            )
+        var = self._lookup(buf_expr.name)
+        if not isinstance(var.value_ty, ir.ArrayType) or var.value_ty.element != I8:
+            raise CodegenError(
+                f"buffer_to_str: {buf_expr.name!r} is not a buffer[N]u8 "
+                f"(got {var.value_ty})"
+            )
+        n = self._gen_expr(args[1])
+        if n is None:
+            raise CodegenError("buffer_to_str length argument has no value")
+        n = self._coerce(n, I64)
+        b = self.builder
+        # Runtime bounds check: n must be in [0, N]. Saturation would
+        # be friendlier, but trapping keeps the "buffer is always
+        # safe" invariant.
+        self._emit_bounds_trap_inclusive(n, var.value_ty.count)
+        elem_ptr = b.gep(
+            var.ir_ref,
+            [ir.Constant(I32, 0), ir.Constant(I32, 0)],
+            inbounds=True,
+        )
+        # malloc(n+1); memcpy(raw, buf_ptr, n); NUL-terminate.
+        alloc_size = b.add(n, ir.Constant(I64, 1))
+        raw = b.call(self._get_malloc(), [alloc_size])
+        b.call(self._get_memcpy(), [raw, elem_ptr, n])
+        b.store(ir.Constant(I8, 0), b.gep(raw, [n], inbounds=True))
+        return self._str_build_value_in(b, raw, n, n)
+
+    def _emit_bounds_trap_inclusive(self, n: ir.Value, size: int) -> None:
+        """Trap if `n < 0` or `n > size` — buffer_to_str permits `n == N`
+        (copies the full buffer), which the exclusive bounds trap
+        rejects. One-off helper; the tablets/str bounds paths stay
+        exclusive."""
+        assert self.builder is not None
+        b = self.builder
+        oob_lo = b.icmp_signed("<", n, ir.Constant(I64, 0))
+        oob_hi = b.icmp_signed(">", n, ir.Constant(I64, size))
+        oob = b.or_(oob_lo, oob_hi)
+        fn = b.function
+        trap_bb = fn.append_basic_block("bounds.trap")
+        ok_bb = fn.append_basic_block("bounds.ok")
+        b.cbranch(oob, trap_bb, ok_bb)
+        b.position_at_end(trap_bb)
+        b.call(self._get_trap(), [])
+        b.unreachable()
+        b.position_at_end(ok_bb)
+
     def _gen_str_slice_call(self, args: list[A.Expr]) -> ir.Value:
         assert self.builder is not None
         s = self._gen_expr(args[0])
@@ -2649,6 +2815,12 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 var = None
             if var is not None and self._tablets_info_for(var.value_ty) is not None:
                 return self._gen_tablets_field(var, e.name)
+            if var is not None and isinstance(var.value_ty, ir.ArrayType):
+                if e.name == "len":
+                    return ir.Constant(I64, var.value_ty.count)
+                raise CodegenError(
+                    f"buffer has no field {e.name!r}; only len"
+                )
 
         target = self._gen_expr(e.target)
         if target is None:
@@ -2692,6 +2864,81 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             as_rat = self._coerce(target, RAT)
             return self.builder.extract_value(as_rat, 0 if e.name == "num" else 1)
         raise CodegenError(f"field access on {target.type} not supported yet")
+
+    def _gen_tablets_lit(self, e: A.TabletsLit) -> ir.Value:
+        """Build a fresh `tablets[N]T` populated with the literal's
+        elements. Alloca the header in the current function's entry
+        block (zero-init `{head=null, tail=null, len=0}`), push each
+        evaluated element via the per-(N, T) push fn, and register a
+        release in the current cleanup frame so the chunks free at
+        scope exit. Returns the loaded tablets value (callers that
+        need the pointer — e.g. the variadic call-site path — look
+        through `_gen_tablets_lit_addr` below)."""
+        slot = self._gen_tablets_lit_addr(e)
+        assert self.builder is not None
+        return self.builder.load(slot)
+
+    def _gen_tablets_lit_addr(
+        self, e: A.TabletsLit, elem_ty_hint: ir.Type | None = None,
+    ) -> ir.Value:
+        """Like `_gen_tablets_lit` but returns the alloca pointer. Used
+        by the variadic-call path so the callee sees the caller's
+        storage directly (same convention as a `mut tablets` param).
+        `elem_ty_hint` lets the variadic caller supply the element
+        type for zero-arity literals where inference has nothing to
+        look at."""
+        assert self.builder is not None
+        # Resolve the element type. The parser always spells one out in
+        # tablets[N]T literals; synthesised variadic literals leave it
+        # None, and we take the hint from the caller if provided, else
+        # probe the first field's expression type.
+        if e.element is not None:
+            elem_ty = self._lower_type(e.element)
+        elif elem_ty_hint is not None:
+            elem_ty = elem_ty_hint
+        else:
+            if not e.fields:
+                raise CodegenError(
+                    "variadic literal: cannot infer element type from "
+                    "empty field list (use explicit tablets[N]T { ... })"
+                )
+            probe = self._gen_expr(e.fields[0])
+            if probe is None:
+                raise CodegenError(
+                    "variadic literal: element probe has no value",
+                )
+            elem_ty = probe.type
+        info = self._get_tablets(e.size, elem_ty)
+        slot = self._alloca_entry(info.tablets_ty, ".tbls.lit")
+        self.builder.store(ir.Constant(info.tablets_ty, None), slot)
+        # Register cleanup BEFORE pushing so a push-then-error path
+        # still frees what was already allocated. Anonymous entry.
+        if self._cleanup_frames:
+            self._cleanup_frames[-1].append(
+                (info.release, slot, ".tbls.lit"),
+            )
+        for fexpr in e.fields:
+            v = self._gen_expr(fexpr)
+            if v is None:
+                raise CodegenError("tablets literal field has no value")
+            v = self._coerce(v, info.elem_ty)
+            # Cleanup-bearing element (str or cleanup-struct): neuter
+            # the element so the tablets holds a borrow-view. The
+            # true owner stays in the caller's frame — same convention
+            # as passing through a cap=0 str param.
+            if self._is_str_value(info.elem_ty):
+                self._register_str_rvalue_cleanup(v, fexpr)
+                v = self._str_as_borrow(v)
+            elif (
+                self._struct_fields_for(info.elem_ty) is not None
+                and self._struct_needs_cleanup(info.elem_ty)
+            ):
+                self._register_struct_rvalue_cleanup(
+                    v, fexpr, info.elem_ty,
+                )
+                v = self._struct_as_borrow(v, info.elem_ty)
+            self.builder.call(info.push, [slot, v])
+        return slot
 
     def _gen_string_lit(self, data: bytes) -> ir.Value:
         """Lower a string literal to a `str` tablet: `{ ptr, len, cap }`.
@@ -2820,6 +3067,19 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 info = self._tablets_info_for(var.value_ty)
                 if info is not None:
                     return self._gen_tablets_index(info, var, e.index)
+                if isinstance(var.value_ty, ir.ArrayType):
+                    # Buffer indexing — GEP + bounds-trap + load.
+                    idx = self._gen_expr(e.index)
+                    if idx is None:
+                        raise CodegenError("buffer index has no value")
+                    idx = self._coerce(idx, I64)
+                    self._emit_bounds_trap(idx, var.value_ty.count)
+                    elem_ptr = self.builder.gep(
+                        var.ir_ref,
+                        [ir.Constant(I32, 0), idx],
+                        inbounds=True,
+                    )
+                    return self.builder.load(elem_ptr)
 
         # str indexing: bounds-checked byte load through s.ptr.
         target = self._gen_expr(e.target)

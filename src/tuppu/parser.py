@@ -322,10 +322,27 @@ class Parser:
         if t.kind is Tok.TABLETS:
             self.advance()
             self.eat(Tok.LBRACKET)
+            # `tablets[...]T` is the variadic-param shape. The lexer
+            # collapses `..` → DOTDOT so `...` lexes as DOTDOT DOT.
+            # Last-param enforcement happens in typecheck; the parser
+            # just shapes the AST here.
+            if self.check(Tok.DOTDOT) and self.peek(1).kind is Tok.DOT:
+                self.advance()  # ..
+                self.advance()  # .
+                self.eat(Tok.RBRACKET)
+                element = self.parse_type()
+                return _at(t, A.TypeVariadicTablets(element=element))
             size = self.eat(Tok.INT, "tablet size (integer)").value
             self.eat(Tok.RBRACKET)
             element = self.parse_type()
             return _at(t, A.TypeTablets(size=size, element=element))
+        if t.kind is Tok.BUFFER:
+            self.advance()
+            self.eat(Tok.LBRACKET)
+            size = self.eat(Tok.INT, "buffer size (integer)").value
+            self.eat(Tok.RBRACKET)
+            element = self.parse_type()
+            return _at(t, A.TypeBuffer(size=size, element=element))
         if t.kind is Tok.WEDGE:
             # `wedge T` — a handle into some `tablets[N]T`. Runtime
             # footprint is a pointer; you get one from `tablets.push`.
@@ -546,7 +563,34 @@ class Parser:
             return self.parse_if()
         if t.kind is Tok.MATCH:
             return self.parse_match()
+        if t.kind is Tok.TABLETS:
+            return self.parse_tablets_lit()
         raise ParseError(f"expected expression, got {t.kind.name}", t.line, t.col)
+
+    def parse_tablets_lit(self) -> A.TabletsLit:
+        """`tablets[N]T { e1, e2, ... }` — pre-populated tablets literal.
+        The size and element type are both required here; call-site
+        variadic desugaring synthesizes a TabletsLit with a canonical
+        size and uses typecheck to pin the element type."""
+        start = self.eat(Tok.TABLETS)
+        self.eat(Tok.LBRACKET)
+        size = self.eat(Tok.INT, "tablet size (integer)").value
+        self.eat(Tok.RBRACKET)
+        element = self.parse_type()
+        self.eat(Tok.LBRACE)
+        fields: list[A.Expr] = []
+        self.skip_newlines()
+        while not self.check(Tok.RBRACE):
+            fields.append(self.parse_expr())
+            self.skip_newlines()
+            if self.check(Tok.COMMA):
+                self.advance()
+                self.skip_newlines()
+            else:
+                break
+        self.skip_newlines()
+        self.eat(Tok.RBRACE)
+        return _at(start, A.TabletsLit(size=size, element=element, fields=fields))
 
     def parse_match(self) -> A.MatchExpr:
         start = self.eat(Tok.MATCH)

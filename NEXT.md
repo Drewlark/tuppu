@@ -3,12 +3,12 @@
 Pickup notes. The Babylonian sexagesimal redesign is the active
 front; imports and dynamic strings are queued behind it.
 
-## Where we are (as of 2026-04-22)
+## Where we are (as of 2026-04-23)
 
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **513 tests passing.**
+- **547 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -138,6 +138,33 @@ What works:
   `examples/tcp_bind.tpu` for a real-libc TCP `socket` + `bind`
   +`close` roundtrip with a user-declared `sockaddr_in`, and
   `tests/test_colophon.py` for the full grid.
+- **`buffer[N]u8` — fixed-size byte buffer for FFI.** `mut buf:
+  buffer[1024]u8` allocates on the stack, zero-inits, and bounds-
+  checks both read and write. `.len` is the compile-time constant.
+  Crosses the C ABI as a `T*` pointer decay — `colophon fn recv(fd,
+  mut buf: buffer[1024]u8, n, flags)` Just Works. `buffer_to_str(buf,
+  n)` copies the first `n` bytes into a fresh heap str (inclusive
+  bounds check: `n == N` allowed, unlike indexing). Rejected in
+  return types and struct fields (would dangle). See `tests/
+  test_buffer.py`.
+- **Tablets literal + variadic slice params.** `tablets[N]T {
+  a, b, c }` builds a pre-populated tablets in one expression;
+  `tablets[...]T` on the last fn param collects trailing call args
+  into a synthesised tablets literal passed by pointer. Enables
+  self-hosted variadic stdlib fns. `str_concat` has been migrated
+  from compiler intrinsic to `stdlib/str.tpu` as a plain Tuppu fn.
+  The binary `+` / `+=` operator on strs still uses the native
+  single-malloc fast path. See `tests/test_variadic.py`.
+- **If-as-statement relaxation.** When an `if` sits in statement
+  position (a bare ExprStmt inside a block, not the block's tail
+  and not assigned anywhere), its arms no longer need to unify.
+  Fixes the recurring friction when one arm diverges via a
+  colophon (`_exit`, `abort`) and the other returns a different
+  shape, or when `push()` returns a `wedge` that nobody asked for.
+  When the `if`'s value IS used (step binding, block tail, etc.),
+  the usual arm-unification rule still applies. Elif chains inherit
+  the flag — relaxing the outer `if` relaxes every nested
+  `else if`. See `tests/test_typecheck.py::test_if_stmt_*`.
 - **First-class function values (no capture)** — a bare fn name is
   a value of type `fn(params) -> ret`. Pass as arg, store in a
   binding, reassign through `mut`, return from a fn, hold in a
@@ -813,7 +840,7 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 513 passing.
+2. `.venv/bin/pytest` — expect 547 passing.
 3. `git log --oneline -15` — recent timeline: sum types + generic
    monomorphization, str ownership sentinel on fn args, slicing,
    str_buf pattern via tablets-backed byte buffer + `bytes_to_str`,
@@ -830,14 +857,10 @@ If starting a fresh session after this compact:
    source of truth is the test files + this document. A SPEC
    catch-up pass is overdue.
 5. **Agreed next tasks (in order):**
-   - **§4. `buffer[N]u8` — fixed-size byte buffer for FFI.** Raises
-     the ceiling on real networking. Closes the `ByteSlot { b: u8 }`
-     workaround. Small commit, well-specified above.
-   - **§5. Tablets literal + variadic slice params.** Unlocks
-     self-hosted `str_concat` (migrate the intrinsic to stdlib).
-     Bigger, higher-leverage; makes the stdlib story feel modern.
-   Both specs are fully fleshed out above with grammar, typecheck
-   rules, codegen sketches, file-touch lists, and migration paths.
+   - ~~**§4. `buffer[N]u8`**~~ — done 2026-04-23.
+   - ~~**§5. Tablets literal + variadic slice params**~~ — done
+     2026-04-23. `str_concat` is now a stdlib fn.
+   - ~~**If-as-statement relaxation**~~ — done 2026-04-23.
    After those: full closures (with capture) → overloads →
    operator overloads → maps → file I/O.
 6. `FUTURE_OPTIMIZATIONS.md` (gitignored) captures design sketches

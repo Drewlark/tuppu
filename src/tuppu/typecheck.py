@@ -126,6 +126,15 @@ class TyTablets:
     def __str__(self) -> str: return f"tablets[{self.size}]{self.element}"
 
 @dataclass(frozen=True)
+class TyBuffer:
+    """`buffer[N]T` — a fixed-size, stack-allocated buffer. `.len` is
+    the compile-time constant `N`. Zero-init on declaration, bounds
+    checked on index, rejected in return types and struct fields."""
+    size: int
+    element: "Ty"
+    def __str__(self) -> str: return f"buffer[{self.size}]{self.element}"
+
+@dataclass(frozen=True)
 class TyStruct:
     """A user-defined tablet (product) type. Nominally typed — equal
     by name only, with an optional tuple of instantiated type args
@@ -167,9 +176,18 @@ class TyTable:
 class TyFn:
     params: tuple
     ret: "Ty"
+    # A variadic fn's last param is a `tablets[...]T`; the checker
+    # collects trailing call-site args into a synthetic TabletsLit
+    # wrapped around the element type. Non-variadic fns set this False.
+    is_variadic: bool = False
     def __str__(self) -> str:
-        args = ", ".join(str(p) for p in self.params)
-        return f"fn({args}) -> {self.ret}"
+        args_list = []
+        for i, p in enumerate(self.params):
+            if self.is_variadic and i == len(self.params) - 1 and isinstance(p, TyTablets):
+                args_list.append(f"tablets[...]{p.element}")
+            else:
+                args_list.append(str(p))
+        return f"fn({', '.join(args_list)}) -> {self.ret}"
 
 
 Ty = object  # structural union; actual nodes listed above
@@ -189,10 +207,16 @@ PRIM_TYPES: dict[str, Ty] = {
 
 INTRINSIC_NAMES = {
     "print", "println", "read_int", "rat",
-    "str_concat", "str_slice",
+    "str_slice",
     "int_to_str", "sex_to_str",
-    "bytes_to_str",
+    "bytes_to_str", "buffer_to_str",
 }
+
+# Canonical tablets chunk size used when synthesising literals for
+# variadic call arguments and when resolving `tablets[...]T` param
+# markers. Sixteen is big enough to hold most variadic calls in one
+# chunk while staying cheap on the "tiny call" path.
+VARIADIC_CHUNK_SIZE = 16
 
 
 # --- helpers ----------------------------------------------------------------
@@ -280,6 +304,18 @@ class Checker:
         # these to know which specialization to emit.
         self.mono_call_args: dict[int, tuple] = {}   # Call node → tuple of Ty
         self.mono_struct_args: dict[int, tuple] = {} # StructLit → tuple of Ty
+        # Variadic calls: Call node id → synthesized TabletsLit holding
+        # the collected trailing arguments. Codegen consults this to
+        # emit the literal once for the last param slot.
+        self.variadic_lit_for_call: dict[int, "A.TabletsLit"] = {}
+        # IfExpr AST node ids appearing in statement position — i.e.
+        # as a bare `ExprStmt` inside a block or a while body, where
+        # the value is provably discarded. Populated by `_tc_stmt`,
+        # consulted by `_tc_if` to relax the arms-must-unify rule, and
+        # by codegen to skip phi construction when arm types differ.
+        # Elif chains propagate: if an outer if is in stmt position,
+        # every nested `else if` inherits the flag.
+        self.stmt_if_nodes: set[int] = set()
         # Variant construction sidebands — both Call (`Some(x)`) and
         # bare Ident (`None`) forms. Keyed by id(AST node).
         self.mono_variant_args: dict[int, tuple] = {}
@@ -408,10 +444,17 @@ class Checker:
                         s.line, s.col,
                     )
                 seen.add(fname)
-                resolved.append((
-                    fname,
-                    self._resolve_type(ftype, f"field {fname!r} of tablet {s.name!r}"),
-                ))
+                fty = self._resolve_type(ftype, f"field {fname!r} of tablet {s.name!r}")
+                # Buffers are scope-lifetime: if the enclosing struct
+                # outlives the scope, the buffer doesn't. Reject here
+                # until we have an ownership story for it.
+                if isinstance(fty, TyBuffer):
+                    raise CheckError(
+                        f"tablet {s.name!r}: field {fname!r} cannot be a buffer "
+                        f"(buffers live on the stack; use a str or tablets)",
+                        s.line, s.col,
+                    )
+                resolved.append((fname, fty))
         finally:
             self._active_type_vars = saved
         self.struct_fields[s.name] = tuple(resolved)
@@ -442,7 +485,26 @@ class Checker:
             )
         finally:
             self._active_type_vars = saved
-        self.fns[fn.name] = TyFn(params=params, ret=ret)
+        # Variadic param must be last and unique. Parse-time already
+        # resolved the AST marker; detect by looking for TypeVariadicTablets
+        # in the source-level param types.
+        is_variadic = False
+        for i, p in enumerate(fn.params):
+            if isinstance(p.type, A.TypeVariadicTablets):
+                if i != len(fn.params) - 1:
+                    raise CheckError(
+                        f"fn {fn.name!r}: variadic `tablets[...]T` parameter "
+                        f"must be the last parameter",
+                        p.line, p.col,
+                    )
+                is_variadic = True
+        if isinstance(ret, TyBuffer):
+            raise CheckError(
+                f"fn {fn.name!r}: cannot return a buffer (its storage "
+                f"would dangle — use a str or tablets instead)",
+                fn.line, fn.col,
+            )
+        self.fns[fn.name] = TyFn(params=params, ret=ret, is_variadic=is_variadic)
         if fn.name == "main":
             if ret != I32:
                 raise CheckError(
@@ -480,10 +542,14 @@ class Checker:
             # like shapes that are platform-dependent; defer).
             if isinstance(ty, TyStruct) and not is_return:
                 return
+            # buffer[N]T decays to a T* at the C boundary — the natural
+            # shape for `recv`/`send`-style fns. Params only; no return.
+            if isinstance(ty, TyBuffer) and not is_return:
+                return
             raise CheckError(
                 f"colophon {c.name!r}: {where} has type {ty}, which isn't "
                 f"marshalable across the C boundary yet (allowed: ints, "
-                f"bool, str, and — for parameters — user tablets)",
+                f"bool, str, buffer, and — for parameters — user tablets)",
                 c.line, c.col,
             )
 
@@ -637,6 +703,24 @@ class Checker:
         if isinstance(t, A.TypeTablets):
             inner = self._resolve_type(t.element, f"{where} element")
             return TyTablets(size=t.size, element=inner)
+        if isinstance(t, A.TypeBuffer):
+            inner = self._resolve_type(t.element, f"{where} element")
+            # v0.1 scope: only byte buffers. Narrowing this avoids
+            # committing to a story for struct-element buffers, which
+            # would intersect with ownership in ways we haven't spec'd.
+            if not (isinstance(inner, TyInt) and inner.width == 8 and not inner.signed):
+                raise CheckError(
+                    f"{where}: buffer element must be u8 in v0.1, got {inner}",
+                    t.line, t.col,
+                )
+            return TyBuffer(size=t.size, element=inner)
+        if isinstance(t, A.TypeVariadicTablets):
+            # Variadic param marker — only legal on the last parameter
+            # of a fn declaration. Resolved into a TyTablets with a
+            # canonical chunk size that codegen will also use at the
+            # call site when synthesising the literal.
+            inner = self._resolve_type(t.element, f"{where} element")
+            return TyTablets(size=VARIADIC_CHUNK_SIZE, element=inner)
         if isinstance(t, A.TypeArray):
             raise CheckError(
                 f"{where}: array types are not supported in v0.1",
@@ -703,7 +787,14 @@ class Checker:
         if isinstance(s, A.ForStmt):       return self._tc_for(s)
         if isinstance(s, A.YieldStmt):     return self._tc_yield(s)
         if isinstance(s, A.ReleaseStmt):   return self._tc_release(s)
-        if isinstance(s, A.ExprStmt):      self._tc_expr(s.expr); return
+        if isinstance(s, A.ExprStmt):
+            # `if` used as a bare statement — the value is provably
+            # discarded, so arms don't need to unify. Mark the node
+            # before typechecking so `_tc_if` sees the flag.
+            if isinstance(s.expr, A.IfExpr):
+                self._mark_stmt_if(s.expr)
+            self._tc_expr(s.expr)
+            return
         raise CheckError(
             f"unsupported statement: {type(s).__name__}", s.line, s.col,
         )
@@ -935,6 +1026,7 @@ class Checker:
         if isinstance(e, A.Slice):     return self._tc_slice(e)
         if isinstance(e, A.Cast):      return self._tc_cast(e)
         if isinstance(e, A.StructLit): return self._tc_struct_lit(e)
+        if isinstance(e, A.TabletsLit): return self._tc_tablets_lit(e, expected)
         if isinstance(e, A.Block):     return self._tc_block(e, expected=expected)
         if isinstance(e, A.IfExpr):    return self._tc_if(e, expected)
         if isinstance(e, A.MatchExpr): return self._tc_match(e, expected)
@@ -1233,7 +1325,7 @@ class Checker:
                     )
             return RAT
 
-        if name in ("str_concat", "str_slice"):
+        if name == "str_slice":
             return self._tc_str_intrinsic(e, name)
 
         if name in ("int_to_str", "sex_to_str"):
@@ -1241,6 +1333,9 @@ class Checker:
 
         if name == "bytes_to_str":
             return self._tc_bytes_to_str(e)
+
+        if name == "buffer_to_str":
+            return self._tc_buffer_to_str(e)
 
         # Local binding named `name` shadows any global fn. If it's a
         # fn-value binding (TyFn), do an indirect call through it;
@@ -1262,6 +1357,33 @@ class Checker:
                 f"{_suggest(name, self.fns)}",
                 e.line, e.col,
             )
+        # Variadic call: split args into (fixed, tail). The fixed args
+        # typecheck against the first (n-1) params; the tail becomes a
+        # synthesized TabletsLit that gets typechecked against the last
+        # param (a TyTablets) and stored on the sideband for codegen.
+        if fn.is_variadic:
+            fixed_count = len(fn.params) - 1
+            if len(e.args) < fixed_count:
+                raise CheckError(
+                    f"{name} expects at least {fixed_count} arg(s), got "
+                    f"{len(e.args)}",
+                    e.line, e.col,
+                )
+            tail_param = fn.params[-1]
+            assert isinstance(tail_param, TyTablets)
+            lit = A.TabletsLit(
+                size=tail_param.size,
+                element=None,
+                fields=list(e.args[fixed_count:]),
+            )
+            lit.line = e.line
+            lit.col = e.col
+            self.variadic_lit_for_call[id(e)] = lit
+            # Rewrite e.args to the (fixed + literal) shape so the
+            # existing matching loop handles it uniformly.
+            new_args: list[A.Expr] = list(e.args[:fixed_count])
+            new_args.append(lit)
+            e.args = new_args
         if len(e.args) != len(fn.params):
             raise CheckError(
                 f"{name} expects {len(fn.params)} args, got {len(e.args)}",
@@ -1330,20 +1452,6 @@ class Checker:
                 f"{name}: str type not in scope (stdlib may be missing)",
                 e.line, e.col,
             )
-        if name == "str_concat":
-            if len(e.args) < 2:
-                raise CheckError(
-                    "str_concat takes at least two str arguments",
-                    e.line, e.col,
-                )
-            for i, a in enumerate(e.args):
-                at = self._tc_expr(a)
-                if at != str_ty:
-                    raise CheckError(
-                        f"str_concat: argument {i} has type {at}, expected str",
-                        e.line, e.col,
-                    )
-            return str_ty
         if name == "str_slice":
             if len(e.args) != 3:
                 raise CheckError(
@@ -1431,6 +1539,36 @@ class Checker:
             )
         return str_ty
 
+    def _tc_buffer_to_str(self, e: A.Call) -> Ty:
+        """`buffer_to_str(buf, n)` — copy the first `n` bytes of `buf`
+        into a fresh heap-owned str. Buffers don't track "used bytes",
+        so the user passes the length explicitly (matches `recv`'s
+        return-value convention). Bounds-checked at runtime."""
+        str_ty = self.structs.get("str")
+        if str_ty is None:
+            raise CheckError(
+                "buffer_to_str: str type not in scope (stdlib may be missing)",
+                e.line, e.col,
+            )
+        if len(e.args) != 2:
+            raise CheckError(
+                "buffer_to_str(buf, n) takes exactly two arguments",
+                e.line, e.col,
+            )
+        at = self._tc_expr(e.args[0])
+        if not isinstance(at, TyBuffer) or at.element != U8:
+            raise CheckError(
+                f"buffer_to_str: first argument must be buffer[N]u8, got {at}",
+                e.line, e.col,
+            )
+        nt = self._tc_expr(e.args[1])
+        if not _is_int(nt):
+            raise CheckError(
+                f"buffer_to_str: length argument must be integer, got {nt}",
+                e.line, e.col,
+            )
+        return str_ty
+
     def _tc_method_call(self, e: A.Call) -> Ty:
         assert isinstance(e.callee, A.Field)
         method = e.callee.name
@@ -1502,6 +1640,13 @@ class Checker:
                 return I64
             raise CheckError(
                 f"tablets has no field {e.name!r}; only len",
+                e.line, e.col,
+            )
+        if isinstance(target_ty, TyBuffer):
+            if e.name == "len":
+                return I64
+            raise CheckError(
+                f"buffer has no field {e.name!r}; only len",
                 e.line, e.col,
             )
         if isinstance(target_ty, TyStruct):
@@ -1606,6 +1751,32 @@ class Checker:
             return TyStruct(name=e.name, args=concrete_args)
         return self.structs[e.name]
 
+    def _tc_tablets_lit(self, e: A.TabletsLit, expected: Ty | None) -> Ty:
+        """`tablets[N]T { a, b, c }` — typecheck each element against T
+        (either the spelled element type or one inferred from context).
+        The parser only emits TabletsLit nodes with an explicit element
+        type, but the variadic-call desugar synthesises nodes without
+        one and relies on `expected` to pin T."""
+        if e.element is not None:
+            elem_ty = self._resolve_type(e.element, "tablets literal element type")
+        elif isinstance(expected, TyTablets):
+            elem_ty = expected.element
+        else:
+            raise CheckError(
+                "tablets literal: cannot infer element type; add "
+                "`tablets[N]T { ... }` form with an explicit element",
+                e.line, e.col,
+            )
+        for i, fexpr in enumerate(e.fields):
+            fty = self._tc_expr(fexpr, expected=elem_ty)
+            if not _coerces_to(fty, elem_ty):
+                raise CheckError(
+                    f"tablets literal: element {i} has type {fty}, "
+                    f"expected {elem_ty}",
+                    e.line, e.col,
+                )
+        return TyTablets(size=e.size, element=elem_ty)
+
     def _tc_index(self, e: A.Index) -> Ty:
         if isinstance(e.target, A.Ident) and e.target.name in self.tables:
             tbl = self.tables[e.target.name]
@@ -1622,6 +1793,14 @@ class Checker:
             if not _is_int(idx_ty):
                 raise CheckError(
                     f"tablets index must be integer, got {idx_ty}",
+                    e.line, e.col,
+                )
+            return target_ty.element
+        if isinstance(target_ty, TyBuffer):
+            idx_ty = self._tc_expr(e.index)
+            if not _is_int(idx_ty):
+                raise CheckError(
+                    f"buffer index must be integer, got {idx_ty}",
                     e.line, e.col,
                 )
             return target_ty.element
@@ -1699,19 +1878,36 @@ class Checker:
         finally:
             self._pop()
 
+    def _mark_stmt_if(self, e: A.IfExpr) -> None:
+        """Mark an IfExpr (and any elif chain) as statement-position so
+        the arm-unification rule relaxes everywhere the discarded-
+        value context extends."""
+        self.stmt_if_nodes.add(id(e))
+        if isinstance(e.else_, A.IfExpr):
+            self._mark_stmt_if(e.else_)
+
     def _tc_if(self, e: A.IfExpr, expected: Ty | None = None) -> Ty:
         cond_ty = self._tc_expr(e.cond)
         if not isinstance(cond_ty, TyBool):
             raise CheckError(
                 f"if condition must be bool, got {cond_ty}", e.line, e.col,
             )
-        then_ty = self._tc_block(e.then, expected=expected)
+        in_stmt_position = id(e) in self.stmt_if_nodes
+        # In statement position the arm values are discarded, so
+        # neither arm is expected to produce a particular type. Drop
+        # the `expected` hint so arms aren't forced to coerce their
+        # tails toward an unused sink type.
+        arm_expected = None if in_stmt_position else expected
+        then_ty = self._tc_block(e.then, expected=arm_expected)
         if e.else_ is None:
             return UNIT
         if isinstance(e.else_, A.IfExpr):
-            else_ty = self._tc_if(e.else_, expected)
+            else_ty = self._tc_if(e.else_, arm_expected)
         else:
-            else_ty = self._tc_block(e.else_, expected=expected)
+            else_ty = self._tc_block(e.else_, expected=arm_expected)
+        if in_stmt_position:
+            # Value is discarded; skip the unify and report () upward.
+            return UNIT
         unified = _unify_if_arms(then_ty, else_ty)
         if unified is None:
             raise CheckError(

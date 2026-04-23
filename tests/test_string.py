@@ -20,19 +20,21 @@ from tuppu.errors import CompileError
 
 
 def run(src: str, tmp_path: Path, stdin: bytes = b"") -> tuple[int, bytes, bytes]:
-    binary = compile_to_binary(src, tmp_path, name="prog")
-    r = subprocess.run([str(binary)], input=stdin, capture_output=True)
-    return r.returncode, r.stdout, r.stderr
-
-
-def run_with_stdlib(src: str, tmp_path: Path) -> tuple[int, bytes, bytes]:
+    # String tests implicitly use the bundled stdlib — str_concat,
+    # int_to_str, str_repeat, etc. are defined there. Matches the
+    # default `./tuppu run` shape; individual tests wanting a bare
+    # compilation call compile_to_binary directly.
     user_file = tmp_path / "main.tpu"
     user_file.write_text(src)
     binary = compile_files_to_binary(
         stdlib_files() + [user_file], tmp_path, name="prog",
     )
-    r = subprocess.run([str(binary)], capture_output=True)
+    r = subprocess.run([str(binary)], input=stdin, capture_output=True)
     return r.returncode, r.stdout, r.stderr
+
+
+# Back-compat alias: keep the old name working for tests that spell it.
+run_with_stdlib = run
 
 
 # --- literal, print, len, index -------------------------------------------
@@ -580,12 +582,13 @@ def test_slice_non_str_rejected():
 
 
 def test_str_rvalue_temp_release_is_wired(tmp_path):
-    # `println(str_concat(a, b))` must register an anonymous cleanup for
+    # `println("foo" + "bar")` must register an anonymous cleanup for
     # the concat result — the IR should show at least one release call
-    # in main after the concat.
+    # in main after the concat. Uses `+` since it's the native path
+    # that doesn't require stdlib.
     src = (
         'fn main() -> i32 {\n'
-        '  println(str_concat("foo", "bar"))\n'
+        '  println("foo" + "bar")\n'
         '  0\n'
         '}\n'
     )

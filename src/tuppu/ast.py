@@ -39,6 +39,31 @@ class TypeTablets:
     col:  int = _pos()
 
 @dataclass
+class TypeBuffer:
+    """`buffer[N]T` — a fixed-size, stack-allocated, bounds-checked
+    buffer of T. Intended for byte-level FFI (`buffer[1024]u8`) and
+    any other place where you want a slab of `N` elements with
+    C-ABI pointer decay at the FFI boundary. Distinct from
+    `tablets[N]T` (which is a growable chunked storage) and from the
+    old `[N]T` shape that was retired when `str` landed.
+    Return type and struct-field placement are rejected at typecheck
+    (would dangle / need ownership semantics we don't have)."""
+    size: int
+    element: "TypeExpr"
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class TypeVariadicTablets:
+    """`tablets[...]T` — a last-param shape that collects the trailing
+    call-site args into a synthetic TabletsLit. Inside a fn body a
+    binding of this type behaves like a regular `tablets[N]T` for
+    indexing, iteration, and method dispatch."""
+    element: "TypeExpr"
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
 class TypePointer:
     """A raw (unmanaged) pointer type, spelled `*T` in source.
 
@@ -88,7 +113,10 @@ class TypeApply:
     line: int = _pos()
     col:  int = _pos()
 
-TypeExpr = Union[TypeName, TypeArray, TypeTablets, TypePointer, TypeHandle, TypeApply, TypeFn]
+TypeExpr = Union[
+    TypeName, TypeArray, TypeTablets, TypeBuffer, TypeVariadicTablets,
+    TypePointer, TypeHandle, TypeApply, TypeFn,
+]
 
 
 # --- expressions -------------------------------------------------------------
@@ -216,6 +244,20 @@ class StructLit:
     col:  int = _pos()
 
 @dataclass
+class TabletsLit:
+    """`tablets[N]T { a, b, c }` — constructs a pre-populated tablets
+    value in one expression. Size is required when spelled; the
+    synthetic literal the parser produces for variadic call arguments
+    uses a compiler-chosen canonical size. element may be None when
+    the checker is expected to infer it from context (variadic call
+    desugaring). fields are expressions, evaluated left-to-right."""
+    size: int
+    element: "TypeExpr | None"
+    fields: list["Expr"]
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
 class Block:
     stmts: list["Stmt"] = field(default_factory=list)
     tail: "Expr | None" = None
@@ -273,7 +315,7 @@ class MatchExpr:
 Expr = Union[
     IntLit, SexLit, StringLit, CharLit, BoolLit, LostLit, Ident,
     Unary, Binary, Call, Index, Slice, Field, Cast, StructLit,
-    Block, IfExpr, MatchExpr,
+    TabletsLit, Block, IfExpr, MatchExpr,
 ]
 
 

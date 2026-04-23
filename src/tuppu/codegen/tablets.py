@@ -35,15 +35,21 @@ class TabletsMixin:
 
     def _gen_tablets_field(self, var: Variable, field_name: str) -> ir.Value:
         assert self.builder is not None
-        if not var.is_mut:
-            raise CodegenError("tablets must be a mut binding")
         if field_name == "len":
-            len_addr = self.builder.gep(
-                var.ir_ref,
-                [ir.Constant(I32, 0), ir.Constant(I32, 2)],
-                inbounds=True,
-            )
-            return self.builder.load(len_addr)
+            # Works on any tablets binding whose ir_ref is a pointer to
+            # the header (both mut and the slot-backed step case covered
+            # by tablets-literal bindings). Pure-SSA step bindings (e.g.
+            # a tablets-returning fn call stored into a step) would be
+            # rare and we can fold them in later.
+            if isinstance(var.ir_ref.type, ir.PointerType):
+                len_addr = self.builder.gep(
+                    var.ir_ref,
+                    [ir.Constant(I32, 0), ir.Constant(I32, 2)],
+                    inbounds=True,
+                )
+                return self.builder.load(len_addr)
+            # Fall-through: step SSA value, just extract the len field.
+            return self.builder.extract_value(var.ir_ref, 2)
         raise CodegenError(f"tablets has no field {field_name!r}; only .len")
 
     # --- rat arithmetic -------------------------------------------------
@@ -51,8 +57,11 @@ class TabletsMixin:
     def _gen_tablets_index(
         self, info: TabletsInfo, var: Variable, idx_expr: A.Expr,
     ) -> ir.Value:
-        if not var.is_mut:
-            raise CodegenError("tablets indexing requires a mut binding")
+        if not isinstance(var.ir_ref.type, ir.PointerType):
+            raise CodegenError(
+                "tablets indexing requires a slot-backed binding "
+                "(mut or tablets-literal step)"
+            )
         assert self.builder is not None
         idx = self._gen_expr(idx_expr)
         if idx is None:

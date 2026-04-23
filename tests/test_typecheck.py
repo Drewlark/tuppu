@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 
 from tuppu.driver import compile_to_ir
+from tuppu.errors import CompileError
 from tuppu.typecheck import CheckError
 
 
@@ -14,6 +15,71 @@ def fails(src: str, message_fragment: str) -> CheckError:
     with pytest.raises(CheckError, match=message_fragment) as ei:
         compile_to_ir(src)
     return ei.value
+
+
+# --- if in statement position (arms need not unify) ------------------------
+
+def test_if_stmt_arms_may_mismatch():
+    # `if cond { unit } else { wedge u8 }` is fine when the value is
+    # provably discarded — the if sits as an ExprStmt inside a block.
+    src = (
+        "fn main() -> i32 {\n"
+        "  mut buf: tablets[4]u8\n"
+        "  mut flag: bool = false\n"
+        "  if flag { flag = true } else { buf.push(7 as u8) }\n"
+        "  0\n"
+        "}\n"
+    )
+    # Must not raise.
+    compile_to_ir(src)
+
+
+def test_if_expr_arms_still_must_unify():
+    # When the if's value IS used (step binding, block tail, etc.),
+    # arms must still unify — the relaxation is scoped to statement
+    # position only.
+    with pytest.raises(CompileError, match="different types"):
+        compile_to_ir(
+            "fn main() -> i32 {\n"
+            "  step x = if true { 1 } else { false }\n"
+            "  0\n"
+            "}\n"
+        )
+
+
+def test_if_stmt_elif_chain_also_relaxed():
+    # A `else if` inside an already-relaxed if inherits the flag.
+    # Without propagation, the inner if would reject.
+    src = (
+        "fn main() -> i32 {\n"
+        "  mut buf: tablets[4]u8\n"
+        "  mut n: i64 = 0\n"
+        "  if n < 0 { buf.push(1 as u8) }\n"
+        "  elif n == 0 { n = n + 1 }\n"
+        "  else { buf.push(2 as u8) }\n"
+        "  0\n"
+        "}\n"
+    )
+    compile_to_ir(src)
+
+
+def test_if_stmt_arms_can_be_divergent():
+    # One arm diverges (colophon declared to return i32 but actually
+    # terminates), the other runs ordinary statements. Without the
+    # relaxation the user had to pad with `0 as i32` dead code.
+    src = (
+        "colophon fn _exit(status: i32) -> i32\n"
+        "fn main() -> i32 {\n"
+        "  step pid: i32 = 0 as i32\n"
+        "  if pid == 0 as i32 {\n"
+        "    _exit(pid)\n"
+        "  } else {\n"
+        "    println(\"parent\")\n"
+        "  }\n"
+        "  0\n"
+        "}\n"
+    )
+    compile_to_ir(src)
 
 
 # --- domain-level messages ---------------------------------------------

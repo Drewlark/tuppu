@@ -7,12 +7,26 @@ from pathlib import Path
 
 import pytest
 
-from tuppu.driver import compile_to_binary, compile_to_ir
+from tuppu.driver import (
+    compile_files_to_binary, compile_to_binary, compile_to_ir, stdlib_files,
+)
 from tuppu.errors import CompileError
 
 
 def run(src: str, tmp_path: Path, stdin: bytes = b"") -> tuple[int, bytes, bytes]:
     binary = compile_to_binary(src, tmp_path, name="prog")
+    r = subprocess.run([str(binary)], input=stdin, capture_output=True)
+    return r.returncode, r.stdout, r.stderr
+
+
+def run_with_stdlib(src: str, tmp_path: Path, stdin: bytes = b"") -> tuple[int, bytes, bytes]:
+    """Compile with the bundled stdlib so tests using `str_concat`,
+    `int_to_str`, etc. can reach them."""
+    user_file = tmp_path / "main.tpu"
+    user_file.write_text(src)
+    binary = compile_files_to_binary(
+        stdlib_files() + [user_file], tmp_path, name="prog",
+    )
     r = subprocess.run([str(binary)], input=stdin, capture_output=True)
     return r.returncode, r.stdout, r.stderr
 
@@ -681,7 +695,7 @@ def test_struct_with_str_field_no_leak(tmp_path):
         "  0\n"
         "}\n"
     )
-    rc, out, _ = run(src, tmp_path)
+    rc, out, _ = run_with_stdlib(src, tmp_path)
     assert rc == 0
     lines = out.split(b"\n")
     assert lines[0] == b"hi 0"
@@ -721,9 +735,12 @@ def test_struct_nested_cleanup(tmp_path):
         "  0\n"
         "}\n"
     )
-    _, out, _ = run(src, tmp_path)
+    _, out, _ = run_with_stdlib(src, tmp_path)
     assert out == b"ab\n"
-    ir = compile_to_ir(src)
+    # For the IR spot-check use a stdlib-free equivalent (`+` operator)
+    # so compile_to_ir doesn't need the fn table populated.
+    ir_src = src.replace('str_concat("a", "b")', '"a" + "b"')
+    ir = compile_to_ir(ir_src)
     assert "__tuppu_struct_Outer_release" in ir
     assert "__tuppu_struct_Inner_release" in ir
 
@@ -759,7 +776,7 @@ def test_struct_returned_transfers_cleanup(tmp_path):
         "  0\n"
         "}\n"
     )
-    _, out, _ = run(src, tmp_path)
+    _, out, _ = run_with_stdlib(src, tmp_path)
     assert out == b"hello!\n"
 
 
@@ -781,7 +798,7 @@ def test_mut_struct_param_caller_retains_heap(tmp_path):
         "  0\n"
         "}\n"
     )
-    rc, out, _ = run(src, tmp_path)
+    rc, out, _ = run_with_stdlib(src, tmp_path)
     assert rc == 0
     assert out == b"hi!\nhi!\n"
 
@@ -804,7 +821,7 @@ def test_mut_struct_param_callee_can_reassign(tmp_path):
         "  0\n"
         "}\n"
     )
-    rc, out, _ = run(src, tmp_path)
+    rc, out, _ = run_with_stdlib(src, tmp_path)
     assert rc == 0
     assert out == b"local\nouter\n"
 
@@ -848,7 +865,7 @@ def test_struct_passed_to_fn_caller_retains_ownership(tmp_path):
         "  0\n"
         "}\n"
     )
-    _, out, _ = run(src, tmp_path)
+    _, out, _ = run_with_stdlib(src, tmp_path)
     assert out == b"hi!\nhi!\n"
 
 
@@ -864,5 +881,5 @@ def test_struct_reassignment_releases_old(tmp_path):
         "  0\n"
         "}\n"
     )
-    _, out, _ = run(src, tmp_path)
+    _, out, _ = run_with_stdlib(src, tmp_path)
     assert out == b"second\n"
