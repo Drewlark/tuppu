@@ -23,10 +23,25 @@ class TabletsMixin:
         if method == "push":
             if len(args) != 1:
                 raise CodegenError("tablets.push takes exactly one argument")
-            val = self._gen_expr(args[0])
+            arg_expr = args[0]
+            val = self._gen_expr(arg_expr)
             if val is None:
                 raise CodegenError("tablets.push argument has no value")
             val = self._coerce(val, info.elem_ty)
+            # Container ownership transfer: if the element type is
+            # cleanup-bearing and the arg is an Ident naming a locally-
+            # owned binding, the tablets takes over the heap bytes —
+            # remove the caller's cleanup so its scope-exit release
+            # doesn't race with the tablets's own element-walk on
+            # release. Safe because the SSA value we just loaded is
+            # a copy of the header that the tablets now owns; the
+            # caller's slot still has readable ptr/len, its cap is
+            # the only thing that matters for release semantics.
+            if (
+                isinstance(arg_expr, A.Ident)
+                and self._is_cleanup_bearing_ty(info.elem_ty)
+            ):
+                self._transfer_cleanup_into_container(arg_expr.name)
             # Push returns a pointer to the just-written slot — this is
             # the `tablet T` handle the user sees. Callers in statement
             # position ignore it.
@@ -329,6 +344,16 @@ class TabletsMixin:
         node_ty: ir.IdentifiedStructType, tablets_ty: ir.LiteralStructType,
         suffix: str,
     ) -> ir.Function:
+        # When the element type is cleanup-bearing (str / struct-with-
+        # cleanup / nested tablets), the tablets release walks each
+        # chunk's occupied slots and dispatches the appropriate release
+        # on each, then frees the chunk. This ensures `mut t:
+        # tablets[N]str` with heap-owned str elements doesn't leak its
+        # bytes at scope exit. Ownership-transfer semantics at push /
+        # struct-lit sites make the caller's cleanup no-op, so the
+        # element-walk here can safely free without risking double-free.
+        element_release = self._element_release_fn(elem_ty)
+
         fn = ir.Function(
             self.module,
             ir.FunctionType(ir.VoidType(), [tablets_ty.as_pointer()]),
@@ -359,10 +384,42 @@ class TabletsMixin:
         b.cbranch(is_null, done, body)
 
         b.position_at_end(body)
+
+        # Per-element release walk for cleanup-bearing element types.
+        # Iterates `used` slots of the current chunk; each slot gets
+        # the appropriate release. Scalar elements skip this entirely
+        # and we just free the chunk as before.
+        if element_release is not None:
+            used = b.load(b.gep(
+                cur_phi, [ZERO_I32, ir.Constant(I32, 1)], inbounds=True,
+            ))
+            rel_loop = fn.append_basic_block("rel.loop")
+            rel_body = fn.append_basic_block("rel.body")
+            rel_done = fn.append_basic_block("rel.done")
+            start_bb = b.block
+            b.branch(rel_loop)
+
+            b.position_at_end(rel_loop)
+            i_phi = b.phi(I64, "i")
+            i_phi.add_incoming(ir.Constant(I64, 0), start_bb)
+            cont = b.icmp_signed("<", i_phi, used)
+            b.cbranch(cont, rel_body, rel_done)
+
+            b.position_at_end(rel_body)
+            slot = b.gep(
+                cur_phi, [ZERO_I32, ZERO_I32, i_phi], inbounds=True,
+            )
+            b.call(element_release, [slot])
+            i_next = b.add(i_phi, ir.Constant(I64, 1))
+            i_phi.add_incoming(i_next, b.block)
+            b.branch(rel_loop)
+
+            b.position_at_end(rel_done)
+
         next_node = b.load(b.gep(cur_phi, [ZERO_I32, ir.Constant(I32, 2)], inbounds=True))
         raw = b.bitcast(cur_phi, I8.as_pointer())
         b.call(self._get_free(), [raw])
-        cur_phi.add_incoming(next_node, body)
+        cur_phi.add_incoming(next_node, b.block)
         b.branch(loop)
 
         b.position_at_end(done)
@@ -371,6 +428,24 @@ class TabletsMixin:
         b.store(ir.Constant(I64, 0), len_addr)
         b.ret_void()
         return fn
+
+    def _element_release_fn(self, elem_ty: ir.Type) -> "ir.Function | None":
+        """Return the per-slot release fn for a tablets element type,
+        or None if the element has no cleanup (plain scalars, rats,
+        sexes, struct-without-cleanup). The returned fn takes a
+        pointer-to-element; it's the same shape the struct and str
+        release fns already have."""
+        if self._is_str_value(elem_ty):
+            return self._get_str_release()
+        inner = self._tablets_info_for(elem_ty)
+        if inner is not None:
+            return inner.release
+        if (
+            self._struct_fields_for(elem_ty) is not None
+            and self._struct_needs_cleanup(elem_ty)
+        ):
+            return self._get_struct_release(elem_ty)
+        return None
 
     def _tablets_info_for(self, value_ty: ir.Type) -> TabletsInfo | None:
         """Given an LLVM type, return the TabletsInfo if it's a tablets struct."""

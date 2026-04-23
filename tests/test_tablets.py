@@ -216,6 +216,116 @@ def test_tablets_field_readable_through_nonmut_struct_arg(tmp_path):
     assert out == b"2\n"
 
 
+def test_tablets_str_element_transfer_ownership_on_push(tmp_path):
+    # The hashmap pattern the Tupsarru community hit: a local `step
+    # owned_k` holds a cap>0 str, gets pushed into a tablets inside
+    # an Entry struct. Previously owned_k's cleanup fired at block-
+    # end, freeing the bytes the Entry still pointed at → UAF.
+    # Fixed via push/struct-lit ownership transfer + per-element
+    # tablets release on scope exit.
+    src = (
+        "tablet Entry { key: str, count: i64 }\n"
+        "fn build(n: i64) -> i64 {\n"
+        "  mut store: tablets[4]Entry\n"
+        "  mut i: i64 = 0\n"
+        "  while i < n {\n"
+        "    step owned_k = \"key\" + int_to_str(i)\n"
+        "    step _ = store.push(Entry { key: owned_k, count: i })\n"
+        "    i = i + 1\n"
+        "  }\n"
+        "  mut total: i64 = 0\n"
+        "  mut j: i64 = 0\n"
+        "  while j < store.len {\n"
+        "    step e = store[j]\n"
+        "    total = total + e.count + e.key.len\n"
+        "    j = j + 1\n"
+        "  }\n"
+        "  total\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  println(build(3))\n"  # 0+1+2 + 4*3 = 15
+        "  0\n"
+        "}\n"
+    )
+    _, out = run(src, tmp_path)
+    assert out == b"15\n"
+
+
+def test_tablets_str_element_inline_push_no_leak(tmp_path):
+    # The "inline rvalue" pattern (str_clone result flows directly
+    # into the struct lit). Pre-fix this was safe-but-leaky (tablets
+    # release freed chunks without walking str elements). Post-fix
+    # the walk fires, bytes are reclaimed.
+    src = (
+        "tablet Entry { key: str, count: i64 }\n"
+        "fn main() -> i32 {\n"
+        "  mut store: tablets[4]Entry\n"
+        "  mut i: i64 = 0\n"
+        "  while i < 5 {\n"
+        "    step _ = store.push(Entry {\n"
+        "      key: \"k\" + int_to_str(i), count: i,\n"
+        "    })\n"
+        "    i = i + 1\n"
+        "  }\n"
+        "  println(store.len)\n"
+        "  step first = store[0]\n"
+        "  step last = store[4]\n"
+        "  println(first.key)\n"
+        "  println(last.key)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out = run(src, tmp_path)
+    assert out == b"5\nk0\nk4\n"
+
+
+def test_tablets_of_str_release_frees_elements(tmp_path):
+    # Sanity: a tablets[N]str with heap strings, then explicit release,
+    # should free every element. Before the fix only the chunks freed;
+    # element bytes leaked.
+    src = (
+        "fn main() -> i32 {\n"
+        "  mut t: tablets[4]str\n"
+        "  mut i: i64 = 0\n"
+        "  while i < 10 {\n"
+        "    step _ = t.push(\"s\" + int_to_str(i))\n"
+        "    i = i + 1\n"
+        "  }\n"
+        "  println(t.len)\n"
+        "  println(t[7])\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out = run(src, tmp_path)
+    assert out == b"10\ns7\n"
+
+
+def test_tablets_index_returns_borrow(tmp_path):
+    # `step e = store[j]` is a borrow of the tablets element, not an
+    # owning copy — so its cleanup is a no-op. Without this, the
+    # binding's scope-exit release would double-free against the
+    # tablets's own release walk.
+    src = (
+        "tablet Entry { key: str }\n"
+        "fn main() -> i32 {\n"
+        "  mut store: tablets[2]Entry\n"
+        "  step _a = store.push(Entry { key: \"a\" + \"b\" })\n"
+        "  step _b = store.push(Entry { key: \"c\" + \"d\" })\n"
+        "  mut round: i64 = 0\n"
+        "  while round < 100 {\n"
+        "    step e = store[0]\n"             # borrowed read
+        "    step f = store[1]\n"
+        "    round = round + 1\n"
+        "  }\n"
+        "  println(store[0].key)\n"
+        "  println(store[1].key)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out = run(src, tmp_path)
+    assert out == b"ab\ncd\n"
+
+
 def test_tablets_len_from_fn_return(tmp_path):
     # Same general case — tablets returned from a fn, with `.len` read
     # off the returned SSA value.

@@ -1784,7 +1784,13 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 )
             )
             transfer_on_tail = None
-            is_borrow_init = isinstance(b.init, (A.Ident, A.Field, A.StringLit))
+            # Indexing a container yields a borrow of the container's
+            # element — same semantic as Ident/Field reads. Registering
+            # cleanup on the binding would double-free against the
+            # container's own release on scope exit.
+            is_borrow_init = isinstance(
+                b.init, (A.Ident, A.Field, A.Index, A.StringLit),
+            )
             if needs_cleanup and not is_borrow_init:
                 assert self.builder is not None
                 cleanup_slot = self._alloca_entry(init_val.type, f"{b.name}.cleanup")
@@ -2289,6 +2295,52 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         finally:
             self.scopes.pop()
             self._cleanup_frames.pop()
+
+    def _is_cleanup_bearing_ty(self, ty: ir.Type) -> bool:
+        """Does this LLVM type hold heap state that needs a release
+        call on scope exit? Used to decide whether a container push /
+        struct-lit field needs to transfer ownership from its Ident
+        source to avoid double-free."""
+        if self._is_str_value(ty):
+            return True
+        if self._tablets_info_for(ty) is not None:
+            return True
+        if (
+            self._struct_fields_for(ty) is not None
+            and self._struct_needs_cleanup(ty)
+        ):
+            return True
+        return False
+
+    def _transfer_cleanup_into_container(self, name: str) -> bool:
+        """Remove the cleanup entry owning `name` — its value is
+        flowing into a long-lived container (tablets push, struct-lit
+        field bound for push, etc.) which takes over ownership. Walks
+        `transfer_on_tail` chains so borrow bindings redirect to their
+        true owners. Returns True if a transfer happened.
+
+        After this runs the caller can still read `name` (its SSA
+        value is unchanged); only the scope-exit release is suppressed,
+        so the container can safely free the bytes without risking a
+        double-free against the caller's frame."""
+        if not self._cleanup_frames:
+            return False
+        try:
+            var = self._lookup(name)
+        except CodegenError:
+            return False
+        entry_name = (
+            var.transfer_on_tail if var.transfer_on_tail else name
+        )
+        # Search all frames — the owning binding may live in an
+        # outer scope (e.g. closed-over Idents that aren't in the
+        # innermost frame).
+        for frame in self._cleanup_frames:
+            for i, (_fn, _ptr, fname) in enumerate(frame):
+                if fname == entry_name:
+                    frame.pop(i)
+                    return True
+        return False
 
     def _transfer_ownership_out(self, name: str) -> None:
         """Remove the cleanup entry that owns the value flowing out via
@@ -3201,11 +3253,20 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 raise CodegenError(
                     f"tablet {e.name!r}: missing field {fname!r}"
                 )
-            fv = self._gen_expr(provided[fname])
+            fexpr = provided[fname]
+            fv = self._gen_expr(fexpr)
             if fv is None:
                 raise CodegenError(
                     f"tablet {e.name!r} field {fname!r}: initializer has no value"
                 )
+            # Ownership transfer: if the field holds a cleanup-bearing
+            # type and the initializer is an Ident naming a locally-
+            # owned binding, take over its cleanup. Without this, the
+            # source binding's scope-exit release would free bytes the
+            # new struct holds, causing a UAF when the struct outlives
+            # the source (e.g. pushed into a long-lived tablets).
+            if isinstance(fexpr, A.Ident) and self._is_cleanup_bearing_ty(fty):
+                self._transfer_cleanup_into_container(fexpr.name)
             value = self.builder.insert_value(value, self._coerce(fv, fty), i)
         return value
 
