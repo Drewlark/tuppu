@@ -1579,6 +1579,17 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 tail_val: ir.Value | None = None
             else:
                 tail_val = self._gen_expr(b.tail)
+            # Ownership transfer on fall-through: if the tail is an Ident
+            # bound in this frame with a heap-owning type, drop its
+            # cleanup entry so the caller receives the live value. Without
+            # this the scope-exit release frees the heap bytes before the
+            # return, leaving the caller with a dangling pointer.
+            if (
+                not self._is_terminated()
+                and tail_val is not None
+                and isinstance(b.tail, A.Ident)
+            ):
+                self._transfer_ownership_out(b.tail.name)
             # Emit cleanups for this frame on fall-through (not on early
             # return — yield emits its own chain before the ret).
             if not self._is_terminated():
@@ -1587,6 +1598,19 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         finally:
             self.scopes.pop()
             self._cleanup_frames.pop()
+
+    def _transfer_ownership_out(self, name: str) -> None:
+        """Remove `name`'s entry from the current cleanup frame, if any.
+        Used when a block's tail expression returns a locally-bound value
+        — ownership flows outward to the caller, so the scope-exit
+        release must not fire."""
+        if not self._cleanup_frames:
+            return
+        frame = self._cleanup_frames[-1]
+        for i, (_fn, _ptr, entry_name) in enumerate(frame):
+            if entry_name == name:
+                frame.pop(i)
+                return
 
     def _emit_frame_cleanups(
         self, frame: list[tuple[ir.Function, ir.Value, str]],

@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **445 tests passing.**
+- **454 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -452,7 +452,7 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 445 passing.
+2. `.venv/bin/pytest` — expect 454 passing.
 3. `git log --oneline -12` — recent timeline: sex Phase 3a/3b,
    struct field mutation, codegen.py split into mixins package,
    elif + did-you-mean, recursive tablets + wedge handles + auto-

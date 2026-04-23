@@ -82,6 +82,19 @@ EXPECTED: dict[str, dict] = {
             b"ends with '.tpu': false\n"
         ),
     },
+    "scribe.tpu":            {
+        "exit": 0,
+        "stdout": (
+            b"Day 1, Eanna Granary:\n"
+            b"Eanna Granary\n"
+            b"Day 1\n"
+            b"barley: 3600 (1 0 0)\n"
+            b"emmer: 150 (2 30)\n"
+            b"sesame: 60 (1 0)\n"
+            b"total items: 3\n"
+            b"Eanna\n"
+        ),
+    },
     "linked_list.tpu":       {
         "exit": 0,
         "stdout": (

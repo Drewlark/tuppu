@@ -1,0 +1,35 @@
+// A scribe's day-tablet. Each line reports a commodity and its count,
+// rendered twice — once in decimal, once in Babylonian sexagesimal —
+// by building the line via str_concat and the typed-to-str
+// conversions. The banner is sliced with Python-style `s[lo:hi]` to
+// pull out the granary's name. Every heap str produced here is freed
+// by the scope-exit cleanup; the 1000-iteration inventory loop in
+// tests/test_string.py::test_nested_concat_inside_call_no_leak
+// proves the shape scales.
+
+fn render(name: str, count: i64) -> str {
+  step sx: sex = count as sex
+  step line0 = str_concat(name, ": ")
+  step line1 = str_concat(line0, int_to_str(count))
+  step line2 = str_concat(line1, " (")
+  step line3 = str_concat(line2, sex_to_str(sx))
+  str_concat(line3, ")")
+}
+
+fn main() -> i32 {
+  step banner = "Day 1, Eanna Granary:"
+  println(banner)
+  // Slice syntax — elided lo and explicit range.
+  println(banner[7:20])
+  println(banner[:5])
+
+  println(render("barley", 3600))
+  println(render("emmer",   150))
+  println(render("sesame",   60))
+
+  // Unbound rvalues consumed directly; the anonymous-cleanup
+  // machinery frees the heap bytes at scope exit.
+  println(str_concat("total items: ", int_to_str(3)))
+  println(str_slice("Eanna Granary", 0, 5))
+  0
+}

@@ -135,6 +135,77 @@ def test_string_as_parameter(tmp_path):
     assert out == b"hi, Drew\n"
 
 
+# --- typed-to-str conversions --------------------------------------------
+
+def test_int_to_str(tmp_path):
+    src = (
+        'fn main() -> i32 {\n'
+        '  println(int_to_str(0))\n'
+        '  println(int_to_str(42))\n'
+        '  println(int_to_str(-9223372036854775807))\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"0\n42\n-9223372036854775807\n"
+
+
+def test_rat_to_str(tmp_path):
+    src = (
+        'fn main() -> i32 {\n'
+        '  println(rat_to_str(rat(3, 4)))\n'
+        '  println(rat_to_str(rat(-7, 2)))\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"3/4\n-7/2\n"
+
+
+def test_sex_to_str_mirrors_print(tmp_path):
+    # sex_to_str must match the Babylonian form emitted by println(s)
+    # so string-built logs read identically to direct prints.
+    src = (
+        'fn main() -> i32 {\n'
+        '  step a = 3600 as sex\n'
+        '  println(a)\n'
+        '  println(sex_to_str(a))\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"1 0 0\n1 0 0\n"
+
+
+def test_bool_to_str(tmp_path):
+    src = (
+        'fn main() -> i32 {\n'
+        '  println(bool_to_str(true))\n'
+        '  println(bool_to_str(false))\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"true\nfalse\n"
+
+
+def test_concat_typed_parts_builds_log_line(tmp_path):
+    # Realistic dynamic-string workflow: assemble a line from mixed
+    # typed pieces via concat + to_str. All intermediates must free
+    # at scope exit.
+    src = (
+        'fn main() -> i32 {\n'
+        '  step name = "answer"\n'
+        '  step piece = str_concat(name, " = ")\n'
+        '  step line = str_concat(piece, int_to_str(42))\n'
+        '  println(line)\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"answer = 42\n"
+
+
 def test_string_as_return_value(tmp_path):
     src = (
         'fn label(tag: i64) -> str {\n'
@@ -188,6 +259,67 @@ def test_mut_str_param_reassign_releases(tmp_path):
     )
     _, out, _ = run(src, tmp_path)
     assert out == b"hi!\nbye!\n"
+
+
+def test_mut_str_returned_as_tail_keeps_ownership(tmp_path):
+    # If a block's tail is an Ident naming a local str binding, the
+    # scope-exit cleanup must NOT free it — the caller receives the
+    # value and owns it. Without the ownership-transfer rule, the heap
+    # bytes get freed inside the callee and the caller sees garbage.
+    src = (
+        'fn build() -> str {\n'
+        '  mut s: str = ""\n'
+        '  s = str_concat(s, "hello")\n'
+        '  s = str_concat(s, ", world")\n'
+        '  s\n'
+        '}\n'
+        'fn main() -> i32 {\n'
+        '  step msg = build()\n'
+        '  println(msg)\n'
+        '  println(msg.len)\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"hello, world\n12\n"
+
+
+def test_step_str_returned_as_tail_keeps_ownership(tmp_path):
+    # Same transfer rule applies to step bindings that hold a heap str.
+    src = (
+        'fn build() -> str {\n'
+        '  step s = str_concat("foo", "bar")\n'
+        '  s\n'
+        '}\n'
+        'fn main() -> i32 {\n'
+        '  println(build())\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"foobar\n"
+
+
+def test_tail_transfer_inside_if_arm(tmp_path):
+    # The transfer happens at every block boundary: if-arm block
+    # returns a locally-bound str, outer block returns the if result.
+    src = (
+        'fn build(flag: bool) -> str {\n'
+        '  if flag {\n'
+        '    step s = str_concat("flag ", "on")\n'
+        '    s\n'
+        '  } else {\n'
+        '    "default"\n'
+        '  }\n'
+        '}\n'
+        'fn main() -> i32 {\n'
+        '  println(build(true))\n'
+        '  println(build(false))\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"flag on\ndefault\n"
 
 
 def test_unbound_concat_does_not_crash(tmp_path):
