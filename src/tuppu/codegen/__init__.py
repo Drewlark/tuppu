@@ -283,9 +283,18 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         if c.name in self.functions:
             raise CodegenError(f"duplicate declaration {c.name!r}")
         c_sym = c.c_name or c.name
-        param_types = [
-            self._colophon_c_ty(self._lower_type(p.type)) for p in c.params
-        ]
+        param_types = []
+        for p in c.params:
+            ty = self._lower_type(p.type)
+            # Mut user-tablet params cross the C ABI by pointer
+            # (mirrors `mut tablets[N]T` semantics; matches how libc
+            # writes through `struct sockaddr *addr`). Non-mut user
+            # tablets pass by value — LLVM lowers them to the
+            # platform's struct-arg ABI.
+            if p.is_mut and self._struct_fields_for(ty) is not None:
+                param_types.append(ty.as_pointer())
+            else:
+                param_types.append(self._colophon_c_ty(ty))
         ret_type = self._colophon_c_ty(
             self._lower_type(c.return_type) if c.return_type
             else ir.VoidType()
@@ -392,12 +401,34 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         call_args: list[ir.Value] = []
         temp_cstrs: list[ir.Value] = []
         for arg_expr, param in zip(arg_exprs, decl.params):
+            param_ty = self._lower_type(param.type)
+            # Mut user-tablet arg: pass the caller's alloca address so
+            # the callee can read/write through it (sockaddr out-params,
+            # mut pointer-to-struct libc conventions). The call site
+            # must be a mut-bound Ident naming a matching struct.
+            if (
+                param.is_mut
+                and self._struct_fields_for(param_ty) is not None
+            ):
+                if not isinstance(arg_expr, A.Ident):
+                    raise CodegenError(
+                        f"colophon {decl.name!r}: mut struct arg must be "
+                        f"a mut-bound Ident, got {type(arg_expr).__name__}"
+                    )
+                var = self._lookup(arg_expr.name)
+                if not var.is_mut or var.value_ty != param_ty:
+                    raise CodegenError(
+                        f"colophon {decl.name!r}: mut struct arg "
+                        f"{arg_expr.name!r} must be a mut binding "
+                        f"of type {param_ty}"
+                    )
+                call_args.append(var.ir_ref)
+                continue
             v = self._gen_expr(arg_expr)
             if v is None:
                 raise CodegenError(
                     f"colophon {decl.name!r} arg has no value"
                 )
-            param_ty = self._lower_type(param.type)
             v = self._coerce(v, param_ty)
             if self._is_str_value(param_ty):
                 cstr = self._str_to_cstr(v)

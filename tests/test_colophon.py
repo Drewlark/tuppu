@@ -112,16 +112,71 @@ def test_colophon_cstr_copies_so_caller_retains_bytes(tmp_path):
 
 # --- error / rejection ----------------------------------------------------
 
-def test_colophon_rejects_struct_arg():
-    # User tablets in colophon signatures will come in the follow-up
-    # landing (for sockaddr_in etc.); first cut only marshalS ints,
-    # bool, and str.
+def test_colophon_accepts_user_tablet_arg(tmp_path):
+    # User tablets pass by value across the C boundary (LLVM handles
+    # the struct-arg ABI). This smoke-tests the shape end-to-end
+    # without needing a real C library: a tablet with identity layout
+    # gets handed to `atoi` via a tiny demo where we only read one
+    # of its fields — here we just compile to IR and check that the
+    # extern declaration has the struct parameter type.
+    ir = compile_to_ir(
+        'tablet Point { x: i64, y: i64 }\n'
+        'colophon fn weird(p: Point) -> i64\n'
+        'fn main() -> i32 { 0 }\n'
+    )
+    # Extern declaration should take a `%"Point"` struct parameter.
+    assert "declare i64 @\"weird\"" in ir or "declare i64 @weird" in ir
+    assert "Point" in ir
+
+
+def test_colophon_rejects_struct_return():
+    # Struct returns across the FFI aren't exposed yet (platform-
+    # dependent layouts for stat-shaped things, ABI quirks we haven't
+    # confronted). Parameters are fine; returns will land later.
     with pytest.raises(CompileError, match="isn't marshalable"):
         compile_to_ir(
             'tablet Point { x: i64, y: i64 }\n'
-            'colophon fn weird(p: Point) -> i64\n'
+            'colophon fn make_point() -> Point\n'
             'fn main() -> i32 { 0 }\n'
         )
+
+
+def test_colophon_tcp_bind_roundtrip(tmp_path):
+    # The payoff test: declare a real sockaddr_in in Tuppu, call
+    # socket + bind + close through raw libc, verify the kernel
+    # accepted our struct layout. macOS-specific sockaddr_in
+    # (sin_len byte up front); on Linux the layout differs and
+    # this test would need a conditional compile story we haven't
+    # built yet.
+    import platform
+    if platform.system() != "Darwin":
+        pytest.skip("sockaddr_in layout assumed macOS-specific here")
+    src = (
+        'tablet sockaddr_in {\n'
+        '  sin_len: u8, sin_family: u8, sin_port: u16,\n'
+        '  sin_addr: u32, sin_zero: u64\n'
+        '}\n'
+        'colophon fn socket(domain: i32, ty: i32, proto: i32) -> i32\n'
+        'colophon fn bind(fd: i32, mut addr: sockaddr_in, addrlen: u32) -> i32\n'
+        'colophon fn close(fd: i32) -> i32\n'
+        'colophon fn htons(val: u16) -> u16\n'
+        'colophon fn htonl(val: u32) -> u32\n'
+        'fn main() -> i32 {\n'
+        '  step fd: i32 = socket(2 as i32, 1 as i32, 0 as i32)\n'
+        '  if fd < (0 as i32) { yield 1 }\n'
+        '  mut addr: sockaddr_in\n'
+        '  addr.sin_len    = 16 as u8\n'
+        '  addr.sin_family = 2 as u8\n'
+        '  addr.sin_port   = htons(0 as u16)\n'
+        '  addr.sin_addr   = htonl(2130706433 as u32)\n'
+        '  addr.sin_zero   = 0 as u64\n'
+        '  step rc: i32 = bind(fd, addr, 16 as u32)\n'
+        '  close(fd)\n'
+        '  if rc == (0 as i32) { 0 } else { 2 }\n'
+        '}\n'
+    )
+    rc, _, _ = run(src, tmp_path)
+    assert rc == 0
 
 
 def test_colophon_name_collision_with_fn():

@@ -1,0 +1,43 @@
+// Raw-libc TCP socket demo: declare `sockaddr_in` as a Tuppu tablet,
+// call `socket` / `bind` / `close` through colophon externs, verify
+// the kernel accepted our struct layout.
+//
+// macOS layout — sin_len byte at offset 0, then sin_family as a u8.
+// Linux's `struct sockaddr_in` has no sin_len and uses a u16
+// sin_family at offset 0; a portable stdlib wrapper would pick the
+// layout conditionally (we don't have that yet).
+//
+// Prints the fd the kernel handed out and the bind return code.
+// bind rc = 0 means success.
+
+tablet sockaddr_in {
+  sin_len: u8, sin_family: u8, sin_port: u16,
+  sin_addr: u32, sin_zero: u64
+}
+
+colophon fn socket(domain: i32, ty: i32, proto: i32) -> i32
+colophon fn bind(fd: i32, mut addr: sockaddr_in, addrlen: u32) -> i32
+colophon fn close(fd: i32) -> i32
+colophon fn htons(val: u16) -> u16
+colophon fn htonl(val: u32) -> u32
+
+fn main() -> i32 {
+  // AF_INET = 2, SOCK_STREAM = 1, default protocol.
+  step fd: i32 = socket(2 as i32, 1 as i32, 0 as i32)
+  if fd < (0 as i32) {
+    println("socket failed")
+    yield 1
+  }
+
+  mut addr: sockaddr_in
+  addr.sin_len    = 16 as u8
+  addr.sin_family = 2 as u8
+  addr.sin_port   = htons(0 as u16)            // ephemeral
+  addr.sin_addr   = htonl(2130706433 as u32)   // 127.0.0.1
+  addr.sin_zero   = 0 as u64
+
+  step rc: i32 = bind(fd, addr, 16 as u32)
+  println("bind rc = ", rc)
+  close(fd)
+  if rc == (0 as i32) { 0 } else { 2 }
+}

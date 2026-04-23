@@ -95,6 +95,10 @@ EXPECTED: dict[str, dict] = {
             b"Eanna\n"
         ),
     },
+    "tcp_bind.tpu":          {
+        "exit": 0,
+        "stdout": b"bind rc = 0\n",
+    },
     "linked_list.tpu":       {
         "exit": 0,
         "stdout": (

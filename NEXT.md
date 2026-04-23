@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **484 tests passing.**
+- **486 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -115,10 +115,14 @@ What works:
   cstr on the way out (freed after the call) and a heap-owned
   Tuppu str on the way back via `strlen + malloc + memcpy`; NULL
   returns yield an empty str. Integer primitives pass through;
-  `bool` widens to `i8` for C-ABI stability. First cut allows
-  ints, bool, and str; user tablets (for e.g. `sockaddr_in`) and
-  opaque handles are the next FFI landings. See
-  `tests/test_colophon.py` — `atoi`, `getenv`, `exit` as proofs.
+  `bool` widens to `i8` for C-ABI stability. **User-tablet args
+  pass by value** (LLVM handles the platform struct-arg ABI), and
+  **`mut` struct args pass by pointer** (mirrors `mut tablets`;
+  used for libc's `struct sockaddr *addr` shape). Struct returns
+  aren't exposed yet (platform-dependent layouts). See
+  `examples/tcp_bind.tpu` for a real-libc TCP `socket` + `bind`
+  +`close` roundtrip with a user-declared `sockaddr_in`, and
+  `tests/test_colophon.py` for the full grid.
 - **`for name in iter { ... }`** — works over `str` (u8 bytes),
   `tablets[N]T`, and comptime tables. Loop variable is step-bound.
 - **Mixed-width int comparisons** promote to the wider type (matches
@@ -504,7 +508,7 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 484 passing.
+2. `.venv/bin/pytest` — expect 486 passing.
 3. `git log --oneline -12` — recent timeline: sex Phase 3a/3b,
    struct field mutation, codegen.py split into mixins package,
    elif + did-you-mean, recursive tablets + wedge handles + auto-

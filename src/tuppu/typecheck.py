@@ -468,15 +468,22 @@ class Checker:
             )
         str_ty = self.structs.get("str")
 
-        def check_ffi_type(ty: Ty, where: str) -> None:
+        def check_ffi_type(ty: Ty, where: str, *, is_return: bool) -> None:
             if _is_int(ty) or isinstance(ty, TyBool):
                 return
             if str_ty is not None and ty == str_ty:
                 return
+            # User tablet: passes by value across the C ABI, or by
+            # pointer when the param is `mut`. Restricted to parameters
+            # here — struct returns across the FFI aren't exposed yet
+            # (most libc fns that return structs do so for 'stat'-
+            # like shapes that are platform-dependent; defer).
+            if isinstance(ty, TyStruct) and not is_return:
+                return
             raise CheckError(
                 f"colophon {c.name!r}: {where} has type {ty}, which isn't "
                 f"marshalable across the C boundary yet (allowed: ints, "
-                f"bool, str)",
+                f"bool, str, and — for parameters — user tablets)",
                 c.line, c.col,
             )
 
@@ -485,13 +492,13 @@ class Checker:
             for p in c.params
         )
         for p, pty in zip(c.params, params):
-            check_ffi_type(pty, f"parameter {p.name!r}")
+            check_ffi_type(pty, f"parameter {p.name!r}", is_return=False)
         ret = (
             self._resolve_type(c.return_type, f"return type of colophon {c.name!r}")
             if c.return_type else UNIT
         )
         if c.return_type is not None:
-            check_ffi_type(ret, "return type")
+            check_ffi_type(ret, "return type", is_return=True)
         self.fns[c.name] = TyFn(params=params, ret=ret)
         # Tracked so codegen can emit extern declarations instead of
         # trying to lower a body.
