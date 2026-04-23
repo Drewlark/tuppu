@@ -99,6 +99,18 @@ EXPECTED: dict[str, dict] = {
         "exit": 0,
         "stdout": b"bind rc = 0\n",
     },
+    "higher_order.tpu":      {
+        "exit": 0,
+        "stdout": (
+            b"sq(1) = 1\n"
+            b"sq(2) = 4\n"
+            b"sq(3) = 9\n"
+            b"cb(1) = 1\n"
+            b"cb(2) = 8\n"
+            b"cb(3) = 27\n"
+            b"incr(41) =42\n"
+        ),
+    },
     "linked_list.tpu":       {
         "exit": 0,
         "stdout": (

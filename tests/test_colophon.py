@@ -194,3 +194,34 @@ def test_colophon_name_collision_with_intrinsic():
             'colophon fn str_concat(a: str, b: str) -> str\n'
             'fn main() -> i32 { 0 }\n'
         )
+
+
+def test_colophon_matching_signature_shares_internal_extern(tmp_path):
+    # A user declaring `write` with the same signature the compiler
+    # uses internally shares the single LLVM extern — both the user's
+    # calls and `println`'s `write(2)` go through the same symbol
+    # without redeclaration issues.
+    src = (
+        'colophon fn write(fd: i32, buf: str, n: i64) -> i64\n'
+        'fn main() -> i32 {\n'
+        '  println("hello from tuppu")\n'
+        '  write(1 as i32, "direct syscall\\n", 15 as i64)\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"hello from tuppu\ndirect syscall\n"
+
+
+def test_colophon_signature_mismatch_with_internal_errors():
+    # User redeclares `write` with a wrong signature — previously this
+    # silently reused the internal extern and miscalled it. Now we
+    # refuse with a clear error pointing at the collision.
+    with pytest.raises(CompileError, match="compiler needs extern"):
+        compile_to_ir(
+            'colophon fn write(x: i32) -> i32\n'
+            'fn main() -> i32 {\n'
+            '  println("trigger write extern")\n'
+            '  0\n'
+            '}\n'
+        )

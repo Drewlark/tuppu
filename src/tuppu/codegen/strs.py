@@ -101,20 +101,17 @@ class StrsMixin:
     def _get_memcpy(self) -> ir.Function:
         if self._memcpy is None:
             i8p = I8.as_pointer()
-            self._memcpy = ir.Function(
-                self.module,
-                ir.FunctionType(i8p, [i8p, i8p, I64]),
-                name="memcpy",
+            self._memcpy = self._get_or_declare_libc(
+                "memcpy", ir.FunctionType(i8p, [i8p, i8p, I64]),
             )
         return self._memcpy
 
     def _get_snprintf(self) -> ir.Function:
         if self._snprintf is None:
             i8p = I8.as_pointer()
-            self._snprintf = ir.Function(
-                self.module,
+            self._snprintf = self._get_or_declare_libc(
+                "snprintf",
                 ir.FunctionType(I32, [i8p, I64, i8p], var_arg=True),
-                name="snprintf",
             )
         return self._snprintf
 

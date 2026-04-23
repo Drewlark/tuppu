@@ -1,0 +1,37 @@
+// First-class function values, no capture. Pass a fn by name to a
+// higher-order helper, store one in a binding, hold one in a struct
+// field. Closures (capturing locals) remain a future pass; this is
+// the minimum expressiveness that unlocks visitor patterns and a
+// stdlib that reads like a modern language.
+
+fn square(x: i64) -> i64 { x * x }
+fn cube(x: i64)   -> i64 { x * x * x }
+fn incr(x: i64)   -> i64 { x + 1 }
+
+// A named "unary op" that bundles a display label with the function.
+tablet UnaryOp {
+  name: str,
+  run:  fn(i64) -> i64
+}
+
+// Apply a fn to every integer in a range, printing `label(i) = run(i)`.
+fn map_print(op: UnaryOp, lo: i64, hi: i64) {
+  mut i: i64 = lo
+  while i < hi {
+    println(op.name, "(", i, ") = ", op.run(i))
+    i = i + 1
+  }
+}
+
+fn main() -> i32 {
+  // Pass a fn by name as an arg to a higher-order helper.
+  step sq: UnaryOp = UnaryOp { name: "sq", run: square }
+  step cb: UnaryOp = UnaryOp { name: "cb", run: cube }
+  map_print(sq, 1, 4)
+  map_print(cb, 1, 4)
+
+  // Store a fn in a local binding and call through it.
+  step op = incr
+  println("incr(41) =", op(41))
+  0
+}

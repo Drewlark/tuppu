@@ -116,15 +116,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
     def _init_runtime_externs(self) -> None:
         """Declare the libc functions our intrinsics lower to."""
         i8ptr = I8.as_pointer()
-        self.printf = ir.Function(
-            self.module,
-            ir.FunctionType(I32, [i8ptr], var_arg=True),
-            name="printf",
+        self.printf = self._get_or_declare_libc(
+            "printf", ir.FunctionType(I32, [i8ptr], var_arg=True),
         )
-        self.scanf = ir.Function(
-            self.module,
-            ir.FunctionType(I32, [i8ptr], var_arg=True),
-            name="scanf",
+        self.scanf = self._get_or_declare_libc(
+            "scanf", ir.FunctionType(I32, [i8ptr], var_arg=True),
         )
         self._malloc: ir.Function | None = None  # lazy
         self._free: ir.Function | None = None
@@ -134,53 +130,62 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         # Colophon decls by Tuppu-level name, for call-site marshaling.
         self._colophon_decls: dict[str, A.ColophonDecl] = {}
 
+    def _get_or_declare_libc(
+        self, name: str, fn_type: ir.FunctionType,
+    ) -> ir.Function:
+        """Declare `name` as an LLVM extern with the given signature,
+        or return the existing declaration if one is already present
+        (e.g. from a user `colophon fn`). Raises if a pre-existing
+        declaration has an incompatible signature — that would
+        silently miscompile calls through it, and the fix is to pick
+        a different Tuppu-side name (C-symbol renames aren't in the
+        syntax yet)."""
+        existing = self.module.globals.get(name)
+        if existing is not None:
+            existing_ty = getattr(existing, "function_type", None)
+            if existing_ty != fn_type:
+                raise CodegenError(
+                    f"compiler needs extern {name!r} with signature "
+                    f"{fn_type}, but the module already has one with "
+                    f"{existing_ty} (likely from a user `colophon fn "
+                    f"{name}(...)` declaration). Rename the colophon."
+                )
+            return existing
+        return ir.Function(self.module, fn_type, name=name)
+
     def _get_malloc(self) -> ir.Function:
         if self._malloc is None:
-            self._malloc = ir.Function(
-                self.module,
-                ir.FunctionType(I8.as_pointer(), [I64]),
-                name="malloc",
+            self._malloc = self._get_or_declare_libc(
+                "malloc", ir.FunctionType(I8.as_pointer(), [I64]),
             )
         return self._malloc
 
     def _get_free(self) -> ir.Function:
         if self._free is None:
-            self._free = ir.Function(
-                self.module,
-                ir.FunctionType(ir.VoidType(), [I8.as_pointer()]),
-                name="free",
+            self._free = self._get_or_declare_libc(
+                "free", ir.FunctionType(ir.VoidType(), [I8.as_pointer()]),
             )
         return self._free
 
     def _get_write(self) -> ir.Function:
         if self._write is None:
-            self._write = ir.Function(
-                self.module,
-                ir.FunctionType(I64, [I32, I8.as_pointer(), I64]),
-                name="write",
+            self._write = self._get_or_declare_libc(
+                "write", ir.FunctionType(I64, [I32, I8.as_pointer(), I64]),
             )
         return self._write
 
     def _get_fflush(self) -> ir.Function:
         if self._fflush is None:
-            self._fflush = ir.Function(
-                self.module,
-                ir.FunctionType(I32, [I8.as_pointer()]),
-                name="fflush",
+            self._fflush = self._get_or_declare_libc(
+                "fflush", ir.FunctionType(I32, [I8.as_pointer()]),
             )
         return self._fflush
 
     def _get_strlen(self) -> ir.Function:
         if self._strlen is None:
-            existing = self.module.globals.get("strlen")
-            if existing is not None:
-                self._strlen = existing
-            else:
-                self._strlen = ir.Function(
-                    self.module,
-                    ir.FunctionType(I64, [I8.as_pointer()]),
-                    name="strlen",
-                )
+            self._strlen = self._get_or_declare_libc(
+                "strlen", ir.FunctionType(I64, [I8.as_pointer()]),
+            )
         return self._strlen
 
     # --- top level ---
@@ -302,6 +307,22 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         fn_type = ir.FunctionType(ret_type, param_types)
         existing = self.module.globals.get(c_sym)
         if existing is not None:
+            # Another declaration (internal runtime helper or a prior
+            # colophon resolved through the same C symbol) already
+            # exists. Refuse to reuse it unless the signatures match —
+            # a silent mismatch would emit correct-looking IR that
+            # miscalls the C function. Users can always pick a
+            # different Tuppu-side name; we reserve an explicit
+            # C-symbol override for a future syntax pass.
+            existing_ty = getattr(existing, "function_type", None)
+            if existing_ty != fn_type:
+                raise CodegenError(
+                    f"colophon {c.name!r} collides with the compiler's "
+                    f"internal {c_sym!r} extern (signature mismatch: "
+                    f"declared {fn_type}, internal {existing_ty}). Pick a "
+                    f"different name — the marshaler would silently "
+                    f"misbehave otherwise."
+                )
             llvm_fn = existing
         else:
             llvm_fn = ir.Function(self.module, fn_type, name=c_sym)
@@ -381,6 +402,41 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         phi.add_incoming(empty, null_bb)
         phi.add_incoming(copied, copy_bb)
         return phi
+
+    def _gen_fn_value_call(
+        self, fn_ptr: ir.Value, fn_ty: ir.FunctionType,
+        arg_exprs: list[A.Expr],
+    ) -> ir.Value | None:
+        """Emit an indirect call through a precomputed fn-pointer value.
+        Arg marshaling mirrors the direct-call path — str gets cap=0
+        borrow, cleanup-bearing structs get field neutering, etc. — so
+        users can't leak or UAF by routing a call through a pointer
+        instead of calling by name."""
+        assert self.builder is not None
+        if len(arg_exprs) != len(fn_ty.args):
+            raise CodegenError(
+                f"fn-value call expects {len(fn_ty.args)} args, "
+                f"got {len(arg_exprs)}"
+            )
+        call_args: list[ir.Value] = []
+        for arg, expected_ty in zip(arg_exprs, fn_ty.args):
+            v = self._gen_expr(arg)
+            if v is None:
+                raise CodegenError("fn-value call arg has no value")
+            coerced = self._coerce(v, expected_ty)
+            if self._is_str_value(expected_ty):
+                self._register_str_rvalue_cleanup(coerced, arg)
+                coerced = self._str_as_borrow(coerced)
+            elif (
+                self._struct_fields_for(expected_ty) is not None
+                and self._struct_needs_cleanup(expected_ty)
+            ):
+                self._register_struct_rvalue_cleanup(
+                    coerced, arg, expected_ty,
+                )
+                coerced = self._struct_as_borrow(coerced, expected_ty)
+            call_args.append(coerced)
+        return self.builder.call(fn_ptr, call_args)
 
     def _gen_colophon_call(
         self, decl: A.ColophonDecl, llvm_fn: ir.Function,
@@ -566,6 +622,13 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             # `*T` at the source level but same LLVM representation.
             elem = self._lower_type(t.element)
             return elem.as_pointer()
+        if isinstance(t, A.TypeFn):
+            param_tys = [self._lower_type(p) for p in t.params]
+            ret_ty = (
+                self._lower_type(t.return_type) if t.return_type
+                else ir.VoidType()
+            )
+            return ir.FunctionType(ret_ty, param_tys).as_pointer()
         raise CodegenError(
             f"complex types not supported in this stage: {type(t).__name__}"
         )
@@ -1948,7 +2011,17 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             and id(e) in self._checker.variant_of_node
         ):
             return self._gen_variant_ctor(e)
-        var = self._lookup(e.name)
+        # If the name isn't in any local scope but IS a declared fn,
+        # evaluate to the LLVM function pointer (first-class value).
+        # Colophons are excluded — the typechecker already rejects
+        # taking their address.
+        try:
+            var = self._lookup(e.name)
+        except CodegenError:
+            fn = self.functions.get(e.name)
+            if fn is not None and e.name not in self._colophon_decls:
+                return fn
+            raise
         assert self.builder is not None
         if var.is_mut:
             return self.builder.load(var.ir_ref, name=e.name)
@@ -2182,9 +2255,39 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                             info, inner, e.callee.name, e.args,
                         )
 
+            # Struct field holding a fn-value: `obj.run(x)` loads the
+            # field (a function pointer) and calls through it. Not a
+            # method dispatch — the callee has no implicit receiver.
+            field_val = self._gen_expr(e.callee)
+            if (
+                field_val is not None
+                and isinstance(field_val.type, ir.PointerType)
+                and isinstance(field_val.type.pointee, ir.FunctionType)
+            ):
+                return self._gen_fn_value_call(
+                    field_val, field_val.type.pointee, e.args,
+                )
+
         if not isinstance(e.callee, A.Ident):
             raise CodegenError("only direct function calls are supported")
         name = e.callee.name
+
+        # Indirect call through a fn-valued local binding —
+        # `step f = foo; f(x)`. Local bindings shadow global fns by
+        # design, so check scopes first and dispatch indirectly when
+        # the binding is a fn pointer.
+        try:
+            local_var = self._lookup(name)
+        except CodegenError:
+            local_var = None
+        if local_var is not None:
+            vty = local_var.value_ty
+            if isinstance(vty, ir.PointerType) and isinstance(
+                vty.pointee, ir.FunctionType
+            ):
+                fn_ptr = self._gen_expr(e.callee)
+                assert fn_ptr is not None
+                return self._gen_fn_value_call(fn_ptr, vty.pointee, e.args)
 
         # Variant constructor call: `Some(x)`, `Circle(r)`, etc.
         # Checker has already resolved this to (seal, variant, type args).

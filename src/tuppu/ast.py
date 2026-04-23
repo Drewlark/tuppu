@@ -64,6 +64,18 @@ class TypeHandle:
     col:  int = _pos()
 
 @dataclass
+class TypeFn:
+    """First-class function type: `fn(T1, T2) -> U`. No environment —
+    these are plain function pointers (capture comes later). Used in
+    param / binding / return annotations; when a bare fn name appears
+    as an expression, its type is this shape."""
+    params: list["TypeExpr"]
+    return_type: "TypeExpr | None"
+    line: int = _pos()
+    col:  int = _pos()
+
+
+@dataclass
 class TypeApply:
     """A parameterized type application like `List<i64>` or `Node<T>`.
     `name` is the user-defined tablet name; `args` is the list of
@@ -76,7 +88,7 @@ class TypeApply:
     line: int = _pos()
     col:  int = _pos()
 
-TypeExpr = Union[TypeName, TypeArray, TypeTablets, TypePointer, TypeHandle, TypeApply]
+TypeExpr = Union[TypeName, TypeArray, TypeTablets, TypePointer, TypeHandle, TypeApply, TypeFn]
 
 
 # --- expressions -------------------------------------------------------------

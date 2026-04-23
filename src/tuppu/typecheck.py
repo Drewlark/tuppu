@@ -648,6 +648,16 @@ class Checker:
         if isinstance(t, A.TypeHandle):
             inner = self._resolve_type(t.element, f"{where} element")
             return TyHandle(element=inner)
+        if isinstance(t, A.TypeFn):
+            params = tuple(
+                self._resolve_type(p, f"{where} fn-type parameter")
+                for p in t.params
+            )
+            ret = (
+                self._resolve_type(t.return_type, f"{where} fn-type return")
+                if t.return_type else UNIT
+            )
+            return TyFn(params=params, ret=ret)
         raise CheckError(
             f"{where}: unsupported type expression",
             getattr(t, "line", 0), getattr(t, "col", 0),
@@ -893,6 +903,29 @@ class Checker:
             # to their seal type rather than "undefined name".
             if e.name in self.variant_lookup:
                 return self._tc_variant_ident(e, expected)
+            # Bare fn name used as an expression = first-class function
+            # value. Its type is the fn signature (TyFn). Local
+            # bindings shadow — if a user wrote `step print = 0`
+            # locally, that wins, which is fine because intrinsics
+            # can't be shadowed and user fn names collide at decl
+            # time.
+            if e.name not in self.scopes[-1] and not any(
+                e.name in s for s in self.scopes
+            ):
+                if e.name in self.fns:
+                    if e.name in self.colophons:
+                        raise CheckError(
+                            f"{e.name!r} is a colophon extern; taking its "
+                            f"address as a value isn't supported yet",
+                            e.line, e.col,
+                        )
+                    if self.fn_type_params.get(e.name):
+                        raise CheckError(
+                            f"{e.name!r} is generic; can't take its address "
+                            f"as a fn value (monomorphize via a call first)",
+                            e.line, e.col,
+                        )
+                    return self.fns[e.name]
             return self._lookup(e.name, e.line, e.col)
         if isinstance(e, A.Unary):     return self._tc_unary(e)
         if isinstance(e, A.Binary):    return self._tc_binary(e)
@@ -1203,6 +1236,19 @@ class Checker:
         if name == "bytes_to_str":
             return self._tc_bytes_to_str(e)
 
+        # Local binding named `name` shadows any global fn. If it's a
+        # fn-value binding (TyFn), do an indirect call through it;
+        # any other type is not callable and errors early.
+        for scope in reversed(self.scopes):
+            if name in scope:
+                bound = scope[name]
+                if not isinstance(bound, TyFn):
+                    raise CheckError(
+                        f"{name!r} has type {bound}, not callable",
+                        e.line, e.col,
+                    )
+                return self._tc_fn_value_call(e, bound)
+
         fn = self.fns.get(name)
         if fn is None:
             raise CheckError(
@@ -1340,6 +1386,26 @@ class Checker:
                 )
         return str_ty
 
+    def _tc_fn_value_call(self, e: A.Call, fn_ty: TyFn) -> Ty:
+        """Typecheck an indirect call through a fn-valued binding —
+        `step f = some_fn; f(args)`. No generics at call time (fn
+        values aren't polymorphic), just arity + param/arg unification
+        against the fn-pointer signature."""
+        if len(fn_ty.params) != len(e.args):
+            raise CheckError(
+                f"fn-value call: signature expects {len(fn_ty.params)} "
+                f"arg(s), got {len(e.args)}",
+                e.line, e.col,
+            )
+        for i, (arg, pty) in enumerate(zip(e.args, fn_ty.params)):
+            at = self._tc_expr(arg, expected=pty)
+            if not _coerces_to(at, pty):
+                raise CheckError(
+                    f"fn-value call: arg {i} has type {at}, expected {pty}",
+                    e.line, e.col,
+                )
+        return fn_ty.ret
+
     def _tc_bytes_to_str(self, e: A.Call) -> Ty:
         str_ty = self.structs.get("str")
         if str_ty is None:
@@ -1393,6 +1459,16 @@ class Checker:
             raise CheckError(
                 f"tablets has no method {method!r}", e.line, e.col,
             )
+
+        # Struct field that happens to be a fn value — `obj.run(x)` is
+        # not a method dispatch but a field-access-then-indirect-call.
+        # Resolve the field's type via the struct registry; if it's a
+        # TyFn, treat the whole expression as a fn-value call.
+        if isinstance(recv_ty, TyStruct):
+            fields = self.struct_fields.get(recv_ty.name, ())
+            for fname, fty in fields:
+                if fname == method and isinstance(fty, TyFn):
+                    return self._tc_fn_value_call(e, fty)
 
         raise CheckError(
             f"method call: {recv_name!r} is {recv_ty}, not a tablets",

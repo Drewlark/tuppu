@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **486 tests passing.**
+- **501 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -123,6 +123,17 @@ What works:
   `examples/tcp_bind.tpu` for a real-libc TCP `socket` + `bind`
   +`close` roundtrip with a user-declared `sockaddr_in`, and
   `tests/test_colophon.py` for the full grid.
+- **First-class function values (no capture)** — a bare fn name is
+  a value of type `fn(params) -> ret`. Pass as arg, store in a
+  binding, reassign through `mut`, return from a fn, hold in a
+  struct field, and call through any of those. Codegen produces
+  an LLVM function-pointer; calls through the pointer reuse the
+  same cap=0 / struct-neutering marshaling as direct calls so
+  there's no ownership escape via the indirect path. Colophons
+  and generic fns can't be taken as values (no monomorphic
+  address to hand out). Closures with environment capture remain
+  a future pass. See `examples/higher_order.tpu`,
+  `tests/test_fn_value.py`.
 - **`for name in iter { ... }`** — works over `str` (u8 bytes),
   `tablets[N]T`, and comptime tables. Loop variable is step-bound.
 - **Mixed-width int comparisons** promote to the wider type (matches
@@ -508,7 +519,7 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 486 passing.
+2. `.venv/bin/pytest` — expect 501 passing.
 3. `git log --oneline -12` — recent timeline: sex Phase 3a/3b,
    struct field mutation, codegen.py split into mixins package,
    elif + did-you-mean, recursive tablets + wedge handles + auto-

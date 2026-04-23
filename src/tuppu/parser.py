@@ -344,6 +344,24 @@ class Parser:
             self.advance()
             element = self.parse_type()
             return _at(t, A.TypePointer(element=element))
+        if t.kind is Tok.FN:
+            # First-class function type: `fn(T1, T2) -> U`. Used as
+            # param / binding / return annotations. No capture: these
+            # are plain function pointers, no environment.
+            self.advance()
+            self.eat(Tok.LPAREN)
+            params: list[A.TypeExpr] = []
+            if not self.check(Tok.RPAREN):
+                params.append(self.parse_type())
+                while self.check(Tok.COMMA):
+                    self.advance()
+                    params.append(self.parse_type())
+            self.eat(Tok.RPAREN)
+            return_type: A.TypeExpr | None = None
+            if self.check(Tok.ARROW):
+                self.advance()
+                return_type = self.parse_type()
+            return _at(t, A.TypeFn(params=params, return_type=return_type))
         raise ParseError(f"expected type, got {t.kind.name}", t.line, t.col)
 
     # --- blocks and statements ---------------------------------------
