@@ -830,7 +830,16 @@ class Checker:
         finally:
             self._active_type_vars = saved
         expected = fn_ty.ret
-        if not _coerces_to(body_ty, expected) and not isinstance(body_ty, TyDiverge):
+        # Unit-returning fn: the body's tail value is discarded, so
+        # any tail type is fine. `fn add_route(mut a: App) { a.routes.
+        # push(r) }` wrote the push call as a tail — push returns a
+        # wedge the user doesn't care about. Previously this errored
+        # with "body produces wedge Route, expected ()"; now we accept
+        # and silently drop the value. Same relaxation spirit as the
+        # if-in-statement-position rule.
+        if isinstance(expected, TyUnit):
+            pass
+        elif not _coerces_to(body_ty, expected) and not isinstance(body_ty, TyDiverge):
             raise CheckError(
                 f"in fn {fn.name!r}: body produces {body_ty}, expected {expected}",
                 fn.line, fn.col,

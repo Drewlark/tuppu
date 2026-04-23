@@ -279,6 +279,21 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             # so indexing and iteration see the actual chunks.
             elif isinstance(p.type, A.TypeVariadicTablets):
                 t = t.as_pointer()
+            # Mut user-struct param — pass by pointer so callee
+            # mutations persist to the caller's storage. Previously
+            # mut structs were pass-by-value, which made
+            # `fn add_route(mut app: App) { app.routes.push(...) }`
+            # silently no-op from the caller's perspective. Matches
+            # the mut-tablets and colophon-mut-struct conventions.
+            # `str` is excluded: it has its own cap-sentinel ownership
+            # model and reassignment-release machinery that assumes
+            # by-value passing with call-site neutering.
+            elif (
+                p.is_mut
+                and self._struct_fields_for(t) is not None
+                and not self._is_str_value(t)
+            ):
+                t = t.as_pointer()
             param_types.append(t)
         ret_type = self._lower_type(fn.return_type) if fn.return_type else ir.VoidType()
         fn_type = ir.FunctionType(ret_type, param_types)
@@ -637,11 +652,19 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                     p.is_mut and self._tablets_info_for(param_decl_ty) is not None
                 )
                 is_variadic = isinstance(p.type, A.TypeVariadicTablets)
-                if is_mut_tablets or is_variadic:
+                is_mut_struct = (
+                    p.is_mut
+                    and self._struct_fields_for(param_decl_ty) is not None
+                    and not self._is_str_value(param_decl_ty)
+                )
+                if is_mut_tablets or is_variadic or is_mut_struct:
                     # Either shape arrives as a pointer to the caller's
-                    # tablets storage; bind the incoming pointer directly
-                    # as the Variable's ir_ref so the body's indexing,
-                    # iteration, and method dispatch walk the real chunks.
+                    # tablets or struct storage; bind the incoming
+                    # pointer directly as the Variable's ir_ref so the
+                    # body's indexing, iteration, field access, and
+                    # method dispatch all work on the caller's actual
+                    # storage. No cleanup registration — the caller
+                    # owns the memory.
                     self.scopes[-1][p.name] = Variable(
                         is_mut=True, ir_ref=arg, value_ty=param_decl_ty,
                     )
@@ -906,6 +929,14 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         for p in decl.params:
             t = self._lower_type(p.type)
             if p.is_mut and self._tablets_info_for(t) is not None:
+                t = t.as_pointer()
+            elif isinstance(p.type, A.TypeVariadicTablets):
+                t = t.as_pointer()
+            elif (
+                p.is_mut
+                and self._struct_fields_for(t) is not None
+                and not self._is_str_value(t)
+            ):
                 t = t.as_pointer()
             param_types.append(t)
         ret_type = (
@@ -2643,6 +2674,38 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                     self._gen_tablets_lit_addr(arg, elem_ty_hint=info.elem_ty),
                 )
                 continue
+            # Mut struct param: expects a pointer to the caller's
+            # struct. Distinguished from a wedge handle (also Struct*
+            # at the LLVM level) by the per-param mut-ness sideband.
+            # The arg must be a mut-bound Ident so we can hand over
+            # the alloca address; literals and step bindings have no
+            # stable address a callee could mutate through. The
+            # callee doesn't register cleanup — caller retains sole
+            # ownership.
+            is_mut_struct_param = (
+                isinstance(expected_ty, ir.PointerType)
+                and self._struct_fields_for(expected_ty.pointee) is not None
+                and self._fn_param_mut.get(name) is not None
+                and i < len(self._fn_param_mut[name])
+                and self._fn_param_mut[name][i]
+            )
+            if is_mut_struct_param:
+                if not isinstance(arg, A.Ident):
+                    raise CodegenError(
+                        f"argument {i} of {name!r}: mut struct param "
+                        f"needs a mut-bound Ident (pass by reference); "
+                        f"got {type(arg).__name__}"
+                    )
+                var = self._lookup(arg.name)
+                if not var.is_mut or var.value_ty != expected_ty.pointee:
+                    raise CodegenError(
+                        f"argument {i} of {name!r}: mut struct param "
+                        f"{arg.name!r} must be a mut binding of type "
+                        f"{expected_ty.pointee}, got "
+                        f"{'mut ' if var.is_mut else 'step '}{var.value_ty}"
+                    )
+                call_args.append(var.ir_ref)
+                continue
             v = self._gen_expr(arg)
             if v is None:
                 raise CodegenError(f"argument {i} of call to {name} has no value")
@@ -3244,6 +3307,24 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             self._emit_dynamic_bounds_trap(idx_i64, length)
             byte_ptr = self.builder.gep(ptr, [idx_i64], inbounds=True)
             return self.builder.load(byte_ptr)
+
+        # Tablets value accessed via struct-field or fn-return — SSA
+        # form. The Ident fast path above only fires for direct
+        # tablets bindings; here we spill to a temp alloca so the
+        # runtime get() call has a pointer to walk. Reads only; writes
+        # would need an lvalue slot rooted at a mut binding.
+        if target is not None:
+            info = self._tablets_info_for(target.type)
+            if info is not None:
+                idx = self._gen_expr(e.index)
+                if idx is None:
+                    raise CodegenError("tablets index has no value")
+                idx = self._coerce(idx, I64)
+                slot = self._alloca_entry(target.type, ".tbls.view")
+                self.builder.store(target, slot)
+                length = self.builder.extract_value(target, 2)
+                self._emit_dynamic_bounds_trap(idx, length)
+                return self.builder.call(info.get, [slot, idx])
 
         raise CodegenError("indexing is only supported on tables, tablets, and str")
 

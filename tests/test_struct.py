@@ -792,7 +792,7 @@ def test_mut_struct_param_caller_retains_heap(tmp_path):
         "  println(r.label)\n"
         "}\n"
         "fn main() -> i32 {\n"
-        "  step r: Row = Row { label: str_concat(\"hi\", \"!\") }\n"
+        "  mut r: Row = Row { label: str_concat(\"hi\", \"!\") }\n"
         "  take(r)\n"
         "  println(r.label)\n"
         "  0\n"
@@ -803,11 +803,12 @@ def test_mut_struct_param_caller_retains_heap(tmp_path):
     assert out == b"hi!\nhi!\n"
 
 
-def test_mut_struct_param_callee_can_reassign(tmp_path):
-    # With the neutering sentinel the callee's cleanup frame still
-    # sees the mut param, so reassigning to a fresh heap-owning
-    # value and then exiting the callee scope releases the new
-    # allocation correctly — caller's original remains untouched.
+def test_mut_struct_param_callee_reassigns_persistently(tmp_path):
+    # Mut struct params now pass by pointer (matching mut tablets and
+    # colophon mut-struct), so the callee's reassignment persists to
+    # the caller. The old value is released via the standard
+    # reassignment path (release old, store new) — caller's eventual
+    # scope-exit release frees the `local` bytes once.
     src = (
         "tablet Row { label: str }\n"
         "fn swap(mut r: Row) {\n"
@@ -815,7 +816,7 @@ def test_mut_struct_param_callee_can_reassign(tmp_path):
         "  println(r.label)\n"
         "}\n"
         "fn main() -> i32 {\n"
-        "  step r: Row = Row { label: str_concat(\"outer\", \"\") }\n"
+        "  mut r: Row = Row { label: str_concat(\"outer\", \"\") }\n"
         "  swap(r)\n"
         "  println(r.label)\n"
         "  0\n"
@@ -823,7 +824,62 @@ def test_mut_struct_param_callee_can_reassign(tmp_path):
     )
     rc, out, _ = run_with_stdlib(src, tmp_path)
     assert rc == 0
-    assert out == b"local\nouter\n"
+    assert out == b"local\nlocal\n"
+
+
+def test_helper_fn_pushes_into_caller_tablets_field(tmp_path):
+    # The webserver-framework pattern: a helper fn takes `mut app: App`
+    # and pushes into `app.routes`. With mut-struct pass-by-pointer,
+    # the caller's `a` sees the pushes. Before: callee got a local
+    # copy, pushes were invisible to the caller.
+    src = (
+        "tablet Route { code: i64 }\n"
+        "tablet App { routes: tablets[8]Route, port: i32 }\n"
+        "fn add_route(mut app: App, code: i64) {\n"
+        "  app.routes.push(Route { code: code })\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  mut a: App\n"
+        "  add_route(a, 1)\n"
+        "  add_route(a, 2)\n"
+        "  add_route(a, 3)\n"
+        "  println(a.routes.len)\n"
+        "  println(a.routes[0].code)\n"
+        "  println(a.routes[2].code)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"3\n1\n3\n"
+
+
+def test_mut_struct_rejects_step_arg():
+    # Step bindings have no stable address to pass; mut struct
+    # requires a caller-side mut binding. Clear error at codegen.
+    with pytest.raises(CompileError, match="mut binding"):
+        compile_to_ir(
+            "tablet Row { n: i64 }\n"
+            "fn take(mut r: Row) { r.n = 1 }\n"
+            "fn main() -> i32 {\n"
+            "  step r: Row = Row { n: 0 }\n"
+            "  take(r)\n"
+            "  0\n"
+            "}\n"
+        )
+
+
+def test_mut_struct_rejects_literal_arg():
+    # Literals have no address — the mut param would have nothing
+    # to mutate that the caller could observe. Rejected.
+    with pytest.raises(CompileError, match="mut-bound Ident"):
+        compile_to_ir(
+            "tablet Row { n: i64 }\n"
+            "fn take(mut r: Row) { r.n = 1 }\n"
+            "fn main() -> i32 {\n"
+            "  take(Row { n: 0 })\n"
+            "  0\n"
+            "}\n"
+        )
 
 
 def test_rvalue_struct_arg_anonymous_cleanup(tmp_path):
