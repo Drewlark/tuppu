@@ -129,13 +129,80 @@ What doesn't yet:
    same rat-path dispatch. Mixed `sex op int` (+/-/*//) also works
    now — int promotes to sex via `__tuppu_int_to_sex`. See
    `::test_sex_div_*` and `::test_sex_mixed_int_*`.
-8. **Language QoL pass** — **Next.** User wants to improve language
-   ergonomics broadly. Possibly break `codegen.py` into multiple
-   files (it's ~2400 lines now).
-9. **Sex/dish Phase 3c** — escape-analysis pass for rat-fallback
-   specialization. Unblocks the future `--strict-dish` flag idea.
-10. **Imports** — cleanup; pay when stdlib grows enough to need
+8. ~~**Language QoL pass**~~ — **done.** Struct field mutation,
+   codegen.py split into a mixins package, elif, did-you-mean
+   suggestions, recursive tablets + wedge handles + auto-release +
+   escape check, tablet/wedge/seal rename.
+9. ~~**Minimal generics**~~ — **done.** `tablet Node<T>`,
+   `fn push<T>(...)`, HM-style inference at call sites and struct
+   literals, lazy monomorphization. `stdlib/list.tpu` rewritten as
+   `List<T>`. See `tests/test_struct.py::test_generic_*`.
+10. **Sum types** — **Next.** Landing the `seal` keyword for Option/
+    Result/ADT shapes, plus minimal pattern matching. Biggest single
+    step toward functional-style code and toward self-hosting. See
+    "Roadmap (agreed 2026-04-22)" below for the full menu.
+11. **Sex/dish Phase 3c** — escape-analysis pass for rat-fallback
+    specialization. Unblocks the future `--strict-dish` flag idea.
+12. **Imports** — cleanup; pay when stdlib grows enough to need
     namespaces.
+
+## Roadmap (agreed 2026-04-22)
+
+Cross-cutting goal: incrementally fold pieces of the compiler into
+Tuppu itself (self-hosting). Minimum viable self-host set: sum types
+(AST shape), closures or fn-as-value (visitors), dynamic strings
+(error messages), maps (symbol tables), file I/O.
+
+Ranked by "unblocks most / lays groundwork for the self-host path":
+
+| Feature                          | Cost    | Unlocks                                       | Notes                                                                        |
+|----------------------------------|---------|-----------------------------------------------|------------------------------------------------------------------------------|
+| **Sum types + pattern matching** | ~6-8 h  | Option, Result, ADTs, AST-shaped data         | `seal` is already reserved. Biggest single step toward self-hosting.         |
+| **Fn-as-value (no capture)**     | ~2-3 h  | Higher-order functions, minimal visitors      | Cheap. Pointers-to-functions, no environment capture.                        |
+| **Full closures (with capture)** | ~4-6 h  | Inline callbacks, state-carrying fns          | Needs a captured-env layout story.                                           |
+| **Overloads (`__repr__`-style)** | ~2-3 h  | Generic `print`, user-extensible operators    | Type-dispatched name resolution. No trait system needed.                     |
+| **Operator overloads**           | +1-2 h  | `a + b` for user types                        | Layers on the same dispatch mechanism as overloads above.                    |
+| **Dynamic strings + slicing**    | ~4-6 h  | `s[i:j]`, concat, real manipulation           | Needs an arena-for-strings story (tablets-backed, auto-release).             |
+| **Maps / hash tables**           | ~4-6 h  | Symbol tables, interning                      | Can be built in Tuppu on top of `tablets`; probably starts as `stdlib/map.tpu`. |
+| **File I/O (read_line, etc.)**   | ~2-4 h  | Real programs, step toward self-hosting input | Libc wrappers via the same extern pattern as `write`/`fflush`.               |
+
+Agreed order (approximate): sum types → fn-as-value → full closures
+→ overloads → operator overloads → dynamic strings → maps → file I/O.
+
+**Sum types design sketch** (to pick up after compact):
+
+```
+seal Option<T> {
+  Some(T),
+  None,
+}
+
+seal Shape {
+  Circle(radius: rat),
+  Square(side: rat),
+}
+
+fn area(s: Shape) -> rat {
+  match s {
+    Circle(r) => r * r * rat(314, 100),
+    Square(s) => s * s,
+  }
+}
+```
+
+- Tagged-union runtime: `{ tag: i8, payload: <union of variants> }` —
+  payload is a `max(sizeof(each variant))`-byte buffer. Identified
+  LLVM type per-seal (same machinery as tablets, different shape).
+- Variant constructors are callable-like: `Some(42)` produces an
+  `Option<i64>`; `None` is a zero-arg constructor.
+- Pattern matching exhaustive over variants. v0.1 scope: no guards,
+  no nested patterns, bindings only at the variant level.
+- Generic seals (`seal Option<T>`) use the same monomorphization
+  machinery as generic tablets.
+
+Skip for v0.1: nested patterns (`Some(Circle(r))`), guards
+(`Some(x) if x > 0`), or-patterns (`Some(1) | Some(2)`). Defer to
+v0.2 if we want real ML-family matching.
 
 ## 1. Future: `impress` reinterpret cast
 
@@ -313,17 +380,21 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 383 passing.
-3. `git log --oneline -8` — timeline: initial import, bundled v0.1
-   features, untrack fun.tpu, sex Phase 1 + ergonomics, sex Phase 2,
-   int→sex + error locations, Phase 3a (rat→sex + native sex*),
-   Phase 3b (native sex/ + mixed sex+int).
-4. Read `SPEC.md` §4.3 for the current sex spec, §14 for non-goals.
-5. **Agreed next task: language QoL pass.** Sex arithmetic is
-   structurally complete through +, -, *, / (native digit-form) and
-   sex+int mixed. User wants to step back and improve general
-   ergonomics next — possibly splitting `codegen.py` (~2400 lines).
-   Phase 3c (escape analysis) is queued behind QoL.
+2. `.venv/bin/pytest` — expect 417 passing.
+3. `git log --oneline -12` — recent timeline: sex Phase 3a/3b,
+   struct field mutation, codegen.py split into mixins package,
+   elif + did-you-mean, recursive tablets + wedge handles + auto-
+   release + escape check, tablet/wedge/seal rename, minimal
+   generics (+ stdlib/list.tpu rewritten to `List<T>`).
+4. Read `SPEC.md` §4.5 (tablets), §4.6 (wedges), §14 (non-goals).
+5. **Agreed next task: sum types.** `seal` is reserved and ready to
+   claim. See "Roadmap (agreed 2026-04-22)" section above for the
+   design sketch (tagged union runtime, variant constructors,
+   exhaustive match — v0.1 scope is flat patterns only).
+   Ultimate goal: fold pieces of the compiler into Tuppu
+   (self-hosting). Min self-host set: sum types → fn-as-value →
+   closures → dynamic strings → maps → file I/O. The full ranked
+   roadmap is in the same section above.
 6. `FUTURE_OPTIMIZATIONS.md` (gitignored) captures design sketches
    for a `--strict-dish` flag, the SEX 20→16 byte shrink, SIMD carry
    in sex_add, and other perf/language ideas. Don't forget on the
