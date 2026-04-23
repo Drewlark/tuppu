@@ -190,7 +190,8 @@ PRIM_TYPES: dict[str, Ty] = {
 INTRINSIC_NAMES = {
     "print", "println", "read_int", "rat",
     "str_concat", "str_slice",
-    "int_to_str", "rat_to_str", "sex_to_str", "bool_to_str",
+    "int_to_str", "sex_to_str",
+    "bytes_to_str",
 }
 
 
@@ -1132,8 +1133,11 @@ class Checker:
         if name in ("str_concat", "str_slice"):
             return self._tc_str_intrinsic(e, name)
 
-        if name in ("int_to_str", "rat_to_str", "sex_to_str", "bool_to_str"):
+        if name in ("int_to_str", "sex_to_str"):
             return self._tc_to_str_intrinsic(e, name)
+
+        if name == "bytes_to_str":
+            return self._tc_bytes_to_str(e)
 
         fn = self.fns.get(name)
         if fn is None:
@@ -1258,17 +1262,10 @@ class Checker:
                 f"{name} takes exactly one argument", e.line, e.col,
             )
         at = self._tc_expr(e.args[0])
-        expected: Ty
         if name == "int_to_str":
             if not _is_int(at):
                 raise CheckError(
                     f"int_to_str: argument must be integer, got {at}",
-                    e.line, e.col,
-                )
-        elif name == "rat_to_str":
-            if not isinstance(at, TyRat):
-                raise CheckError(
-                    f"rat_to_str: argument must be rat, got {at}",
                     e.line, e.col,
                 )
         elif name == "sex_to_str":
@@ -1277,12 +1274,25 @@ class Checker:
                     f"sex_to_str: argument must be sex/dish, got {at}",
                     e.line, e.col,
                 )
-        elif name == "bool_to_str":
-            if not isinstance(at, TyBool):
-                raise CheckError(
-                    f"bool_to_str: argument must be bool, got {at}",
-                    e.line, e.col,
-                )
+        return str_ty
+
+    def _tc_bytes_to_str(self, e: A.Call) -> Ty:
+        str_ty = self.structs.get("str")
+        if str_ty is None:
+            raise CheckError(
+                "bytes_to_str: str type not in scope (stdlib may be missing)",
+                e.line, e.col,
+            )
+        if len(e.args) != 1:
+            raise CheckError(
+                "bytes_to_str takes exactly one argument", e.line, e.col,
+            )
+        at = self._tc_expr(e.args[0])
+        if not isinstance(at, TyTablets) or at.element != U8:
+            raise CheckError(
+                f"bytes_to_str: argument must be tablets[N]u8, got {at}",
+                e.line, e.col,
+            )
         return str_ty
 
     def _tc_method_call(self, e: A.Call) -> Ty:

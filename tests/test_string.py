@@ -151,6 +151,8 @@ def test_int_to_str(tmp_path):
 
 
 def test_rat_to_str(tmp_path):
+    # rat_to_str lives in stdlib/str.tpu — built on top of the native
+    # int_to_str + str_concat.
     src = (
         'fn main() -> i32 {\n'
         '  println(rat_to_str(rat(3, 4)))\n'
@@ -158,7 +160,7 @@ def test_rat_to_str(tmp_path):
         '  0\n'
         '}\n'
     )
-    _, out, _ = run(src, tmp_path)
+    _, out, _ = run_with_stdlib(src, tmp_path)
     assert out == b"3/4\n-7/2\n"
 
 
@@ -178,6 +180,8 @@ def test_sex_to_str_mirrors_print(tmp_path):
 
 
 def test_bool_to_str(tmp_path):
+    # bool_to_str lives in stdlib/str.tpu — returns a borrow of a
+    # literal so there's no allocation.
     src = (
         'fn main() -> i32 {\n'
         '  println(bool_to_str(true))\n'
@@ -185,7 +189,7 @@ def test_bool_to_str(tmp_path):
         '  0\n'
         '}\n'
     )
-    _, out, _ = run(src, tmp_path)
+    _, out, _ = run_with_stdlib(src, tmp_path)
     assert out == b"true\nfalse\n"
 
 
@@ -509,6 +513,141 @@ def test_stdlib_index_of(tmp_path):
     )
     _, out, _ = run_with_stdlib(src, tmp_path)
     assert out == b"2\n-1\n"
+
+
+def test_stdlib_find(tmp_path):
+    src = (
+        'fn main() -> i32 {\n'
+        '  println(str_find("hello, world", "world"))\n'   # 7
+        '  println(str_find("hello", "hello"))\n'           # 0
+        '  println(str_find("hello", ""))\n'                # 0 (empty matches at start)
+        '  println(str_find("hello", "xyz"))\n'             # -1
+        '  println(str_find("ab", "abc"))\n'                # -1 (too short)
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run_with_stdlib(src, tmp_path)
+    assert out == b"7\n0\n0\n-1\n-1\n"
+
+
+def test_stdlib_contains(tmp_path):
+    src = (
+        'fn main() -> i32 {\n'
+        '  println(str_contains("hello, world", "world"))\n'   # true
+        '  println(str_contains("hello", "xyz"))\n'            # false
+        '  println(str_contains("hello", ""))\n'               # true
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run_with_stdlib(src, tmp_path)
+    assert out == b"true\nfalse\ntrue\n"
+
+
+def test_bytes_to_str_single_chunk(tmp_path):
+    # Build a short byte buffer, flatten it — fits in one chunk.
+    src = (
+        'fn main() -> i32 {\n'
+        '  mut buf: tablets[64]u8\n'
+        '  buf.push(72 as u8)\n'   # H
+        '  buf.push(105 as u8)\n'  # i
+        '  println(bytes_to_str(buf))\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"Hi\n"
+
+
+def test_bytes_to_str_empty(tmp_path):
+    src = (
+        'fn main() -> i32 {\n'
+        '  mut buf: tablets[64]u8\n'
+        '  step s = bytes_to_str(buf)\n'
+        '  println(s.len)\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"0\n"
+
+
+def test_bytes_to_str_spans_chunks(tmp_path):
+    # Chunk size is 4 here, push 10 bytes — forces the intrinsic to
+    # walk at least three nodes and memcpy each chunk's used bytes.
+    src = (
+        'fn main() -> i32 {\n'
+        '  mut buf: tablets[4]u8\n'
+        '  mut i: i64 = 0\n'
+        '  while i < 10 {\n'
+        '    buf.push((65 + i) as u8)\n'   # A..J
+        '    i = i + 1\n'
+        '  }\n'
+        '  println(bytes_to_str(buf))\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"ABCDEFGHIJ\n"
+
+
+def test_bytes_to_str_rejects_non_u8():
+    with pytest.raises(CompileError, match="tablets\\[N\\]u8"):
+        compile_to_ir(
+            'fn main() -> i32 {\n'
+            '  mut t: tablets[4]i64\n'
+            '  t.push(1)\n'
+            '  println(bytes_to_str(t))\n'
+            '  0\n'
+            '}\n'
+        )
+
+
+def test_str_repeat_linear_on_large_n(tmp_path):
+    # Repeat a 10-byte string 5000 times — ~50KB of output. A
+    # quadratic implementation would take multiple seconds and
+    # allocate gigabytes; the linear tablets-backed version should
+    # finish under a second. We only assert correctness here; the
+    # stress is a bounded smoke check.
+    src = (
+        'fn main() -> i32 {\n'
+        '  step s = str_repeat("0123456789", 5000)\n'
+        '  println(s.len)\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run_with_stdlib(src, tmp_path)
+    assert out == b"50000\n"
+
+
+def test_stdlib_repeat(tmp_path):
+    src = (
+        'fn main() -> i32 {\n'
+        '  println(str_repeat("ab", 3))\n'
+        '  println(str_repeat("x", 0))\n'        # empty
+        '  println(str_repeat("-", 5))\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run_with_stdlib(src, tmp_path)
+    assert out == b"ababab\n\n-----\n"
+
+
+def test_stdlib_repeat_no_leak(tmp_path):
+    # str_repeat does O(n) allocations per call. Call it many times;
+    # every intermediate must free at scope exit.
+    src = (
+        'fn main() -> i32 {\n'
+        '  mut i: i64 = 0\n'
+        '  while i < 200 {\n'
+        '    println(str_repeat("ab", 5))\n'
+        '    i = i + 1\n'
+        '  }\n'
+        '  0\n'
+        '}\n'
+    )
+    rc, out, _ = run_with_stdlib(src, tmp_path)
+    assert rc == 0
+    assert out.count(b"ababababab\n") == 200
 
 
 def test_stdlib_is_empty(tmp_path):

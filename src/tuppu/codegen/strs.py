@@ -33,8 +33,8 @@ from llvmlite import ir
 
 from ._common import (
     CodegenError,
-    I1, I8, I32, I64,
-    RAT, SEX,
+    I8, I32, I64,
+    SEX,
     SEX_IDX_DIGITS, SEX_IDX_RADIX, SEX_IDX_COUNT, SEX_IDX_SIGN,
 )
 
@@ -274,62 +274,131 @@ class StrsMixin:
         self._int_to_str = fn
         return fn
 
-    def _get_rat_to_str(self) -> ir.Function:
-        """`__tuppu_rat_to_str(r: rat) -> str`. Formats as `num/den`."""
-        if self._rat_to_str is not None:
-            return self._rat_to_str
-        str_ty = self._str_ty()
-        fn = ir.Function(
-            self.module,
-            ir.FunctionType(str_ty, [RAT]),
-            name="__tuppu_rat_to_str",
-        )
-        fn.args[0].name = "r"
-        entry = fn.append_basic_block("entry")
-        b = ir.IRBuilder(entry)
-        BUF = 48
-        raw = b.call(self._get_malloc(), [ir.Constant(I64, BUF)])
-        num = b.extract_value(fn.args[0], 0)
-        den = b.extract_value(fn.args[0], 1)
-        fmt = self._bare_str_ptr(b, b"%lld/%lld")
-        written = b.call(
-            self._get_snprintf(),
-            [raw, ir.Constant(I64, BUF), fmt, num, den],
-        )
-        length = b.sext(written, I64)
-        out = self._str_build_value_in(b, raw, length, length)
-        b.ret(out)
-        self._rat_to_str = fn
-        return fn
+    # bool_to_str and rat_to_str used to live here as native helpers.
+    # They moved to stdlib/str.tpu once the language could express them
+    # (bool: borrow-two-literals via if/else; rat: int_to_str + concat).
+    # Keeping the surface functions in Tuppu is a small down-payment on
+    # the self-host path — native helpers stay for things that need heap
+    # allocation or internal-field digit decomposition.
 
-    def _get_bool_to_str(self) -> ir.Function:
-        """`__tuppu_bool_to_str(b: i1) -> str`. Returns a fresh heap
-        copy (not a borrowed view of a static "true" / "false") so
-        the cleanup path treats it uniformly with other to_str outputs."""
-        if self._bool_to_str is not None:
-            return self._bool_to_str
+    # --- tablets[N]u8 → str -------------------------------------------
+
+    def _get_bytes_to_str(self, N: int) -> ir.Function:
+        """`__tuppu_bytes_to_str_N(t: tablets_ty) -> str`. Flatten a
+        `tablets[N]u8` into a heap-owned str. Walks the chunk chain
+        twice: first to sum `used` across all nodes (total length),
+        then to memcpy each node's `used` bytes into a fresh buffer
+        at a running offset. Result is heap-owned (cap > 0); caller's
+        cleanup frame releases it at scope exit.
+
+        Per-N monomorph because the chunk layout
+        `{[N x u8], used: i64, next: Node*}` bakes N into the GEP
+        indices. Keyed off the tablets helper cache so we share the
+        node type with `_get_tablets`."""
+        info = self._get_tablets(N, I8)
+        cache = getattr(self, "_bytes_to_str_cache", None)
+        if cache is None:
+            cache = {}
+            self._bytes_to_str_cache = cache
+        fn = cache.get(N)
+        if fn is not None:
+            return fn
+
+        tablets_ty = info.tablets_ty
+        node_ty = info.node_ty
         str_ty = self._str_ty()
+
         fn = ir.Function(
             self.module,
-            ir.FunctionType(str_ty, [I1]),
-            name="__tuppu_bool_to_str",
+            ir.FunctionType(str_ty, [tablets_ty]),
+            name=f"__tuppu_bytes_to_str_{N}",
         )
-        entry = fn.append_basic_block("entry")
+        fn.args[0].name = "t"
+        tablets_val = fn.args[0]
+
+        ZERO_I32 = ir.Constant(I32, 0)
+        null_node = ir.Constant(node_ty.as_pointer(), None)
+
+        entry     = fn.append_basic_block("entry")
+        sum_loop  = fn.append_basic_block("sum.loop")
+        sum_body  = fn.append_basic_block("sum.body")
+        sum_done  = fn.append_basic_block("sum.done")
+        copy_loop = fn.append_basic_block("copy.loop")
+        copy_body = fn.append_basic_block("copy.body")
+        copy_done = fn.append_basic_block("copy.done")
+
         b = ir.IRBuilder(entry)
-        true_ptr = self._bare_str_ptr(b, b"true")
-        false_ptr = self._bare_str_ptr(b, b"false")
-        chosen_ptr = b.select(fn.args[0], true_ptr, false_ptr)
-        chosen_len = b.select(
-            fn.args[0], ir.Constant(I64, 4), ir.Constant(I64, 5),
+        # Extract head from the value-form tablets struct.
+        head = b.extract_value(tablets_val, 0)
+        b.branch(sum_loop)
+
+        # Pass 1: sum total bytes across the chain.
+        b.position_at_end(sum_loop)
+        cur_phi = b.phi(node_ty.as_pointer(), "cur")
+        total_phi = b.phi(I64, "total")
+        cur_phi.add_incoming(head, entry)
+        total_phi.add_incoming(ir.Constant(I64, 0), entry)
+        at_end = b.icmp_signed("==", cur_phi, null_node)
+        b.cbranch(at_end, sum_done, sum_body)
+
+        b.position_at_end(sum_body)
+        used_addr = b.gep(
+            cur_phi, [ZERO_I32, ir.Constant(I32, 1)], inbounds=True,
         )
-        alloc_size = b.add(chosen_len, ir.Constant(I64, 1))
+        used = b.load(used_addr)
+        new_total = b.add(total_phi, used)
+        next_addr = b.gep(
+            cur_phi, [ZERO_I32, ir.Constant(I32, 2)], inbounds=True,
+        )
+        next_node = b.load(next_addr)
+        cur_phi.add_incoming(next_node, sum_body)
+        total_phi.add_incoming(new_total, sum_body)
+        b.branch(sum_loop)
+
+        b.position_at_end(sum_done)
+        total = total_phi
+        alloc_size = b.add(total, ir.Constant(I64, 1))
         raw = b.call(self._get_malloc(), [alloc_size])
-        b.call(self._get_memcpy(), [raw, chosen_ptr, chosen_len])
-        end = b.gep(raw, [chosen_len], inbounds=True)
-        b.store(ir.Constant(I8, 0), end)
-        out = self._str_build_value_in(b, raw, chosen_len, chosen_len)
+        b.branch(copy_loop)
+
+        # Pass 2: walk again, memcpy each chunk's `used` bytes into
+        # `raw` at the running offset.
+        b.position_at_end(copy_loop)
+        copy_cur_phi = b.phi(node_ty.as_pointer(), "cur")
+        offset_phi = b.phi(I64, "offset")
+        copy_cur_phi.add_incoming(head, sum_done)
+        offset_phi.add_incoming(ir.Constant(I64, 0), sum_done)
+        done = b.icmp_signed("==", copy_cur_phi, null_node)
+        b.cbranch(done, copy_done, copy_body)
+
+        b.position_at_end(copy_body)
+        used2 = b.load(b.gep(
+            copy_cur_phi, [ZERO_I32, ir.Constant(I32, 1)], inbounds=True,
+        ))
+        items_ptr = b.gep(
+            copy_cur_phi, [ZERO_I32, ZERO_I32, ir.Constant(I64, 0)],
+            inbounds=True,
+        )
+        dst = b.gep(raw, [offset_phi], inbounds=True)
+        b.call(self._get_memcpy(), [dst, items_ptr, used2])
+        next_node2 = b.load(b.gep(
+            copy_cur_phi, [ZERO_I32, ir.Constant(I32, 2)], inbounds=True,
+        ))
+        new_offset = b.add(offset_phi, used2)
+        copy_cur_phi.add_incoming(next_node2, copy_body)
+        offset_phi.add_incoming(new_offset, copy_body)
+        b.branch(copy_loop)
+
+        b.position_at_end(copy_done)
+        # Trailing NUL (belt and suspenders, mirrors str_concat).
+        b.store(
+            ir.Constant(I8, 0),
+            b.gep(raw, [total], inbounds=True),
+        )
+        out = self._str_build_value_in(b, raw, total, total)
         b.ret(out)
-        self._bool_to_str = fn
+
+        cache[N] = fn
         return fn
 
     # --- sex → str (Babylonian form, mirrors __tuppu_sex_print) -------

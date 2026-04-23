@@ -1,8 +1,18 @@
-// Byte-level string utilities for `str` (the built-in `tablet str { ptr: *u8, len: i64 }`).
+// Helpers for `str` — the built-in `{ ptr: *u8, len: i64, cap: i64 }`
+// tablet with the cap-sentinel ownership rule (cap == 0 borrow,
+// cap > 0 heap-owned; __tuppu_str_release frees only when owned).
 //
-// All functions operate on the existing bytes behind a `str` — no allocation,
-// no copying. Anything that *produces* a new string (concat, slice, to_upper)
-// is deferred until we commit to an allocation strategy for dynamic strings.
+// The byte-level helpers here never allocate — they inspect the bytes
+// behind a `str` via indexing. The producers (`str_repeat`,
+// `bool_to_str`, `rat_to_str`) build new heap-owned strings on top of
+// the native intrinsics `str_concat` / `int_to_str`; every
+// intermediate gets freed at scope exit by the anonymous-cleanup
+// machinery.
+//
+// Notation conventions here try to keep the Tuppu feel:
+// `yield` is early-return, `mut` is alloca-backed, `step` is SSA.
+
+// --- boolean checks --------------------------------------------------------
 
 fn str_is_empty(s: str) -> bool {
   s.len == 0
@@ -47,4 +57,76 @@ fn str_index_of(s: str, b: u8) -> i64 {
     i = i + 1
   }
   -1
+}
+
+// Index of first occurrence of substring `sub` in `s`, or -1 if absent.
+// Reads all `sub.len` bytes per candidate position rather than bailing
+// early — Tuppu's `&&` isn't short-circuit yet, and the outer bound
+// `s.len - sub.len + 1` keeps every byte read in range.
+fn str_find(s: str, sub: str) -> i64 {
+  if sub.len == 0 { yield 0 }
+  if s.len < sub.len { yield -1 }
+  step limit: i64 = s.len - sub.len + 1
+  mut i: i64 = 0
+  while i < limit {
+    mut matched: bool = true
+    mut j: i64 = 0
+    while j < sub.len {
+      if s[i + j] != sub[j] { matched = false }
+      j = j + 1
+    }
+    if matched { yield i }
+    i = i + 1
+  }
+  -1
+}
+
+fn str_contains(s: str, sub: str) -> bool {
+  str_find(s, sub) != -1
+}
+
+// --- growable byte buffers (a.k.a. str_buf) -------------------------------
+//
+// A `mut tablets[64]u8` is the growable byte buffer. Each `.push(b)` is
+// amortized O(1); `bytes_to_str(buf)` flattens the chain into a
+// heap-owned str in a single pass. Combined cost of building an n-byte
+// string: O(n) — no quadratic-rebuild trap.
+//
+// The N = 64 chunk size is a stdlib convention; a user wanting a
+// different size picks their own `tablets[N]u8` and calls the same
+// intrinsics directly.
+
+fn str_buf_append(mut buf: tablets[64]u8, s: str) {
+  mut i: i64 = 0
+  while i < s.len {
+    buf.push(s[i])
+    i = i + 1
+  }
+}
+
+// --- producers (heap-owned results) ---------------------------------------
+
+// Repeat `s` `n` times — empty string for `n <= 0`. O(s.len · n)
+// total via the tablets-backed buffer — each push is amortized O(1)
+// and the final flatten is a single pass.
+fn str_repeat(s: str, n: i64) -> str {
+  mut buf: tablets[64]u8
+  mut i: i64 = 0
+  while i < n {
+    str_buf_append(buf, s)
+    i = i + 1
+  }
+  bytes_to_str(buf)
+}
+
+// Literal borrows — no allocation, release is a no-op on cap=0.
+fn bool_to_str(b: bool) -> str {
+  if b { "true" } else { "false" }
+}
+
+// Formats as "num/den" — leverages the native int_to_str and lets
+// the concat machinery own the joined buffer.
+fn rat_to_str(r: rat) -> str {
+  step left = str_concat(int_to_str(r.num), "/")
+  str_concat(left, int_to_str(r.den))
 }

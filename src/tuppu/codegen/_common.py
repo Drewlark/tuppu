@@ -83,8 +83,14 @@ class TabletsInfo:
 # "rat" is both a type and a construction intrinsic (rat(num, den) -> rat).
 INTRINSICS: frozenset[str] = frozenset({
     "print", "println", "read_int", "rat",
-    # Dynamic-string intrinsics: all return heap-owned `str` values
-    # which the caller's cleanup frame releases at scope exit.
+    # Dynamic-string intrinsics that return heap-owned `str` values.
+    # Only the ones requiring native support (heap allocation or
+    # internal-field digit decomposition) live here; `bool_to_str`
+    # and `rat_to_str` are expressible in Tuppu itself, so they
+    # moved to stdlib/str.tpu.
     "str_concat", "str_slice",
-    "int_to_str", "rat_to_str", "sex_to_str", "bool_to_str",
+    "int_to_str", "sex_to_str",
+    # Flatten a tablets[N]u8 into a heap-owned str — underpins the
+    # growable str_buf pattern without a quadratic-rebuild trap.
+    "bytes_to_str",
 })

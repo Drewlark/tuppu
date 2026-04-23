@@ -63,9 +63,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         self._str_concat: ir.Function | None = None
         self._str_slice: ir.Function | None = None
         self._int_to_str: ir.Function | None = None
-        self._rat_to_str: ir.Function | None = None
         self._sex_to_str: ir.Function | None = None
-        self._bool_to_str: ir.Function | None = None
         self._memcpy: ir.Function | None = None
         self._snprintf: ir.Function | None = None
         # table name -> (global array, length, lo bound, element LLVM type)
@@ -1784,14 +1782,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             return self._gen_str_slice_call(e.args)
         if name == "int_to_str":
             return self._gen_to_str_call(e.args, self._get_int_to_str(), I64)
-        if name == "rat_to_str":
-            from ._common import RAT as _RAT
-            return self._gen_to_str_call(e.args, self._get_rat_to_str(), _RAT)
         if name == "sex_to_str":
             from ._common import SEX as _SEX
             return self._gen_to_str_call(e.args, self._get_sex_to_str(), _SEX)
-        if name == "bool_to_str":
-            return self._gen_to_str_call(e.args, self._get_bool_to_str(), I1)
+        if name == "bytes_to_str":
+            return self._gen_bytes_to_str_call(e.args)
 
         # Generic fn call: look up the concrete type args inferred by
         # the checker and dispatch to (emitting if necessary) the
@@ -1965,6 +1960,24 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         self._register_str_rvalue_cleanup(a, args[0])
         self._register_str_rvalue_cleanup(b, args[1])
         return self.builder.call(self._get_str_concat(), [a, b])
+
+    def _gen_bytes_to_str_call(self, args: list[A.Expr]) -> ir.Value:
+        """Lower `bytes_to_str(t)` — flatten a `tablets[N]u8` into a
+        heap-owned str via the per-N monomorph. The arg is evaluated
+        by value; for a mut tablets Ident that's `load(alloca)`, which
+        hands the intrinsic the current {head, tail, len} metadata."""
+        assert self.builder is not None
+        if len(args) != 1:
+            raise CodegenError("bytes_to_str takes exactly one argument")
+        v = self._gen_expr(args[0])
+        if v is None:
+            raise CodegenError("bytes_to_str argument has no value")
+        info = self._tablets_info_for(v.type)
+        if info is None or info.elem_ty != I8:
+            raise CodegenError(
+                f"bytes_to_str: argument must be tablets[N]u8, got {v.type}"
+            )
+        return self.builder.call(self._get_bytes_to_str(info.N), [v])
 
     def _gen_str_slice_call(self, args: list[A.Expr]) -> ir.Value:
         assert self.builder is not None

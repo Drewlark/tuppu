@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **454 tests passing.**
+- **463 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -39,8 +39,20 @@ What works:
   survive). Python-style slice syntax `s[lo:hi]`, `s[:hi]`, `s[lo:]`,
   `s[:]` lowers to `__tuppu_str_slice` with elided bounds defaulting
   to `0` / `s.len`; bounds-checked, copies into a fresh heap str.
-  Stdlib `str_eq`/`str_starts_with`/`str_ends_with`/
-  `str_is_empty`/`str_index_of`.
+  **Ownership transfers on tail return** — a block whose trailing
+  expression is an Ident naming a local heap-owned binding
+  deregisters that entry from the scope-exit cleanup, so the caller
+  receives the live value instead of a dangling ptr.
+  **Growable byte buffer (a.k.a. str_buf)** — a `mut tablets[64]u8`
+  accumulates bytes via the amortized-O(1) `push`, then
+  `bytes_to_str(buf)` flattens the chain into a fresh heap str in
+  one pass. Total cost to build an n-byte string is O(n); no
+  quadratic-rebuild trap. `stdlib/str_buf_append` wraps the common
+  "append a str's bytes" shape. Stdlib `str_eq`/`str_starts_with`/
+  `str_ends_with`/`str_is_empty`/`str_index_of`/`str_find`/
+  `str_contains`/`str_repeat`/`bool_to_str`/`rat_to_str`
+  (last two were native, migrated to Tuppu now that the language
+  can express them).
 - Raw pointer type `*T` — type-only, no expression-level ops.
 - **Recursive structs** via identified LLVM types. `wedge Node {
   next: wedge Node }` works, including mutually-recursive pairs.
@@ -452,7 +464,7 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 454 passing.
+2. `.venv/bin/pytest` — expect 463 passing.
 3. `git log --oneline -12` — recent timeline: sex Phase 3a/3b,
    struct field mutation, codegen.py split into mixins package,
    elif + did-you-mean, recursive tablets + wedge handles + auto-
