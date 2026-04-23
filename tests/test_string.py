@@ -240,6 +240,77 @@ def test_mut_str_param_release_is_wired(tmp_path):
     assert "__tuppu_str_release" in ir
 
 
+def test_slice_syntax_basic(tmp_path):
+    src = (
+        'fn main() -> i32 {\n'
+        '  step s = "hello, world"\n'
+        '  println(s[0:5])\n'
+        '  println(s[7:12])\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"hello\nworld\n"
+
+
+def test_slice_syntax_elided_bounds(tmp_path):
+    src = (
+        'fn main() -> i32 {\n'
+        '  step s = "hello"\n'
+        '  println(s[:3])\n'
+        '  println(s[2:])\n'
+        '  println(s[:])\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"hel\nllo\nhello\n"
+
+
+def test_slice_of_concat_no_leak(tmp_path):
+    # Slicing an rvalue: the heap bytes from str_concat must be
+    # registered for cleanup alongside the slice result so neither
+    # leaks across the iteration.
+    src = (
+        'fn main() -> i32 {\n'
+        '  mut i: i64 = 0\n'
+        '  while i < 500 {\n'
+        '    println(str_concat("foo", "bar")[1:5])\n'
+        '    i = i + 1\n'
+        '  }\n'
+        '  0\n'
+        '}\n'
+    )
+    rc, out, _ = run(src, tmp_path)
+    assert rc == 0
+    assert out.count(b"ooba\n") == 500
+
+
+def test_slice_bounds_trap(tmp_path):
+    # Out-of-range hi should trap at runtime via __tuppu_str_slice's check.
+    src = (
+        'fn main() -> i32 {\n'
+        '  step s = "hi"\n'
+        '  println(s[0:99])\n'
+        '  0\n'
+        '}\n'
+    )
+    binary = compile_to_binary(src, tmp_path, name="prog")
+    r = subprocess.run([str(binary)], capture_output=True)
+    assert r.returncode != 0
+
+
+def test_slice_non_str_rejected():
+    with pytest.raises(CompileError, match="slice syntax is only supported on str"):
+        compile_to_ir(
+            'fn main() -> i32 {\n'
+            '  mut t: tablets[4]i64\n'
+            '  t[0:2]\n'
+            '  0\n'
+            '}\n'
+        )
+
+
 def test_str_rvalue_temp_release_is_wired(tmp_path):
     # `println(str_concat(a, b))` must register an anonymous cleanup for
     # the concat result — the IR should show at least one release call

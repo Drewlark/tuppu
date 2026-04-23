@@ -837,6 +837,7 @@ class Checker:
         if isinstance(e, A.Call):      return self._tc_call(e, expected)
         if isinstance(e, A.Field):     return self._tc_field(e)
         if isinstance(e, A.Index):     return self._tc_index(e)
+        if isinstance(e, A.Slice):     return self._tc_slice(e)
         if isinstance(e, A.Cast):      return self._tc_cast(e)
         if isinstance(e, A.StructLit): return self._tc_struct_lit(e)
         if isinstance(e, A.Block):     return self._tc_block(e, expected=expected)
@@ -1473,6 +1474,25 @@ class Checker:
         raise CheckError(
             f"cannot index into {target_ty}", e.line, e.col,
         )
+
+    def _tc_slice(self, e: A.Slice) -> Ty:
+        target_ty = self._tc_expr(e.target)
+        str_ty = self.structs.get("str")
+        if str_ty is None or target_ty != str_ty:
+            raise CheckError(
+                f"slice syntax is only supported on str, got {target_ty}",
+                e.line, e.col,
+            )
+        for label, bound in (("lo", e.lo), ("hi", e.hi)):
+            if bound is None:
+                continue
+            bt = self._tc_expr(bound)
+            if not _is_int(bt):
+                raise CheckError(
+                    f"slice {label} bound must be integer, got {bt}",
+                    e.line, e.col,
+                )
+        return str_ty
 
     def _tc_cast(self, e: A.Cast) -> Ty:
         src = self._tc_expr(e.value)

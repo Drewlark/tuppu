@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **440 tests passing.**
+- **445 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -36,7 +36,10 @@ What works:
   the consumer site so heap bytes are freed at the surrounding
   scope's exit — no leaks in tight loops. `fn f(s: str)`, `s.len`,
   `s[i]`, `print(s)`/`println(s)` via `write(2)` (embedded NULs
-  survive). Stdlib `str_eq`/`str_starts_with`/`str_ends_with`/
+  survive). Python-style slice syntax `s[lo:hi]`, `s[:hi]`, `s[lo:]`,
+  `s[:]` lowers to `__tuppu_str_slice` with elided bounds defaulting
+  to `0` / `s.len`; bounds-checked, copies into a fresh heap str.
+  Stdlib `str_eq`/`str_starts_with`/`str_ends_with`/
   `str_is_empty`/`str_index_of`.
 - Raw pointer type `*T` — type-only, no expression-level ops.
 - **Recursive structs** via identified LLVM types. `wedge Node {
@@ -449,7 +452,7 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 440 passing.
+2. `.venv/bin/pytest` — expect 445 passing.
 3. `git log --oneline -12` — recent timeline: sex Phase 3a/3b,
    struct field mutation, codegen.py split into mixins package,
    elif + did-you-mean, recursive tablets + wedge handles + auto-

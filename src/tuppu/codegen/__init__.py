@@ -1452,6 +1452,8 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             return self._gen_field(e)
         if isinstance(e, A.Index):
             return self._gen_index(e)
+        if isinstance(e, A.Slice):
+            return self._gen_slice(e)
         if isinstance(e, A.Ident):
             return self._gen_ident(e)
         if isinstance(e, A.Block):
@@ -2162,6 +2164,39 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             return self.builder.load(byte_ptr)
 
         raise CodegenError("indexing is only supported on tables, tablets, and str")
+
+    def _gen_slice(self, e: A.Slice) -> ir.Value:
+        """Lower `s[lo:hi]` (and its elided variants) to a call into
+        `__tuppu_str_slice`. Missing lo defaults to 0; missing hi
+        defaults to `s.len` — matching Python's open-ended half-slice
+        semantics. The result is heap-owned; the surrounding consumer
+        site registers the anonymous cleanup, same as any other
+        str-returning call."""
+        assert self.builder is not None
+        target = self._gen_expr(e.target)
+        if target is None or not self._is_str_value(target.type):
+            raise CodegenError(
+                "slice expression target must be a str value"
+            )
+        # If the target itself is a heap-producing rvalue (e.g.
+        # `str_concat(a,b)[0:3]`), register it for cleanup so the
+        # bytes don't orphan after the slice call reads them.
+        self._register_str_rvalue_cleanup(target, e.target)
+        if e.lo is None:
+            lo = ir.Constant(I64, 0)
+        else:
+            lo_val = self._gen_expr(e.lo)
+            if lo_val is None:
+                raise CodegenError("slice lo bound has no value")
+            lo = self._coerce(lo_val, I64)
+        if e.hi is None:
+            hi = self.builder.extract_value(target, 1)
+        else:
+            hi_val = self._gen_expr(e.hi)
+            if hi_val is None:
+                raise CodegenError("slice hi bound has no value")
+            hi = self._coerce(hi_val, I64)
+        return self.builder.call(self._get_str_slice(), [target, lo, hi])
 
 def codegen(program: A.Program, checker=None) -> ir.Module:
     return Codegen(checker=checker).gen(program)
