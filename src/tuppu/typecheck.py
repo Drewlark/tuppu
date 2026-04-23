@@ -139,6 +139,18 @@ class TyStruct:
         return f"{self.name}<{', '.join(str(a) for a in self.args)}>"
 
 @dataclass(frozen=True)
+class TySeal:
+    """A user-defined seal (sum) type. Like TyStruct it's nominal and
+    carries an optional tuple of type args for generic seals — so
+    `Option<i64>` and `Option<str>` are distinct TySeals."""
+    name: str
+    args: tuple = ()
+    def __str__(self) -> str:
+        if not self.args:
+            return self.name
+        return f"{self.name}<{', '.join(str(a) for a in self.args)}>"
+
+@dataclass(frozen=True)
 class TyVar:
     """A type variable — appears during generic-fn body checking and
     during unification at a call site. Resolved away by the end of
@@ -238,6 +250,16 @@ class Checker:
         self.tables: dict[str, TyTable] = {}
         self.structs: dict[str, TyStruct] = {}
         self.struct_fields: dict[str, tuple[tuple[str, Ty], ...]] = {}
+        # Seals (sum types) — registered alongside structs in phase 0.
+        self.seals: dict[str, TySeal] = {}
+        self.seal_type_params: dict[str, tuple[str, ...]] = {}
+        # seal name → tuple of (variant_name, tuple of field Ty).
+        # Order is source order so codegen can assign stable tag indices.
+        self.seal_variants: dict[str, tuple[tuple[str, tuple[Ty, ...]], ...]] = {}
+        # variant_name → (seal_name, variant_index, declared_field_tys).
+        # Variant names are globally unique for v0.1 — ambiguity would
+        # require qualified syntax we haven't designed yet.
+        self.variant_lookup: dict[str, tuple[str, int, tuple[Ty, ...]]] = {}
         # Generics: per-tablet type-parameter names, in declaration order.
         self.struct_type_params: dict[str, tuple[str, ...]] = {}
         # Generics: per-fn type-parameter names.
@@ -250,6 +272,11 @@ class Checker:
         # these to know which specialization to emit.
         self.mono_call_args: dict[int, tuple] = {}   # Call node → tuple of Ty
         self.mono_struct_args: dict[int, tuple] = {} # StructLit → tuple of Ty
+        # Variant construction sidebands — both Call (`Some(x)`) and
+        # bare Ident (`None`) forms. Keyed by id(AST node).
+        self.mono_variant_args: dict[int, tuple] = {}
+        self.variant_of_node: dict[int, tuple[str, str, int]] = {}
+        # ^ id(node) → (seal_name, variant_name, variant_index)
         self.scopes: list[dict[str, Ty]] = [{}]
         self.current_fn: str = "<top>"
         self.warnings: list[CompileWarning] = []
@@ -264,16 +291,20 @@ class Checker:
         self.warnings.append(CompileWarning(message=message, line=line, col=col))
 
     def check(self) -> None:
-        # Phase 0a: collect struct names so struct-referencing-struct works
-        # regardless of source order.
+        # Phase 0a: collect struct + seal names so type bodies can refer
+        # to each other and to user types regardless of source order.
         for d in self.prog.decls:
             if isinstance(d, A.StructDecl):
                 self._register_struct_name(d)
-        # Phase 0b: resolve each struct's fields. Struct names are visible
-        # at this point; primitive types always have been.
+            elif isinstance(d, A.SealDecl):
+                self._register_seal_name(d)
+        # Phase 0b: resolve fields (structs) and variants (seals) now
+        # that all user type names are in scope.
         for d in self.prog.decls:
             if isinstance(d, A.StructDecl):
                 self._resolve_struct_fields(d)
+            elif isinstance(d, A.SealDecl):
+                self._resolve_seal_variants(d)
         # Phase 1: function signatures (parameter and return types can now
         # reference any struct).
         for d in self.prog.decls:
@@ -299,6 +330,56 @@ class Checker:
             )
         self.structs[s.name] = TyStruct(name=s.name)
         self.struct_type_params[s.name] = tuple(s.type_params)
+
+    def _register_seal_name(self, s: A.SealDecl) -> None:
+        if s.name in PRIM_TYPES:
+            raise CheckError(
+                f"seal {s.name!r}: name shadows a built-in type", s.line, s.col,
+            )
+        if s.name in self.structs:
+            raise CheckError(
+                f"seal {s.name!r}: name collides with an existing tablet",
+                s.line, s.col,
+            )
+        if s.name in self.seals:
+            raise CheckError(
+                f"duplicate seal {s.name!r}", s.line, s.col,
+            )
+        self.seals[s.name] = TySeal(name=s.name)
+        self.seal_type_params[s.name] = tuple(s.type_params)
+
+    def _resolve_seal_variants(self, s: A.SealDecl) -> None:
+        seen_names: set[str] = set()
+        resolved_variants: list[tuple[str, tuple[Ty, ...]]] = []
+        saved = self._active_type_vars
+        self._active_type_vars = {name: TyVar(name) for name in s.type_params}
+        try:
+            for idx, v in enumerate(s.variants):
+                if v.name in seen_names:
+                    raise CheckError(
+                        f"seal {s.name!r}: duplicate variant {v.name!r}",
+                        v.line, v.col,
+                    )
+                seen_names.add(v.name)
+                if v.name in self.variant_lookup:
+                    prev_seal = self.variant_lookup[v.name][0]
+                    raise CheckError(
+                        f"variant {v.name!r} is already declared in seal "
+                        f"{prev_seal!r}; variant names must be globally "
+                        f"unique in v0.1",
+                        v.line, v.col,
+                    )
+                field_tys = tuple(
+                    self._resolve_type(
+                        ft, f"field of variant {v.name!r} of seal {s.name!r}",
+                    )
+                    for ft in v.fields
+                )
+                resolved_variants.append((v.name, field_tys))
+                self.variant_lookup[v.name] = (s.name, idx, field_tys)
+        finally:
+            self._active_type_vars = saved
+        self.seal_variants[s.name] = tuple(resolved_variants)
 
     def _resolve_struct_fields(self, s: A.StructDecl) -> None:
         seen: set[str] = set()
@@ -403,7 +484,7 @@ class Checker:
         try:
             for param, pty in zip(fn.params, fn_ty.params):
                 self.scopes[0][param.name] = pty
-            body_ty = self._tc_expr(fn.body)
+            body_ty = self._tc_expr(fn.body, expected=fn_ty.ret)
         finally:
             self._active_type_vars = saved
         expected = fn_ty.ret
@@ -445,26 +526,48 @@ class Checker:
                         t.line, t.col,
                     )
                 return self.structs[t.name]
+            if t.name in self.seals:
+                params = self.seal_type_params.get(t.name, ())
+                if params:
+                    raise CheckError(
+                        f"{where}: seal {t.name!r} expects "
+                        f"{len(params)} type argument(s): "
+                        f"write `{t.name}<...>`",
+                        t.line, t.col,
+                    )
+                return self.seals[t.name]
             raise CheckError(
                 f"{where}: unknown type {t.name!r}", t.line, t.col,
             )
         if isinstance(t, A.TypeApply):
-            if t.name not in self.structs:
-                raise CheckError(
-                    f"{where}: unknown tablet {t.name!r}",
-                    t.line, t.col,
+            if t.name in self.structs:
+                params = self.struct_type_params.get(t.name, ())
+                if len(params) != len(t.args):
+                    raise CheckError(
+                        f"{where}: tablet {t.name!r} expects "
+                        f"{len(params)} type argument(s), got {len(t.args)}",
+                        t.line, t.col,
+                    )
+                resolved_args = tuple(
+                    self._resolve_type(a, f"{where} type arg") for a in t.args
                 )
-            params = self.struct_type_params.get(t.name, ())
-            if len(params) != len(t.args):
-                raise CheckError(
-                    f"{where}: tablet {t.name!r} expects "
-                    f"{len(params)} type argument(s), got {len(t.args)}",
-                    t.line, t.col,
+                return TyStruct(name=t.name, args=resolved_args)
+            if t.name in self.seals:
+                params = self.seal_type_params.get(t.name, ())
+                if len(params) != len(t.args):
+                    raise CheckError(
+                        f"{where}: seal {t.name!r} expects "
+                        f"{len(params)} type argument(s), got {len(t.args)}",
+                        t.line, t.col,
+                    )
+                resolved_args = tuple(
+                    self._resolve_type(a, f"{where} type arg") for a in t.args
                 )
-            resolved_args = tuple(
-                self._resolve_type(a, f"{where} type arg") for a in t.args
+                return TySeal(name=t.name, args=resolved_args)
+            raise CheckError(
+                f"{where}: unknown type {t.name!r}",
+                t.line, t.col,
             )
-            return TyStruct(name=t.name, args=resolved_args)
         if isinstance(t, A.TypeTablets):
             inner = self._resolve_type(t.element, f"{where} element")
             return TyTablets(size=t.size, element=inner)
@@ -541,7 +644,7 @@ class Checker:
             if isinstance(declared, TyHandle):
                 self._tainted[b.name] = False
             return
-        init_ty = self._tc_expr(b.init)
+        init_ty = self._tc_expr(b.init, expected=declared)
         if declared is not None:
             if not _coerces_to(init_ty, declared):
                 raise CheckError(
@@ -566,7 +669,7 @@ class Checker:
         # the chain (field names must exist on their struct types) and
         # yields the expected type of the RHS.
         target_ty = self._tc_expr(a.target)
-        value_ty = self._tc_expr(a.value)
+        value_ty = self._tc_expr(a.value, expected=target_ty)
         if not _coerces_to(value_ty, target_ty):
             raise CheckError(
                 f"assignment target has type {target_ty}, "
@@ -626,7 +729,7 @@ class Checker:
                     y.line, y.col,
                 )
             return
-        val_ty = self._tc_expr(y.value)
+        val_ty = self._tc_expr(y.value, expected=expected)
         if not _coerces_to(val_ty, expected):
             raise CheckError(
                 f"yield: value has type {val_ty}, fn {self.current_fn!r} "
@@ -704,7 +807,7 @@ class Checker:
 
     # --- expressions ------------------------------------------------
 
-    def _tc_expr(self, e: A.Expr) -> Ty:
+    def _tc_expr(self, e: A.Expr, expected: Ty | None = None) -> Ty:
         if isinstance(e, A.IntLit):    return I64
         if isinstance(e, A.CharLit):   return U8
         if isinstance(e, A.BoolLit):   return BOOL
@@ -719,16 +822,22 @@ class Checker:
                 )
             return self.structs["str"]
         if isinstance(e, A.Ident):
+            # Nullary variants look like bare identifiers. Check the
+            # variant registry first so `None` / `Circle` etc. resolve
+            # to their seal type rather than "undefined name".
+            if e.name in self.variant_lookup:
+                return self._tc_variant_ident(e, expected)
             return self._lookup(e.name, e.line, e.col)
         if isinstance(e, A.Unary):     return self._tc_unary(e)
         if isinstance(e, A.Binary):    return self._tc_binary(e)
-        if isinstance(e, A.Call):      return self._tc_call(e)
+        if isinstance(e, A.Call):      return self._tc_call(e, expected)
         if isinstance(e, A.Field):     return self._tc_field(e)
         if isinstance(e, A.Index):     return self._tc_index(e)
         if isinstance(e, A.Cast):      return self._tc_cast(e)
         if isinstance(e, A.StructLit): return self._tc_struct_lit(e)
-        if isinstance(e, A.Block):     return self._tc_block(e)
-        if isinstance(e, A.IfExpr):    return self._tc_if(e)
+        if isinstance(e, A.Block):     return self._tc_block(e, expected=expected)
+        if isinstance(e, A.IfExpr):    return self._tc_if(e, expected)
+        if isinstance(e, A.MatchExpr): return self._tc_match(e, expected)
         raise CheckError(
             f"unsupported expression: {type(e).__name__}",
             getattr(e, "line", 0), getattr(e, "col", 0),
@@ -903,6 +1012,17 @@ class Checker:
             for p, c in zip(pattern.args, concrete.args):
                 self._unify(p, c, subst)
             return
+        if isinstance(pattern, TySeal) and isinstance(concrete, TySeal):
+            if pattern.name != concrete.name:
+                raise _UnifyError(f"{pattern.name} vs {concrete.name}")
+            if len(pattern.args) != len(concrete.args):
+                raise _UnifyError(
+                    f"{pattern.name}: arity mismatch "
+                    f"{len(pattern.args)} vs {len(concrete.args)}",
+                )
+            for p, c in zip(pattern.args, concrete.args):
+                self._unify(p, c, subst)
+            return
         # Leaves — rely on the coercion rules that already govern call
         # sites. If pattern == concrete exactly, trivially fine;
         # otherwise let `_coerces_to` handle it later. Here we only
@@ -926,6 +1046,8 @@ class Checker:
             return self._occurs_in(var_name, ty.element)
         if isinstance(ty, TyStruct):
             return any(self._occurs_in(var_name, a) for a in ty.args)
+        if isinstance(ty, TySeal):
+            return any(self._occurs_in(var_name, a) for a in ty.args)
         return False
 
     def _substitute(self, ty: Ty, subst: dict[str, Ty]) -> Ty:
@@ -941,9 +1063,12 @@ class Checker:
         if isinstance(ty, TyStruct) and ty.args:
             new_args = tuple(self._substitute(a, subst) for a in ty.args)
             return TyStruct(name=ty.name, args=new_args)
+        if isinstance(ty, TySeal) and ty.args:
+            new_args = tuple(self._substitute(a, subst) for a in ty.args)
+            return TySeal(name=ty.name, args=new_args)
         return ty
 
-    def _tc_call(self, e: A.Call) -> Ty:
+    def _tc_call(self, e: A.Call, expected: Ty | None = None) -> Ty:
         # Method call on a tablets variable: t.push(x), t.release(), ...
         if isinstance(e.callee, A.Field) and isinstance(e.callee.target, A.Ident):
             return self._tc_method_call(e)
@@ -953,6 +1078,10 @@ class Checker:
                 "only direct function calls are supported", e.line, e.col,
             )
         name = e.callee.name
+
+        # Variant constructor: `Some(42)`, `Circle(rat(1, 2))`, etc.
+        if name in self.variant_lookup:
+            return self._tc_variant_call(e, expected)
 
         if name in ("print", "println"):
             if not e.args:
@@ -1021,7 +1150,16 @@ class Checker:
         inst_names = [f"{name}.{tp}#{id(e)}" for tp in type_params]
         inst_subst = {tp: TyVar(fresh) for tp, fresh in zip(type_params, inst_names)}
         subst: dict[str, Ty] = {}
-        arg_tys = [self._tc_expr(a) for a in e.args]
+        # Expected-type hint per arg: the freshened param type if it
+        # contains no open type variables, otherwise None. Supplies
+        # context to variant/match construction inside args.
+        arg_hints: list[Ty | None] = []
+        for pty in fn.params:
+            h = self._substitute(pty, inst_subst)
+            arg_hints.append(
+                h if not self._has_open_tyvar(h, inst_names) else None
+            )
+        arg_tys = [self._tc_expr(a, expected=h) for a, h in zip(e.args, arg_hints)]
         for i, (at, pty) in enumerate(zip(arg_tys, fn.params)):
             freshened = self._substitute(pty, inst_subst)
             try:
@@ -1269,30 +1407,34 @@ class Checker:
             f"cannot cast {src} to {dst}", e.line, e.col,
         )
 
-    def _tc_block(self, b: A.Block, *, allow_nonbool_tail: bool = False) -> Ty:
+    def _tc_block(
+        self, b: A.Block, *,
+        allow_nonbool_tail: bool = False,
+        expected: Ty | None = None,
+    ) -> Ty:
         self._push()
         try:
             for stmt in b.stmts:
                 self._tc_stmt(stmt)
             if b.tail is None:
                 return UNIT
-            return self._tc_expr(b.tail)
+            return self._tc_expr(b.tail, expected=expected)
         finally:
             self._pop()
 
-    def _tc_if(self, e: A.IfExpr) -> Ty:
+    def _tc_if(self, e: A.IfExpr, expected: Ty | None = None) -> Ty:
         cond_ty = self._tc_expr(e.cond)
         if not isinstance(cond_ty, TyBool):
             raise CheckError(
                 f"if condition must be bool, got {cond_ty}", e.line, e.col,
             )
-        then_ty = self._tc_block(e.then)
+        then_ty = self._tc_block(e.then, expected=expected)
         if e.else_ is None:
             return UNIT
         if isinstance(e.else_, A.IfExpr):
-            else_ty = self._tc_if(e.else_)
+            else_ty = self._tc_if(e.else_, expected)
         else:
-            else_ty = self._tc_block(e.else_)
+            else_ty = self._tc_block(e.else_, expected=expected)
         unified = _unify_if_arms(then_ty, else_ty)
         if unified is None:
             raise CheckError(
@@ -1300,6 +1442,215 @@ class Checker:
                 e.line, e.col,
             )
         return unified
+
+    # --- variants and match ----------------------------------------------
+
+    def _tc_variant_ident(self, e: A.Ident, expected: Ty | None) -> Ty:
+        """Typecheck a bare variant name like `None`. Must be nullary;
+        generic seals require `expected` to pin their type parameters."""
+        seal_name, vidx, field_tys = self.variant_lookup[e.name]
+        if field_tys:
+            raise CheckError(
+                f"variant {e.name!r} takes {len(field_tys)} argument(s); "
+                f"call it like `{e.name}(...)`",
+                e.line, e.col,
+            )
+        type_params = self.seal_type_params.get(seal_name, ())
+        self.variant_of_node[id(e)] = (seal_name, e.name, vidx)
+        if not type_params:
+            self.mono_variant_args[id(e)] = ()
+            return TySeal(name=seal_name, args=())
+        # Generic seal: try to pin type args from expected.
+        if (
+            isinstance(expected, TySeal)
+            and expected.name == seal_name
+            and len(expected.args) == len(type_params)
+            and all(not isinstance(a, TyVar) for a in expected.args)
+        ):
+            self.mono_variant_args[id(e)] = expected.args
+            return TySeal(name=seal_name, args=expected.args)
+        raise CheckError(
+            f"variant {e.name!r} of generic seal {seal_name!r}: cannot "
+            f"infer type parameter(s) from the context. Add a type "
+            f"annotation on the binding or call site (e.g. "
+            f"`step x: {seal_name}<...> = {e.name}`).",
+            e.line, e.col,
+        )
+
+    def _tc_variant_call(self, e: A.Call, expected: Ty | None) -> Ty:
+        assert isinstance(e.callee, A.Ident)
+        vname = e.callee.name
+        seal_name, vidx, field_tys = self.variant_lookup[vname]
+        self.variant_of_node[id(e)] = (seal_name, vname, vidx)
+        if len(e.args) != len(field_tys):
+            raise CheckError(
+                f"variant {vname!r} takes {len(field_tys)} argument(s), "
+                f"got {len(e.args)}",
+                e.line, e.col,
+            )
+        type_params = self.seal_type_params.get(seal_name, ())
+        # Freshen the seal's type parameters at this call site so they
+        # don't collide with identically-named TyVars from an enclosing
+        # generic fn/tablet body.
+        fresh_names = [f"{seal_name}.{tp}#{id(e)}" for tp in type_params]
+        inst_subst = {tp: TyVar(fn) for tp, fn in zip(type_params, fresh_names)}
+        freshened_fields = [self._substitute(t, inst_subst) for t in field_tys]
+        subst: dict[str, Ty] = {}
+        # If the sink provides concrete type args, seed the subst so
+        # arg inference can reuse them.
+        if (
+            isinstance(expected, TySeal)
+            and expected.name == seal_name
+            and len(expected.args) == len(type_params)
+        ):
+            for fn, exp_arg in zip(fresh_names, expected.args):
+                subst[fn] = exp_arg
+        arg_tys: list[Ty] = []
+        for i, arg in enumerate(e.args):
+            # Pass along the field's expected type if fully resolved,
+            # so nested variants like `Some(None)` can find their T.
+            hint = self._substitute(freshened_fields[i], subst)
+            arg_hint = hint if not self._has_open_tyvar(hint, fresh_names) else None
+            arg_tys.append(self._tc_expr(arg, expected=arg_hint))
+        for i, (at, pty) in enumerate(zip(arg_tys, freshened_fields)):
+            try:
+                self._unify(pty, at, subst)
+            except _UnifyError as ex:
+                raise CheckError(
+                    f"variant {vname!r}: arg {i} has type {at}, "
+                    f"expected {self._substitute(pty, subst)}"
+                    f"{f' ({ex.detail})' if ex.detail else ''}",
+                    e.line, e.col,
+                ) from None
+        for i, (at, pty) in enumerate(zip(arg_tys, freshened_fields)):
+            inst = self._substitute(pty, subst)
+            if not _coerces_to(at, inst):
+                raise CheckError(
+                    f"variant {vname!r}: arg {i} has type {at}, expected {inst}",
+                    e.line, e.col,
+                )
+        if type_params:
+            resolved: list[Ty] = []
+            missing: list[str] = []
+            for tp, fn in zip(type_params, fresh_names):
+                r = self._substitute(TyVar(fn), subst)
+                if isinstance(r, TyVar) and r.name == fn:
+                    missing.append(tp)
+                resolved.append(r)
+            if missing:
+                raise CheckError(
+                    f"variant {vname!r} of generic seal {seal_name!r}: "
+                    f"could not infer type parameter(s) "
+                    f"{', '.join(missing)}. A type annotation on the "
+                    f"binding or an explicit cast would fix this.",
+                    e.line, e.col,
+                )
+            resolved_tuple = tuple(resolved)
+            self.mono_variant_args[id(e)] = resolved_tuple
+            return TySeal(name=seal_name, args=resolved_tuple)
+        self.mono_variant_args[id(e)] = ()
+        return TySeal(name=seal_name, args=())
+
+    def _has_open_tyvar(self, ty: Ty, fresh_names: list[str]) -> bool:
+        if isinstance(ty, TyVar):
+            return ty.name in fresh_names
+        if isinstance(ty, (TyHandle, TyTablets)):
+            return self._has_open_tyvar(ty.element, fresh_names)
+        if isinstance(ty, TyStruct):
+            return any(self._has_open_tyvar(a, fresh_names) for a in ty.args)
+        if isinstance(ty, TySeal):
+            return any(self._has_open_tyvar(a, fresh_names) for a in ty.args)
+        return False
+
+    def _tc_match(self, e: A.MatchExpr, expected: Ty | None = None) -> Ty:
+        scrut_ty = self._tc_expr(e.scrutinee)
+        if not isinstance(scrut_ty, TySeal):
+            raise CheckError(
+                f"match scrutinee must be a seal value, got {scrut_ty}",
+                e.line, e.col,
+            )
+        seal_name = scrut_ty.name
+        variants = self.seal_variants[seal_name]
+        type_params = self.seal_type_params.get(seal_name, ())
+        # Build a subst from the seal's declared type params to the
+        # scrutinee's concrete type args, so pattern binder types get
+        # the right concrete form.
+        subst: dict[str, Ty] = {}
+        for tp, ta in zip(type_params, scrut_ty.args):
+            if isinstance(ta, TyVar) and ta.name == tp:
+                continue
+            subst[tp] = ta
+
+        seen: set[str] = set()
+        has_wildcard = False
+        arm_tys: list[Ty] = []
+        for arm in e.arms:
+            self._push()
+            try:
+                if isinstance(arm.pattern, A.WildcardPattern):
+                    has_wildcard = True
+                elif isinstance(arm.pattern, A.VariantPattern):
+                    matched = None
+                    for i, (vn, vfs) in enumerate(variants):
+                        if vn == arm.pattern.name:
+                            matched = (i, vn, vfs)
+                            break
+                    if matched is None:
+                        raise CheckError(
+                            f"pattern {arm.pattern.name!r}: not a variant "
+                            f"of seal {seal_name!r}",
+                            arm.line, arm.col,
+                        )
+                    _, vn, vfs = matched
+                    if vn in seen:
+                        raise CheckError(
+                            f"duplicate pattern for variant {vn!r}",
+                            arm.line, arm.col,
+                        )
+                    seen.add(vn)
+                    self.variant_of_node[id(arm.pattern)] = (seal_name, vn, matched[0])
+                    if len(arm.pattern.binders) != len(vfs):
+                        raise CheckError(
+                            f"pattern {vn!r} has "
+                            f"{len(arm.pattern.binders)} binder(s); "
+                            f"variant has {len(vfs)} field(s)",
+                            arm.line, arm.col,
+                        )
+                    for binder, fty in zip(arm.pattern.binders, vfs):
+                        if binder is None:
+                            continue
+                        concrete = self._substitute(fty, subst)
+                        self._bind(binder, concrete, arm.line, arm.col)
+                else:
+                    raise CheckError(
+                        f"unsupported pattern: {type(arm.pattern).__name__}",
+                        arm.line, arm.col,
+                    )
+                body_ty = self._tc_expr(arm.body, expected=expected)
+                arm_tys.append(body_ty)
+            finally:
+                self._pop()
+
+        if not has_wildcard:
+            all_names = {vn for vn, _ in variants}
+            missing = sorted(all_names - seen)
+            if missing:
+                raise CheckError(
+                    f"match on seal {seal_name!r} is not exhaustive; "
+                    f"missing variant(s): {', '.join(missing)}",
+                    e.line, e.col,
+                )
+
+        result = arm_tys[0]
+        for ty in arm_tys[1:]:
+            uni = _unify_if_arms(result, ty)
+            if uni is None:
+                raise CheckError(
+                    f"match arms have different types: {result} vs {ty}",
+                    e.line, e.col,
+                )
+            result = uni
+        return result
 
 
 def check(program: A.Program) -> "Checker":

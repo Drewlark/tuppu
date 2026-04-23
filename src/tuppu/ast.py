@@ -206,10 +206,50 @@ class IfExpr:
     line: int = _pos()
     col:  int = _pos()
 
+
+# --- patterns ---------------------------------------------------------------
+
+@dataclass
+class WildcardPattern:
+    """`_` — matches anything, binds nothing."""
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class VariantPattern:
+    """`Name` (nullary) or `Name(x, y)` (positional binders). For a
+    binder slot, `None` indicates a wildcard position (`Name(_, x)`);
+    otherwise it's the name to bind that field to within the arm body."""
+    name: str
+    binders: list["str | None"]  # None = wildcard at that slot
+    line: int = _pos()
+    col:  int = _pos()
+
+Pattern = Union[WildcardPattern, VariantPattern]
+
+
+@dataclass
+class MatchArm:
+    pattern: Pattern
+    body: "Expr"
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class MatchExpr:
+    """`match scrutinee { pat => expr, ... }` — variant-dispatching
+    expression. Exhaustive over the scrutinee's seal variants unless
+    a wildcard arm is present."""
+    scrutinee: "Expr"
+    arms: list[MatchArm]
+    line: int = _pos()
+    col:  int = _pos()
+
+
 Expr = Union[
     IntLit, SexLit, StringLit, CharLit, BoolLit, LostLit, Ident,
     Unary, Binary, Call, Index, Field, Cast, StructLit,
-    Block, IfExpr,
+    Block, IfExpr, MatchExpr,
 ]
 
 
@@ -315,7 +355,28 @@ class StructDecl:
     line: int = _pos()
     col:  int = _pos()
 
-Decl = Union[FnDecl, TableDecl, StructDecl]
+@dataclass
+class Variant:
+    """One alternative of a seal: `Some(T)`, `Circle(rat)`, or nullary
+    like `None`. Fields are positional (unnamed) — named variant fields
+    may come in a later pass."""
+    name: str
+    fields: list[TypeExpr]
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
+class SealDecl:
+    """A user-defined seal (sum) type. Variants are stored in parse
+    order. Generic seals (`seal Option<T>`) use the same type-param
+    machinery as generic tablets."""
+    name: str
+    variants: list[Variant]
+    type_params: list[str] = field(default_factory=list)
+    line: int = _pos()
+    col:  int = _pos()
+
+Decl = Union[FnDecl, TableDecl, StructDecl, SealDecl]
 
 @dataclass
 class Program:

@@ -107,6 +107,20 @@ EXPECTED: dict[str, dict] = {
             b"  1/9 = 1/9\n"
         ),
     },
+    "omens.tpu":             {
+        "exit": 0,
+        "stdout": (
+            b"the scribe reads:\n"
+            b"favorable: +3/2\n"
+            b"ambiguous: ignored\n"
+            b"unfavorable: -1/4\n"
+            b"favorable: +2/1\n"
+            b"ambiguous: ignored\n"
+            b"unfavorable: -3/4\n"
+            b"tally: 5/2\n"
+            b"the gods favor this venture\n"
+        ),
+    },
 }
 
 

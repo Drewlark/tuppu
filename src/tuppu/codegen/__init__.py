@@ -68,6 +68,21 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         self._cleanup_frames: list[list[tuple[ir.Function, ir.Value, str]]] = []
         self._struct_types: dict[str, ir.LiteralStructType] = {}
         self._struct_fields: dict[str, list[tuple[str, ir.Type]]] = {}
+        # Seal (sum type) state. `_seal_types` keys are seal names for
+        # non-generic seals and `(name, arg_tys)` tuples for concrete
+        # monomorphizations. Each seal value is laid out as
+        # `{ i8 tag, [N x i64] payload }` where N is chosen to fit the
+        # widest variant. Variant payloads are accessed via a bitcast
+        # of the payload slot to a per-variant "payload struct".
+        self._seal_types: dict = {}
+        # seal key -> [(variant_name, payload_struct_ty), ...] in
+        # source order. payload_struct_ty is a LiteralStructType whose
+        # elements are the variant's field LLVM types (empty tuple for
+        # nullary variants).
+        self._seal_variants: dict = {}
+        # Declarations for generic seals, keyed by seal name. Populated
+        # in `_register_seals` and consumed by `_get_monomorph_seal`.
+        self._generic_seal_decls: dict = {}
         # Generic monomorphizations. Keys are (name, tuple-of-LLVM-types).
         # Values are the specialized LLVM types / functions. Populated
         # on demand via `_get_monomorph_struct` / `_get_monomorph_fn`.
@@ -148,6 +163,9 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         self._register_structs(
             [d for d in prog.decls if isinstance(d, A.StructDecl)]
         )
+        self._register_seals(
+            [d for d in prog.decls if isinstance(d, A.SealDecl)]
+        )
 
         # Generic fns are monomorphized lazily at call sites, so we
         # don't declare/emit them here — just stash the AST.
@@ -166,6 +184,8 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
                 pass  # handled in phase 2 after function decls are visible
             elif isinstance(decl, A.StructDecl):
                 pass  # already handled in phase 0
+            elif isinstance(decl, A.SealDecl):
+                pass  # already handled in phase 0c
             else:
                 raise CodegenError(
                     f"unsupported top-level: {type(decl).__name__}"
@@ -295,9 +315,13 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
                 return self._type_arg_subst[t.name]
             if t.name in self._struct_types:
                 return self._struct_types[t.name]
+            if t.name in self._seal_types:
+                return self._seal_types[t.name]
             raise CodegenError(f"type {t.name!r} not supported in this stage")
         if isinstance(t, A.TypeApply):
             arg_tys = tuple(self._lower_type(a) for a in t.args)
+            if t.name in self._generic_seal_decls:
+                return self._get_monomorph_seal(t.name, arg_tys)
             return self._get_monomorph_struct(t.name, arg_tys)
         if isinstance(t, A.TypeTablets):
             elem = self._lower_type(t.element)
@@ -506,13 +530,376 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
                 self.functions[name] = saved_functions
         return llvm_fn
 
+    # --- seals (sum types) ---------------------------------------------
+
+    def _register_seals(self, decls: list["A.SealDecl"]) -> None:
+        """Phase 0c for sum types. Declares an identified LLVM type per
+        seal and computes its layout `{ i8 tag, [N x i64] payload }` so
+        variants can be constructed / matched by bitcasting the payload
+        slot to the appropriate variant struct.
+
+        Generic seals (those with type parameters) are stashed for on-
+        demand monomorphization — layout depends on concrete arg types
+        (payload width differs between `Option<i64>` and `Option<str>`),
+        so we can't emit one up front."""
+        self._generic_seal_decls = {
+            d.name: d for d in decls if d.type_params
+        }
+        concrete = [d for d in decls if not d.type_params]
+        # Phase A: declare empty identified types so mutually-recursive
+        # seal-to-seal references resolve during body lowering.
+        for d in concrete:
+            if d.name in self._seal_types:
+                raise CodegenError(f"duplicate seal {d.name!r}")
+            ident_ty = self.module.context.get_identified_type(d.name)
+            self._seal_types[d.name] = ident_ty
+        # Phase B: compute each seal's payload layout.
+        for d in concrete:
+            self._finalize_seal(d.name, d, arg_tys=())
+
+    def _finalize_seal(
+        self,
+        name: str,
+        decl: "A.SealDecl",
+        arg_tys: tuple,
+    ) -> None:
+        """Compute and assign the LLVM body for a (possibly monomorphized)
+        seal. Stores variant payload struct types under the seal's key
+        for later variant construction / match destructuring."""
+        # Set the subst so type-parameter references inside variant
+        # fields resolve to concrete arg types.
+        saved_subst = self._type_arg_subst
+        if decl.type_params:
+            self._type_arg_subst = dict(zip(decl.type_params, arg_tys))
+        try:
+            variants: list[tuple[str, ir.LiteralStructType]] = []
+            for v in decl.variants:
+                field_tys = [self._lower_type(ft) for ft in v.fields]
+                payload = ir.LiteralStructType(field_tys)
+                variants.append((v.name, payload))
+        finally:
+            self._type_arg_subst = saved_subst
+        key = name if not arg_tys else (name, arg_tys)
+        self._seal_variants[key] = variants
+        max_bytes = 0
+        for _, payload in variants:
+            b = self._size_of(payload)
+            if b > max_bytes:
+                max_bytes = b
+        # Payload chunk: array of i64, sized up to fit the widest variant.
+        # Using i64 gives 8-byte alignment, which covers every primitive
+        # we currently allow in variants.
+        n = (max_bytes + 7) // 8
+        if n == 0:
+            body = [I8]
+        else:
+            body = [I8, ir.ArrayType(I64, n)]
+        seal_ty = self._seal_types[key] if not arg_tys else self._seal_types[key]
+        seal_ty.set_body(*body)
+
+    def _get_monomorph_seal(
+        self, name: str, arg_tys: tuple,
+    ) -> ir.IdentifiedStructType:
+        """Return the specialized seal LLVM type for a generic seal at
+        concrete type args. Mirrors `_get_monomorph_struct` in shape."""
+        if not arg_tys:
+            return self._seal_types[name]
+        key = (name, arg_tys)
+        cached = self._seal_types.get(key)
+        if cached is not None:
+            return cached
+        decl = self._generic_seal_decls.get(name)
+        if decl is None:
+            raise CodegenError(
+                f"unknown generic seal {name!r} for monomorphization"
+            )
+        arg_tag = "_".join(str(a).replace(" ", "").replace('"', "")
+                           for a in arg_tys)
+        mono_name = f"{name}__{arg_tag}"
+        ident_ty = self.module.context.get_identified_type(mono_name)
+        self._seal_types[key] = ident_ty
+        self._finalize_seal(name, decl, arg_tys)
+        return ident_ty
+
+    def _seal_key_for_ty(self, llvm_ty: ir.Type):
+        """Find the seal key (name or (name, args) tuple) for a given
+        LLVM type. Returns None if not a registered seal."""
+        for k, v in self._seal_types.items():
+            if v is llvm_ty:
+                return k
+        return None
+
+    def _size_of(self, ty: ir.Type) -> int:
+        """Conservative-to-LLVM byte size. Handles primitives, pointers,
+        arrays, and (possibly identified) struct types including rat/
+        sex/user-tablets/nested seals. Good enough for picking the
+        widest variant's payload width — we round up to i64 anyway."""
+        if isinstance(ty, ir.IntType):
+            return max(1, ty.width // 8)
+        if isinstance(ty, ir.PointerType):
+            return 8
+        if isinstance(ty, ir.ArrayType):
+            return ty.count * self._size_of(ty.element)
+        if isinstance(ty, (ir.LiteralStructType, ir.IdentifiedStructType)):
+            offset = 0
+            max_align = 1
+            elements = getattr(ty, "elements", None) or ()
+            for m in elements:
+                align = self._align_of(m)
+                if align > max_align:
+                    max_align = align
+                offset = (offset + align - 1) // align * align
+                offset += self._size_of(m)
+            return (offset + max_align - 1) // max_align * max_align
+        raise CodegenError(f"cannot compute size of {ty}")
+
+    def _align_of(self, ty: ir.Type) -> int:
+        if isinstance(ty, ir.IntType):
+            return max(1, ty.width // 8)
+        if isinstance(ty, ir.PointerType):
+            return 8
+        if isinstance(ty, ir.ArrayType):
+            return self._align_of(ty.element)
+        if isinstance(ty, (ir.LiteralStructType, ir.IdentifiedStructType)):
+            elements = getattr(ty, "elements", None) or ()
+            return max((self._align_of(m) for m in elements), default=1)
+        return 1
+
+    def _variant_lookup(
+        self, seal_key, variant_name: str,
+    ) -> tuple[int, ir.LiteralStructType]:
+        """Return (tag_index, payload_struct_ty) for a variant within a
+        seal. Raises CodegenError if the variant isn't registered."""
+        variants = self._seal_variants.get(seal_key)
+        if variants is None:
+            raise CodegenError(f"seal {seal_key!r} not registered")
+        for idx, (vn, payload) in enumerate(variants):
+            if vn == variant_name:
+                return idx, payload
+        raise CodegenError(
+            f"seal {seal_key!r} has no variant {variant_name!r}"
+        )
+
+    def _gen_variant_ctor(self, node) -> ir.Value:
+        """Build a seal value from a variant construction. `node` is
+        either a bare Ident (nullary variant) or a Call whose callee
+        is an Ident naming a variant.
+
+        Layout: alloca the seal struct, zero-init, write the tag byte,
+        and for variants with fields bitcast the payload slot to the
+        per-variant payload struct and store each field. Load and
+        return the final aggregate value."""
+        assert self.builder is not None
+        assert self._checker is not None
+        if isinstance(node, A.Call):
+            variant_name = node.callee.name  # type: ignore[attr-defined]
+            args = node.args
+        else:
+            variant_name = node.name
+            args = []
+        seal_name, _, vidx = self._checker.variant_of_node[id(node)]
+        type_args = self._checker.mono_variant_args[id(node)]
+        if type_args:
+            llvm_args = tuple(self._lower_ty(a) for a in type_args)
+            seal_ty = self._get_monomorph_seal(seal_name, llvm_args)
+            seal_key = (seal_name, llvm_args)
+        else:
+            seal_ty = self._seal_types[seal_name]
+            seal_key = seal_name
+        _, payload_ty = self._variant_lookup(seal_key, variant_name)
+
+        slot = self._alloca_entry(seal_ty, f"{seal_name}.{variant_name}")
+        # Zero the whole thing so any unused payload bytes are well-defined
+        # (lets `== lost`-style tag comparisons work deterministically).
+        self.builder.store(ir.Constant(seal_ty, None), slot)
+        tag_ptr = self.builder.gep(
+            slot, [ir.Constant(I32, 0), ir.Constant(I32, 0)], inbounds=True,
+        )
+        self.builder.store(ir.Constant(I8, vidx), tag_ptr)
+
+        if payload_ty.elements and args:
+            payload_ptr = self._seal_payload_ptr(slot)
+            typed_ptr = self.builder.bitcast(
+                payload_ptr, payload_ty.as_pointer(),
+            )
+            for i, (arg, expected_ty) in enumerate(
+                zip(args, payload_ty.elements)
+            ):
+                v = self._gen_expr(arg)
+                if v is None:
+                    raise CodegenError(
+                        f"variant {variant_name!r} arg {i} has no value"
+                    )
+                field_ptr = self.builder.gep(
+                    typed_ptr,
+                    [ir.Constant(I32, 0), ir.Constant(I32, i)],
+                    inbounds=True,
+                )
+                self.builder.store(self._coerce(v, expected_ty), field_ptr)
+        return self.builder.load(slot)
+
+    def _seal_payload_ptr(self, slot: ir.Value) -> ir.Value:
+        """GEP to the payload slot (field index 1) of a seal alloca.
+        Asserts that the seal actually has a payload field."""
+        assert self.builder is not None
+        seal_ty = slot.type.pointee
+        if not isinstance(seal_ty, ir.IdentifiedStructType):
+            raise CodegenError(f"expected seal pointer, got {slot.type}")
+        if len(seal_ty.elements) < 2:
+            raise CodegenError(
+                "seal has no payload (all variants are nullary) "
+                "— caller should have taken the fast path"
+            )
+        return self.builder.gep(
+            slot, [ir.Constant(I32, 0), ir.Constant(I32, 1)], inbounds=True,
+        )
+
+    def _gen_match(self, e: "A.MatchExpr") -> ir.Value | None:
+        """Lower a match expression to a switch on the tag byte.
+
+        Each arm becomes its own basic block; a VariantPattern's arm
+        bitcasts the payload to the variant's payload struct and binds
+        pattern binders to extracted fields. A wildcard arm becomes
+        the default block; without one the default is `unreachable`
+        (exhaustiveness is already checked by the type checker).
+
+        Arm values are joined via a phi in the merge block, mirroring
+        the `if`-expression pattern."""
+        assert self.builder is not None
+        assert self._checker is not None
+        scrutinee = self._gen_expr(e.scrutinee)
+        if scrutinee is None:
+            raise CodegenError("match scrutinee diverged")
+        seal_key = self._seal_key_for_ty(scrutinee.type)
+        if seal_key is None:
+            raise CodegenError(
+                f"match scrutinee has type {scrutinee.type}, not a seal"
+            )
+        variants = self._seal_variants[seal_key]
+        name_to_index = {vn: i for i, (vn, _) in enumerate(variants)}
+        # Spill scrutinee so we can GEP into it for the payload.
+        slot = self._alloca_entry(scrutinee.type, "match.scrut")
+        self.builder.store(scrutinee, slot)
+        tag_ptr = self.builder.gep(
+            slot, [ir.Constant(I32, 0), ir.Constant(I32, 0)], inbounds=True,
+        )
+        tag = self.builder.load(tag_ptr)
+
+        fn = self.builder.function
+        merge_bb = fn.append_basic_block("match.merge")
+        default_bb = fn.append_basic_block("match.default")
+
+        # Pick the default block: if an arm has a wildcard, its body
+        # becomes the default. Otherwise default is an unreachable trap.
+        wildcard_arm: "A.MatchArm | None" = None
+        variant_arms: list[tuple["A.MatchArm", int, ir.Block]] = []
+        for arm in e.arms:
+            if isinstance(arm.pattern, A.WildcardPattern):
+                wildcard_arm = arm
+            else:
+                vidx = name_to_index[arm.pattern.name]
+                bb = fn.append_basic_block(f"match.{arm.pattern.name}")
+                variant_arms.append((arm, vidx, bb))
+
+        switch_inst = self.builder.switch(tag, default_bb)
+        for _arm, vidx, bb in variant_arms:
+            switch_inst.add_case(ir.Constant(I8, vidx), bb)
+
+        results: list[tuple[ir.Value | None, ir.Block]] = []
+
+        # Emit variant arms.
+        for arm, vidx, bb in variant_arms:
+            self.builder.position_at_end(bb)
+            self.scopes.append({})
+            self._cleanup_frames.append([])
+            try:
+                self._bind_variant_pattern(arm.pattern, slot, seal_key)
+                val = self._gen_expr(arm.body)
+                end_bb = self.builder.block
+                diverged = end_bb.is_terminated
+                if not diverged:
+                    self._emit_frame_cleanups(self._cleanup_frames[-1])
+                    results.append((val, self.builder.block))
+                    self.builder.branch(merge_bb)
+            finally:
+                self.scopes.pop()
+                self._cleanup_frames.pop()
+
+        # Emit default (wildcard or unreachable trap).
+        self.builder.position_at_end(default_bb)
+        if wildcard_arm is not None:
+            self.scopes.append({})
+            self._cleanup_frames.append([])
+            try:
+                val = self._gen_expr(wildcard_arm.body)
+                end_bb = self.builder.block
+                diverged = end_bb.is_terminated
+                if not diverged:
+                    self._emit_frame_cleanups(self._cleanup_frames[-1])
+                    results.append((val, self.builder.block))
+                    self.builder.branch(merge_bb)
+            finally:
+                self.scopes.pop()
+                self._cleanup_frames.pop()
+        else:
+            self.builder.unreachable()
+
+        self.builder.position_at_end(merge_bb)
+        if not results:
+            # All arms diverged.
+            self.builder.unreachable()
+            return None
+        if all(r[0] is None for r in results):
+            return None
+        # Find a non-None representative to pick the phi type.
+        rep = next((r for r in results if r[0] is not None), None)
+        if rep is None:
+            return None
+        phi = self.builder.phi(rep[0].type)
+        for val, bb in results:
+            if val is None:
+                # Diverged arms don't contribute to the phi; but arms
+                # that produced unit in a unit-typed match shouldn't
+                # reach here in practice.
+                continue
+            phi.add_incoming(val, bb)
+        return phi
+
+    def _bind_variant_pattern(
+        self,
+        pattern: "A.VariantPattern",
+        scrut_slot: ir.Value,
+        seal_key,
+    ) -> None:
+        """Inside a match arm for a variant pattern: bitcast the
+        scrutinee's payload to the variant's payload struct and bind
+        each named pattern binder to a loaded field."""
+        assert self.builder is not None
+        vidx, payload_ty = self._variant_lookup(seal_key, pattern.name)
+        if not payload_ty.elements:
+            return
+        payload_ptr = self._seal_payload_ptr(scrut_slot)
+        typed_ptr = self.builder.bitcast(payload_ptr, payload_ty.as_pointer())
+        for i, binder in enumerate(pattern.binders):
+            if binder is None:
+                continue
+            field_ptr = self.builder.gep(
+                typed_ptr,
+                [ir.Constant(I32, 0), ir.Constant(I32, i)],
+                inbounds=True,
+            )
+            val = self.builder.load(field_ptr)
+            self._bind(binder, Variable(
+                is_mut=False, ir_ref=val, value_ty=val.type,
+            ))
+
     def _lower_ty(self, ty) -> ir.Type:
         """Convert a `typecheck.Ty` object (the resolved-type form the
         checker works in) to an `ir.Type`. Used by monomorphization
         paths where we have checker-resolved types, not AST nodes."""
         from ..typecheck import (
             TyInt, TyBool, TyRat, TyDish, TyUnit, TyHandle, TyTablets,
-            TyStruct, TyVar,
+            TyStruct, TySeal, TyVar,
         )
         if isinstance(ty, TyVar):
             # Inside a generic fn specialization, a TyVar that survived
@@ -542,6 +929,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
                 arg_tys = tuple(self._lower_ty(a) for a in ty.args)
                 return self._get_monomorph_struct(ty.name, arg_tys)
             return self._struct_types[ty.name]
+        if isinstance(ty, TySeal):
+            if ty.args:
+                arg_tys = tuple(self._lower_ty(a) for a in ty.args)
+                return self._get_monomorph_seal(ty.name, arg_tys)
+            return self._seal_types[ty.name]
         raise CodegenError(f"cannot lower checker type {ty!r} to LLVM")
 
     def _struct_name_for(self, llvm_ty: ir.Type) -> str | None:
@@ -1006,6 +1398,8 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
                 raise CodegenError("cannot cast a diverging expression")
             target = self._lower_type(e.type)
             return self._coerce(value, target)
+        if isinstance(e, A.MatchExpr):
+            return self._gen_match(e)
         raise CodegenError(f"expression not supported yet: {type(e).__name__}")
 
     def _gen_if_expr(self, e: A.IfExpr) -> ir.Value | None:
@@ -1081,6 +1475,14 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         return phi
 
     def _gen_ident(self, e: A.Ident) -> ir.Value:
+        # A bare identifier may also name a nullary seal variant —
+        # recognise it via the checker's sideband so `None` / `Empty` /
+        # etc. construct the correct seal value.
+        if (
+            self._checker is not None
+            and id(e) in self._checker.variant_of_node
+        ):
+            return self._gen_variant_ctor(e)
         var = self._lookup(e.name)
         assert self.builder is not None
         if var.is_mut:
@@ -1259,6 +1661,14 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         if not isinstance(e.callee, A.Ident):
             raise CodegenError("only direct function calls are supported")
         name = e.callee.name
+
+        # Variant constructor call: `Some(x)`, `Circle(r)`, etc.
+        # Checker has already resolved this to (seal, variant, type args).
+        if (
+            self._checker is not None
+            and id(e) in self._checker.variant_of_node
+        ):
+            return self._gen_variant_ctor(e)
 
         # Intrinsics dispatch first so user-defined shadows can't occur
         # (they'd have been rejected at declaration time anyway).

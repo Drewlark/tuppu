@@ -45,7 +45,8 @@ class Tok(Enum):
     RELEASE = auto()
     STRUCT = auto()      # emitted by `tablet` keyword — product type decl
     WEDGE = auto()       # emitted by `wedge` keyword — handle type (tablet ref)
-    SEAL = auto()        # reserved for future sum types; no semantics yet
+    SEAL = auto()        # emitted by `seal` keyword — sum type decl
+    MATCH = auto()       # emitted by `match` keyword — pattern-match expr
     LOST = auto()
     COLOPHON = auto()    # reserved; no semantics yet (see NEXT.md)
 
@@ -115,10 +116,13 @@ KEYWORDS: dict[str, Tok] = {
     # a single small reference to something larger.
     "wedge": Tok.WEDGE,
     "release": Tok.RELEASE,
-    # `seal Name { Variant, Variant, ... }` is reserved for future sum
-    # types — Kotlin/Scala precedent: a cylinder seal produces one of
-    # a fixed set of stamp designs.
+    # `seal Name { Variant, Variant(T), ... }` declares a sum type.
+    # Kotlin/Scala precedent: a cylinder seal produces one of a fixed
+    # set of stamp designs — here, one of a fixed set of variants.
     "seal": Tok.SEAL,
+    # `match e { Pattern => expr, ... }` is a pattern-match expression
+    # that dispatches on a seal value's variant.
+    "match": Tok.MATCH,
     "lost": Tok.LOST,
     # `colophon` is reserved for a future use (file-level metadata
     # preamble, tablets debug-name, something along those lines) — the

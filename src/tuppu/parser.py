@@ -98,11 +98,13 @@ class Parser:
                 decls.append(self.parse_table())
             elif self.check(Tok.STRUCT):
                 decls.append(self.parse_struct_decl())
+            elif self.check(Tok.SEAL):
+                decls.append(self.parse_seal_decl())
             else:
                 t = self.peek()
                 raise ParseError(
-                    f"expected 'fn', 'table', or 'tablet' at top level, "
-                    f"got {t.kind.name}",
+                    f"expected 'fn', 'table', 'tablet', or 'seal' at top "
+                    f"level, got {t.kind.name}",
                     t.line, t.col,
                 )
             self.skip_newlines()
@@ -185,6 +187,50 @@ class Parser:
             )
         return _at(start, A.StructDecl(
             name=name, fields=fields, type_params=type_params,
+        ))
+
+    def parse_seal_decl(self) -> A.SealDecl:
+        start = self.eat(Tok.SEAL)
+        name = self.eat(Tok.IDENT, "seal name").value
+        type_params = self.parse_type_params()
+        self.eat(Tok.LBRACE)
+        variants: list[A.Variant] = []
+        seen_names: set[str] = set()
+        self.skip_newlines()
+        while not self.check(Tok.RBRACE):
+            vtok = self.peek()
+            vname = self.eat(Tok.IDENT, "variant name").value
+            if vname in seen_names:
+                raise ParseError(
+                    f"seal {name!r}: duplicate variant {vname!r}",
+                    vtok.line, vtok.col,
+                )
+            seen_names.add(vname)
+            fields: list[A.TypeExpr] = []
+            if self.check(Tok.LPAREN):
+                self.advance()
+                if not self.check(Tok.RPAREN):
+                    fields.append(self.parse_type())
+                    while self.check(Tok.COMMA):
+                        self.advance()
+                        fields.append(self.parse_type())
+                self.eat(Tok.RPAREN)
+            variants.append(_at(vtok, A.Variant(name=vname, fields=fields)))
+            self.skip_newlines()
+            if self.check(Tok.COMMA):
+                self.advance()
+                self.skip_newlines()
+            else:
+                break
+        self.skip_newlines()
+        self.eat(Tok.RBRACE)
+        if not variants:
+            raise ParseError(
+                f"seal {name!r} must declare at least one variant",
+                start.line, start.col,
+            )
+        return _at(start, A.SealDecl(
+            name=name, variants=variants, type_params=type_params,
         ))
 
     def parse_struct_lit(self) -> A.StructLit:
@@ -446,7 +492,70 @@ class Parser:
             return self.parse_block()
         if t.kind is Tok.IF:
             return self.parse_if()
+        if t.kind is Tok.MATCH:
+            return self.parse_match()
         raise ParseError(f"expected expression, got {t.kind.name}", t.line, t.col)
+
+    def parse_match(self) -> A.MatchExpr:
+        start = self.eat(Tok.MATCH)
+        scrutinee = self.parse_expr()
+        self.eat(Tok.LBRACE)
+        arms: list[A.MatchArm] = []
+        self.skip_newlines()
+        while not self.check(Tok.RBRACE):
+            arm_start = self.peek()
+            pattern = self.parse_pattern()
+            self.eat(Tok.FATARROW)
+            body = self.parse_expr()
+            arms.append(_at(arm_start, A.MatchArm(pattern=pattern, body=body)))
+            self.skip_newlines()
+            if self.check(Tok.COMMA):
+                self.advance()
+                self.skip_newlines()
+            else:
+                break
+        self.skip_newlines()
+        self.eat(Tok.RBRACE)
+        if not arms:
+            raise ParseError(
+                "match expression requires at least one arm",
+                start.line, start.col,
+            )
+        return _at(start, A.MatchExpr(scrutinee=scrutinee, arms=arms))
+
+    def parse_pattern(self) -> A.Pattern:
+        t = self.peek()
+        # `_` is a bare wildcard. It lexes as an IDENT whose value is "_".
+        if t.kind is Tok.IDENT and t.value == "_":
+            self.advance()
+            return _at(t, A.WildcardPattern())
+        if t.kind is Tok.IDENT:
+            self.advance()
+            binders: list[str | None] = []
+            has_paren = False
+            if self.check(Tok.LPAREN):
+                has_paren = True
+                self.advance()
+                if not self.check(Tok.RPAREN):
+                    binders.append(self._parse_pattern_binder())
+                    while self.check(Tok.COMMA):
+                        self.advance()
+                        binders.append(self._parse_pattern_binder())
+                self.eat(Tok.RPAREN)
+            return _at(t, A.VariantPattern(name=t.value, binders=binders))
+        raise ParseError(
+            f"expected pattern, got {t.kind.name}", t.line, t.col,
+        )
+
+    def _parse_pattern_binder(self) -> str | None:
+        t = self.peek()
+        if t.kind is not Tok.IDENT:
+            raise ParseError(
+                f"expected identifier or `_` in pattern, got {t.kind.name}",
+                t.line, t.col,
+            )
+        self.advance()
+        return None if t.value == "_" else t.value
 
     def parse_infix(self, left: A.Expr, op_tok: Token, prec: int) -> A.Expr:
         if op_tok.kind is Tok.LPAREN:

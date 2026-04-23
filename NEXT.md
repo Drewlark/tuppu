@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **411 tests passing.**
+- **434 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -59,6 +59,17 @@ What works:
   `tablets[N]T`, and comptime tables. Loop variable is step-bound.
 - **Mixed-width int comparisons** promote to the wider type (matches
   `if`-arm unification).
+- **Sum types (`seal`) + pattern matching.** `seal Option<T> { Some(T),
+  None }`; non-generic and generic; positional variant fields; `match`
+  as an expression with wildcard arms (`_ => ...`) and per-slot
+  wildcards (`Both(_, b)`); exhaustiveness enforced unless a wildcard
+  arm is present. Runtime is `{ i8 tag, [N x i64] payload }` — payload
+  bitcast to a per-variant struct for read/write. Generic seals use the
+  same lazy monomorphization as generic tablets. Bidirectional type
+  checking threads an optional `expected` type through bindings, yield,
+  fn body tails, assignment RHS, and call args — so `None` works
+  without an annotation when context pins `T`. See
+  `examples/omens.tpu`, `tests/test_sum.py`.
 - **Sex/dish Phases 1–3b:**
   - Distinct 20-byte runtime `{ [16]u8 digits, u8 radix, u8 count,
     i8 sign, u8 pad }`.
@@ -91,6 +102,14 @@ What works:
 - Compile-time warning infrastructure.
 
 What doesn't yet:
+- Sum-type match patterns: no nesting (`Some(Circle(r))`), no guards
+  (`Some(x) if x > 0`), no or-patterns (`Some(1) | Some(2)`). v0.1
+  intentionally stops at flat patterns.
+- Named fields on variants (`Circle(radius: rat)`). Positional only
+  for now.
+- SPEC.md coverage of `seal` / `match` — source of truth is the test
+  and example files until the spec gets updated.
+- Fn-as-value / closures — the next planned chunk.
 - Native sex `%` (still warn-lower to rat; rat % itself isn't
   implemented either, so this errors at codegen).
 - Mixed sex × rat ops (still warn, stay as rat — deliberate, since
@@ -137,13 +156,20 @@ What doesn't yet:
    `fn push<T>(...)`, HM-style inference at call sites and struct
    literals, lazy monomorphization. `stdlib/list.tpu` rewritten as
    `List<T>`. See `tests/test_struct.py::test_generic_*`.
-10. **Sum types** — **Next.** Landing the `seal` keyword for Option/
-    Result/ADT shapes, plus minimal pattern matching. Biggest single
-    step toward functional-style code and toward self-hosting. See
-    "Roadmap (agreed 2026-04-22)" below for the full menu.
-11. **Sex/dish Phase 3c** — escape-analysis pass for rat-fallback
+10. ~~**Sum types**~~ — **done.** `seal Option<T> { Some(T), None }`,
+    generic seals monomorphized like tablets, `match` as an expression
+    with wildcard arms and exhaustiveness checking. Bidirectional
+    expected-type threading so `None` works in return / call-arg /
+    annotated-binding contexts. See `tests/test_sum.py` and
+    `examples/omens.tpu`.
+11. **Fn-as-value (no capture)** — **Next.** Higher-order functions
+    without environment capture. Lets us pass `fn(i64) -> i64`
+    values as params and store them in bindings; unlocks visitor
+    patterns and minimal higher-order stdlib helpers. Short step
+    toward closures.
+12. **Sex/dish Phase 3c** — escape-analysis pass for rat-fallback
     specialization. Unblocks the future `--strict-dish` flag idea.
-12. **Imports** — cleanup; pay when stdlib grows enough to need
+13. **Imports** — cleanup; pay when stdlib grows enough to need
     namespaces.
 
 ## Roadmap (agreed 2026-04-22)
@@ -157,7 +183,7 @@ Ranked by "unblocks most / lays groundwork for the self-host path":
 
 | Feature                          | Cost    | Unlocks                                       | Notes                                                                        |
 |----------------------------------|---------|-----------------------------------------------|------------------------------------------------------------------------------|
-| **Sum types + pattern matching** | ~6-8 h  | Option, Result, ADTs, AST-shaped data         | `seal` is already reserved. Biggest single step toward self-hosting.         |
+| ~~**Sum types + pattern matching**~~ | **done**  | Option, Result, ADTs, AST-shaped data         | Landed 2026-04-22 — see `tests/test_sum.py`.                          |
 | **Fn-as-value (no capture)**     | ~2-3 h  | Higher-order functions, minimal visitors      | Cheap. Pointers-to-functions, no environment capture.                        |
 | **Full closures (with capture)** | ~4-6 h  | Inline callbacks, state-carrying fns          | Needs a captured-env layout story.                                           |
 | **Overloads (`__repr__`-style)** | ~2-3 h  | Generic `print`, user-extensible operators    | Type-dispatched name resolution. No trait system needed.                     |
@@ -166,43 +192,38 @@ Ranked by "unblocks most / lays groundwork for the self-host path":
 | **Maps / hash tables**           | ~4-6 h  | Symbol tables, interning                      | Can be built in Tuppu on top of `tablets`; probably starts as `stdlib/map.tpu`. |
 | **File I/O (read_line, etc.)**   | ~2-4 h  | Real programs, step toward self-hosting input | Libc wrappers via the same extern pattern as `write`/`fflush`.               |
 
-Agreed order (approximate): sum types → fn-as-value → full closures
-→ overloads → operator overloads → dynamic strings → maps → file I/O.
+Agreed order (approximate): ~~sum types~~ → **fn-as-value** → full
+closures → overloads → operator overloads → dynamic strings → maps →
+file I/O.
 
-**Sum types design sketch** (to pick up after compact):
+**Sum types — what shipped** (2026-04-22):
 
-```
-seal Option<T> {
-  Some(T),
-  None,
-}
-
-seal Shape {
-  Circle(radius: rat),
-  Square(side: rat),
-}
-
-fn area(s: Shape) -> rat {
-  match s {
-    Circle(r) => r * r * rat(314, 100),
-    Square(s) => s * s,
-  }
-}
-```
-
-- Tagged-union runtime: `{ tag: i8, payload: <union of variants> }` —
-  payload is a `max(sizeof(each variant))`-byte buffer. Identified
-  LLVM type per-seal (same machinery as tablets, different shape).
-- Variant constructors are callable-like: `Some(42)` produces an
-  `Option<i64>`; `None` is a zero-arg constructor.
-- Pattern matching exhaustive over variants. v0.1 scope: no guards,
-  no nested patterns, bindings only at the variant level.
-- Generic seals (`seal Option<T>`) use the same monomorphization
-  machinery as generic tablets.
-
-Skip for v0.1: nested patterns (`Some(Circle(r))`), guards
-(`Some(x) if x > 0`), or-patterns (`Some(1) | Some(2)`). Defer to
-v0.2 if we want real ML-family matching.
+- `seal Name<T> { Variant, Variant(T), Variant(T, U), ... }` declares
+  a tagged sum. Variant fields are positional (names elided); named
+  variant fields are a possible follow-up.
+- Runtime: `{ i8 tag, [N x i64] payload }` where N fits the widest
+  variant's payload. Variant constructors alloca the seal, store tag,
+  bitcast payload to the per-variant struct, fill the fields, and
+  load. Nullary variants skip the payload writes.
+- `match scrutinee { Pat => expr, ..., _ => expr, }` lowers to an
+  LLVM `switch` on the tag. Exhaustiveness enforced unless a `_`
+  arm is present; default block is `unreachable` when exhaustive.
+- Patterns: `VariantName`, `VariantName(bind_or_underscore, ...)`,
+  and `_`. **Flat patterns only** — no nesting, no guards, no or-
+  patterns. (Those stay v0.2.)
+- Generic seals use the same monomorphization machinery as generic
+  tablets (`_get_monomorph_seal(name, arg_tys)`).
+- **Bidirectional inference for nullary generic variants.** `_tc_expr`
+  takes an optional `expected` that's threaded through bindings with
+  type annotations, yield, fn-body tails, assignment RHS, and call
+  args. So `step x: Option<i64> = None` and `fn f() -> Option<i64> {
+  if cond { Some(1) } else { None } }` both work. A bare `step x =
+  None` without context errors with a "cannot infer T" message.
+- Typecheck: `TySeal` added alongside `TyStruct`; variant names live
+  in a global `variant_lookup` (they must be globally unique in v0.1).
+- Sidebands: `mono_variant_args` (id(node) → concrete type args) and
+  `variant_of_node` (id(node) → (seal, variant, index)) so codegen
+  knows exactly what to emit without re-running inference.
 
 ## 1. Future: `impress` reinterpret cast
 
@@ -380,21 +401,24 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 417 passing.
+2. `.venv/bin/pytest` — expect 434 passing.
 3. `git log --oneline -12` — recent timeline: sex Phase 3a/3b,
    struct field mutation, codegen.py split into mixins package,
    elif + did-you-mean, recursive tablets + wedge handles + auto-
    release + escape check, tablet/wedge/seal rename, minimal
-   generics (+ stdlib/list.tpu rewritten to `List<T>`).
+   generics (+ stdlib/list.tpu rewritten to `List<T>`), sum types
+   via `seal` + flat pattern `match` + bidirectional expected-type
+   threading.
 4. Read `SPEC.md` §4.5 (tablets), §4.6 (wedges), §14 (non-goals).
-5. **Agreed next task: sum types.** `seal` is reserved and ready to
-   claim. See "Roadmap (agreed 2026-04-22)" section above for the
-   design sketch (tagged union runtime, variant constructors,
-   exhaustive match — v0.1 scope is flat patterns only).
-   Ultimate goal: fold pieces of the compiler into Tuppu
-   (self-hosting). Min self-host set: sum types → fn-as-value →
-   closures → dynamic strings → maps → file I/O. The full ranked
-   roadmap is in the same section above.
+   SPEC.md does NOT yet describe `seal` / `match`; the source of
+   truth is `tests/test_sum.py` and `examples/omens.tpu`. A spec
+   update for sum types is queued.
+5. **Agreed next task: fn-as-value (no capture).** Function values
+   passed as params / stored in bindings / returned — no environment
+   capture yet. Type `fn(i64) -> i64`. Unlocks visitor patterns over
+   sums and is the smallest step toward full closures. After that:
+   closures → overloads → operator overloads → dynamic strings →
+   maps → file I/O. Self-hosting remains the multi-quarter goal.
 6. `FUTURE_OPTIMIZATIONS.md` (gitignored) captures design sketches
    for a `--strict-dish` flag, the SEX 20→16 byte shrink, SIMD carry
    in sex_add, and other perf/language ideas. Don't forget on the

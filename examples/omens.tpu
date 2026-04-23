@@ -1,0 +1,81 @@
+// A bāru (Babylonian diviner) reads a sequence of omens from a tablet
+// and tallies their weights. Each omen is one of three seal variants:
+//
+//   Favorable(weight)   — a positive reading
+//   Unfavorable(weight) — a negative reading (subtracted from the total)
+//   Ambiguous           — the scribe couldn't tell; ignored
+//
+// Ambiguous carries no payload, so it's a nullary variant. The match
+// inside `weight` dispatches on the tag byte and binds the payload
+// (where present) to a pattern variable.
+//
+// This example demonstrates:
+//   - `seal` declaration with both payload-carrying and nullary variants
+//   - `match` as an expression (the arm values become `weight`'s return)
+//   - using a seal as a tablets element type
+//   - iterating a tablets of seals with `for ... in ...`
+
+seal Omen {
+  Favorable(rat),
+  Unfavorable(rat),
+  Ambiguous,
+}
+
+fn weight(o: Omen) -> rat {
+  match o {
+    Favorable(w)   => w,
+    Unfavorable(w) => rat(0, 1) - w,
+    Ambiguous      => rat(0, 1),
+  }
+}
+
+fn describe(o: Omen) {
+  match o {
+    Favorable(w)   => println("favorable: +", w),
+    Unfavorable(w) => println("unfavorable: -", w),
+    Ambiguous      => println("ambiguous: ignored"),
+  }
+}
+
+fn main() -> i32 {
+  mut omens: tablets[8]Omen
+  omens.push(Favorable(rat(3, 2)))
+  omens.push(Ambiguous)
+  omens.push(Unfavorable(rat(1, 4)))
+  omens.push(Favorable(rat(2, 1)))
+  omens.push(Ambiguous)
+  omens.push(Unfavorable(rat(3, 4)))
+
+  println("the scribe reads:")
+  for o in omens {
+    describe(o)
+  }
+
+  mut total: rat = rat(0, 1)
+  for o in omens {
+    total = total + weight(o)
+  }
+  println("tally: ", total)
+
+  // Wrap the verdict in an Option so callers can signal a neutral
+  // reading without inventing a sentinel value.
+  step verdict: Option<str> = if total > rat(0, 1) {
+    Some("the gods favor this venture")
+  } else {
+    if total < rat(0, 1) {
+      Some("the signs counsel delay")
+    } else {
+      None
+    }
+  }
+  match verdict {
+    Some(msg) => println(msg),
+    None      => println("the omens balance; no counsel given"),
+  }
+  0
+}
+
+seal Option<T> {
+  Some(T),
+  None,
+}
