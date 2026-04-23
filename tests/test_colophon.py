@@ -216,6 +216,88 @@ def test_colophon_matching_signature_shares_internal_extern(tmp_path):
     assert out == b"hello from tuppu\ndirect syscall\n"
 
 
+# --- fn pointers across colophon (primitives-only) -------------------------
+
+def test_colophon_atexit_callback(tmp_path):
+    # `atexit(fn())` — callback runs on normal program exit. The Tuppu
+    # fn's LLVM function pointer passes straight across the C ABI; no
+    # marshaling because the signature is primitives-only.
+    src = (
+        'colophon fn atexit(cb: fn()) -> i32\n'
+        'fn cleanup() { println("goodbye") }\n'
+        'fn main() -> i32 {\n'
+        '  atexit(cleanup)\n'
+        '  println("hello")\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"hello\ngoodbye\n"
+
+
+def test_colophon_signal_fn_roundtrip(tmp_path):
+    # `signal(int, fn(int)) -> fn(int)` — the returned fn pointer can
+    # be both rebound to a later `signal` call AND invoked directly
+    # from Tuppu. Exercises both directions of the fn-pointer boundary.
+    src = (
+        'colophon fn signal(sig: i32, handler: fn(i32)) -> fn(i32)\n'
+        'colophon fn raise(sig: i32) -> i32\n'
+        'fn first(s: i32)  { println("first: ", s) }\n'
+        'fn second(s: i32) { println("second: ", s) }\n'
+        'fn main() -> i32 {\n'
+        '  signal(30 as i32, first)\n'
+        '  raise(30 as i32)\n'
+        '  step old = signal(30 as i32, second)\n'
+        '  raise(30 as i32)\n'
+        '  old(99 as i32)\n'          # call the returned fn pointer directly
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"first: 30\nsecond: 30\nfirst: 99\n"
+
+
+def test_colophon_fn_param_non_primitive_rejected():
+    # str in callback signature: rejected — we'd have to marshal str
+    # to/from cstr inside a C-invoked Tuppu fn, which is out of scope
+    # for primitives-only mode.
+    with pytest.raises(CompileError, match="primitives-only"):
+        compile_to_ir(
+            'colophon fn takes_bad(cb: fn(str) -> i32) -> i32\n'
+            'fn main() -> i32 { 0 }\n'
+        )
+
+
+def test_colophon_fn_return_non_primitive_rejected():
+    # Fn returning str is rejected on the same ground.
+    with pytest.raises(CompileError, match="primitives-only"):
+        compile_to_ir(
+            'colophon fn bad_ret(cb: fn() -> str) -> i32\n'
+            'fn main() -> i32 { 0 }\n'
+        )
+
+
+def test_colophon_nested_fn_type_rejected():
+    # A callback that itself takes a callback — rejected at v0.1.
+    with pytest.raises(CompileError, match="primitives-only"):
+        compile_to_ir(
+            'colophon fn nested(cb: fn(fn(i32)) -> i32) -> i32\n'
+            'fn main() -> i32 { 0 }\n'
+        )
+
+
+def test_colophon_fn_arg_signature_must_match(tmp_path):
+    # A Tuppu fn passed to a callback slot must type-match exactly —
+    # wrong param width is caught at the call site, not propagated to
+    # an LLVM verify failure.
+    with pytest.raises(CompileError, match="expected"):
+        compile_to_ir(
+            'colophon fn atexit(cb: fn()) -> i32\n'
+            'fn wrong(x: i32) { println(x) }\n'   # takes an arg; atexit doesn't supply one
+            'fn main() -> i32 { atexit(wrong)\n 0 }\n'
+        )
+
+
 def test_colophon_signature_mismatch_with_internal_errors():
     # User redeclares `write` with a wrong signature — previously this
     # silently reused the internal extern and miscalled it. Now we

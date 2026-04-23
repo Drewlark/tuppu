@@ -530,6 +530,11 @@ class Checker:
             )
         str_ty = self.structs.get("str")
 
+        def is_primitive(t: Ty) -> bool:
+            """Types that round-trip unchanged across the C ABI with no
+            marshaling. Used to gate callback-signature acceptance."""
+            return _is_int(t) or isinstance(t, (TyBool, TyUnit))
+
         def check_ffi_type(ty: Ty, where: str, *, is_return: bool) -> None:
             if _is_int(ty) or isinstance(ty, TyBool):
                 return
@@ -546,10 +551,28 @@ class Checker:
             # shape for `recv`/`send`-style fns. Params only; no return.
             if isinstance(ty, TyBuffer) and not is_return:
                 return
+            # Callback fn pointer — `fn(prim, ...) -> prim`. Accepted
+            # only when every param and the return are primitive
+            # (int, bool, unit); anything else would need marshaling
+            # inside the C-invoked callback, which we don't have a
+            # story for. Nested fn types (fns returning fns) are
+            # rejected at v0.1.
+            if isinstance(ty, TyFn):
+                if all(is_primitive(p) for p in ty.params) and is_primitive(ty.ret):
+                    return
+                raise CheckError(
+                    f"colophon {c.name!r}: {where} has type {ty}; "
+                    f"callback signatures are primitives-only (int / "
+                    f"bool / unit) at v0.1 — str / struct / wedge / "
+                    f"nested fn aren't marshalable across a C-invoked "
+                    f"callback",
+                    c.line, c.col,
+                )
             raise CheckError(
                 f"colophon {c.name!r}: {where} has type {ty}, which isn't "
                 f"marshalable across the C boundary yet (allowed: ints, "
-                f"bool, str, buffer, and — for parameters — user tablets)",
+                f"bool, str, buffer, fn(prim)->prim, and — for "
+                f"parameters — user tablets)",
                 c.line, c.col,
             )
 

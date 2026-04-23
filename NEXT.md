@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **547 tests passing.**
+- **553 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -155,6 +155,17 @@ What works:
   from compiler intrinsic to `stdlib/str.tpu` as a plain Tuppu fn.
   The binary `+` / `+=` operator on strs still uses the native
   single-malloc fast path. See `tests/test_variadic.py`.
+- **Primitive-only fn pointers across colophon.** `colophon fn
+  atexit(cb: fn())` and `colophon fn signal(sig: i32, handler:
+  fn(i32)) -> fn(i32)` both type-check and run. Tuppu fn names
+  pass straight through as LLVM function pointers (no wrapper,
+  no marshaling — LLVM's default calling convention is
+  C-compatible for primitive signatures). Callback signatures
+  are restricted to `fn(prim, ...) -> prim` (int / bool / unit)
+  at v0.1 — str/struct/wedge/nested-fn rejected at colophon
+  decl. Returned C fn pointers can be bound, rebound via a
+  later colophon call, or invoked directly from Tuppu (all
+  three tested). See `tests/test_colophon.py::test_colophon_*fn*`.
 - **If-as-statement relaxation.** When an `if` sits in statement
   position (a bare ExprStmt inside a block, not the block's tail
   and not assigned anywhere), its arms no longer need to unify.
@@ -952,7 +963,7 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 547 passing.
+2. `.venv/bin/pytest` — expect 553 passing.
 3. `git log --oneline -15` — recent timeline: sum types + generic
    monomorphization, str ownership sentinel on fn args, slicing,
    str_buf pattern via tablets-backed byte buffer + `bytes_to_str`,
@@ -975,6 +986,9 @@ If starting a fresh session after this compact:
    - ~~**If-as-statement relaxation**~~ — done 2026-04-23.
    After those: full closures (with capture) → overloads →
    operator overloads → maps → file I/O.
+   - ~~**§6. Fn pointers across colophon (primitives-only)**~~ —
+     done 2026-04-23. `signal` / `atexit` work; callback sigs must
+     be `fn(prim, ...) -> prim`.
 6. `FUTURE_OPTIMIZATIONS.md` (gitignored) captures design sketches
    for a `--strict-dish` flag, the SEX 20→16 byte shrink, SIMD carry
    in sex_add, and other perf/language ideas. Don't forget on the
