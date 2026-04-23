@@ -63,6 +63,40 @@ def test_if_stmt_elif_chain_also_relaxed():
     compile_to_ir(src)
 
 
+@pytest.mark.xfail(
+    reason=(
+        "KNOWN_BUGS.md Bug 1: if arm with a void-Call tail vs arm "
+        "with an Assign stmt (no tail) codegens to 'if arms "
+        "disagree', even though the if sits as a bare ExprStmt in "
+        "a while body (value is discarded). _gen_if_expr's "
+        "statement-position check comes after the arms-disagree "
+        "check."
+    ),
+    strict=True,
+)
+def test_if_stmt_arm_shape_mismatch(tmp_path):
+    from pathlib import Path
+    import subprocess
+    from tuppu.driver import compile_to_binary
+    src = (
+        "fn noop() { }\n"
+        "fn main() -> i32 {\n"
+        "  mut done: bool = false\n"
+        "  while !done {\n"
+        "    if done {\n"
+        "      noop()\n"
+        "    } else {\n"
+        "      done = true\n"
+        "    }\n"
+        "  }\n"
+        "  0\n"
+        "}\n"
+    )
+    binary = compile_to_binary(src, tmp_path, name="prog")
+    r = subprocess.run([str(binary)], capture_output=True)
+    assert r.returncode == 0
+
+
 def test_if_stmt_arms_can_be_divergent():
     # One arm diverges (colophon declared to return i32 but actually
     # terminates), the other runs ordinary statements. Without the

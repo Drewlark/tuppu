@@ -283,3 +283,34 @@ def test_match_scrutinee_must_be_seal(tmp_path):
     )
     with pytest.raises(CompileError, match="scrutinee must be a seal"):
         compile_to_ir(src)
+
+
+@pytest.mark.xfail(
+    reason=(
+        "KNOWN_BUGS.md Bug 2: recursive seal via tablet wrapper — "
+        "seal E references tablet N which holds an E field. Fails "
+        "with \"type E not supported in this stage\" because codegen "
+        "lowers seal fields before the identified type is declared. "
+        "Needs the two-phase pattern that tablets-recursion already "
+        "uses."
+    ),
+    strict=True,
+)
+def test_recursive_seal_via_tablet_wrapper(tmp_path):
+    src = (
+        "tablet N { e: E }\n"
+        "seal E { Num(i64), Add(wedge N, wedge N) }\n"
+        "fn main() -> i32 {\n"
+        "  mut store: tablets[8]N\n"
+        "  step a: wedge N = store.push(N { e: Num(1) })\n"
+        "  step b: wedge N = store.push(N { e: Add(a, a) })\n"
+        "  match b.e {\n"
+        "    Num(n) => println(\"leaf \", n),\n"
+        "    Add(x, y) => println(\"branch\"),\n"
+        "  }\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out, _ = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"branch\n"
