@@ -169,6 +169,73 @@ def test_negative_index_traps(tmp_path):
     assert r.returncode != 0
 
 
+# --- tablets as a value from a field / fn return ---------------------------
+
+def test_tablets_len_from_struct_field(tmp_path):
+    # `.len` on a tablets accessed as a struct field (not a direct
+    # Ident). Before the fix, `_gen_field`'s fast path only fired for
+    # Ident-rooted tablets, so struct-field access fell through to the
+    # generic "field access on X not supported yet" error.
+    src = (
+        "tablet Route { code: i64 }\n"
+        "tablet App { routes: tablets[8]Route, port: i32 }\n"
+        "fn main() -> i32 {\n"
+        "  mut a: App\n"
+        "  a.routes.push(Route { code: 1 })\n"
+        "  a.routes.push(Route { code: 2 })\n"
+        "  a.routes.push(Route { code: 3 })\n"
+        "  step n = a.routes.len\n"
+        "  println(n)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out = run(src, tmp_path)
+    assert out == b"3\n"
+
+
+def test_tablets_field_readable_through_nonmut_struct_arg(tmp_path):
+    # Passing a struct-with-tablets-field by value (non-mut) must
+    # preserve the tablets metadata so the callee can read it. Before
+    # the fix, `_struct_as_borrow` zeroed tablets fields for every
+    # struct arg — mut or not — destroying the data the callee needed
+    # to read. Only mut struct params need the neutering (to prevent
+    # the callee's cleanup frame from double-releasing caller chunks).
+    src = (
+        "tablet Route { code: i64 }\n"
+        "tablet App { routes: tablets[8]Route, port: i32 }\n"
+        "fn count(app: App) -> i64 { app.routes.len }\n"
+        "fn main() -> i32 {\n"
+        "  mut a: App\n"
+        "  a.routes.push(Route { code: 1 })\n"
+        "  a.routes.push(Route { code: 2 })\n"
+        "  println(count(a))\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out = run(src, tmp_path)
+    assert out == b"2\n"
+
+
+def test_tablets_len_from_fn_return(tmp_path):
+    # Same general case — tablets returned from a fn, with `.len` read
+    # off the returned SSA value.
+    src = (
+        "fn build() -> tablets[4]i64 {\n"
+        "  mut t: tablets[4]i64\n"
+        "  t.push(10)\n"
+        "  t.push(20)\n"
+        "  t\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  step t = build()\n"
+        "  println(t.len)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out = run(src, tmp_path)
+    assert out == b"2\n"
+
+
 # --- generated helpers live in the IR --------------------------------------
 
 def test_helpers_emitted():

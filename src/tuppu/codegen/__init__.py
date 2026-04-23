@@ -46,6 +46,13 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         self.module.triple = llvm.get_default_triple()
         self.builder: ir.IRBuilder | None = None
         self.functions: dict[str, ir.Function] = {}
+        # Per-fn parameter mut-ness — populated by `_declare_fn` /
+        # `_declare_colophon` / `_declare_gloss` / monomorph paths.
+        # Consulted by `_gen_call` to decide whether a struct-with-
+        # cleanup arg needs field neutering: only mut params do (so
+        # the callee's cleanup frame doesn't double-free), non-mut
+        # params read the caller's data as-is.
+        self._fn_param_mut: dict[str, list[bool]] = {}
         self.scopes: list[dict[str, Variable]] = []
         self._strings: dict[bytes, ir.GlobalVariable] = {}
         self._str_counter = 0
@@ -279,6 +286,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         for i, p in enumerate(fn.params):
             llvm_fn.args[i].name = p.name
         self.functions[fn.name] = llvm_fn
+        self._fn_param_mut[fn.name] = [p.is_mut for p in fn.params]
 
     def _declare_gloss(self, g: A.GlossDecl) -> None:
         """Forward-declare a gloss fn under its mangled internal name.
@@ -390,6 +398,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 llvm_fn.args[i].name = p.name
         self.functions[c.name] = llvm_fn
         self._colophon_decls[c.name] = c
+        self._fn_param_mut[c.name] = [p.is_mut for p in c.params]
 
     def _colophon_c_ty(self, ty: ir.Type) -> ir.Type:
         """Map a Tuppu-side LLVM type to its C-ABI counterpart for
@@ -908,11 +917,16 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         for i, p in enumerate(decl.params):
             llvm_fn.args[i].name = p.name
         self._fn_monomorphs[key] = llvm_fn
+        self._fn_param_mut[mono_name] = [p.is_mut for p in decl.params]
         # Temporarily install this specialization under the decl's
         # source name so recursive calls inside the body find it and
         # don't trigger a second monomorphization pass.
         saved_functions = self.functions.get(name)
         self.functions[name] = llvm_fn
+        # Mirror the param-mut list under the source name for the
+        # duration of recursive body emission.
+        saved_param_mut = self._fn_param_mut.get(name)
+        self._fn_param_mut[name] = self._fn_param_mut[mono_name]
         try:
             self._gen_fn_body(decl)
         finally:
@@ -925,6 +939,10 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 del self.functions[name]
             else:
                 self.functions[name] = saved_functions
+            if saved_param_mut is None:
+                del self._fn_param_mut[name]
+            else:
+                self._fn_param_mut[name] = saved_param_mut
         return llvm_fn
 
     # --- seals (sum types) ---------------------------------------------
@@ -2636,6 +2654,16 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             # str, cleanup markers zeroed for struct fields — so the
             # callee's own scope-exit release is a no-op on every
             # heap-owning field. Caller retains sole ownership.
+            #
+            # Struct neutering only fires for MUT struct params: those
+            # are the only ones that alloca + register cleanup in the
+            # callee. Non-mut struct params read the SSA value as-is,
+            # no cleanup frame entry — so neutering would pointlessly
+            # zero out tablets fields the callee wants to read.
+            param_is_mut = False
+            param_mut_list = self._fn_param_mut.get(name)
+            if param_mut_list is not None and i < len(param_mut_list):
+                param_is_mut = param_mut_list[i]
             if self._is_str_value(expected_ty):
                 self._register_str_rvalue_cleanup(coerced, arg)
                 coerced = self._str_as_borrow(coerced)
@@ -2646,7 +2674,8 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 self._register_struct_rvalue_cleanup(
                     coerced, arg, expected_ty,
                 )
-                coerced = self._struct_as_borrow(coerced, expected_ty)
+                if param_is_mut:
+                    coerced = self._struct_as_borrow(coerced, expected_ty)
             call_args.append(coerced)
         return self.builder.call(fn, call_args)
 
@@ -2936,6 +2965,17 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         target = self._gen_expr(e.target)
         if target is None:
             raise CodegenError("field access target has no value")
+        # Tablets value read as an SSA (e.g. from a struct field or a
+        # fn return). The fast path above only fires for direct Ident
+        # bindings; here we cover the general case. Only `.len` is
+        # readable off the value — indexing needs a pointer and goes
+        # through `_gen_index`'s spill-to-alloca path.
+        if self._tablets_info_for(target.type) is not None:
+            if e.name == "len":
+                return self.builder.extract_value(target, 2)
+            raise CodegenError(
+                f"tablets has no field {e.name!r}; only len"
+            )
         # Tablet handle: auto-deref. The handle is a pointer to the
         # underlying struct; GEP into it to the field slot, then load.
         if isinstance(target.type, ir.PointerType):
