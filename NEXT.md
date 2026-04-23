@@ -1010,6 +1010,56 @@ pressure before committing to one.
   full str ownership story. Overdue but purely editorial — cut
   a half-day when the feature surface stabilizes.
 
+### If-arm unification leaks outside "real" statement position
+
+The statement-position relaxation (§4 in the done list) marks an
+`if` as "value discarded" when it sits as a bare `ExprStmt` inside
+a block, so arms don't need to unify. `_mark_stmt_if` propagates
+into elif chains correctly.
+
+What it misses:
+
+- **Nested ifs inside a statement-position if's arms.** `if a {
+  if b { foo() } else { bar() } } else { c = 1 }` — the outer is
+  relaxed, but the inner `if b { ... }` still demands arm unity
+  even though its value is also discarded.
+- **Block-tail ifs whose block itself is in statement position.**
+  `while cond { { if ... { foo() } else { bar() } } }` — the
+  inner block's tail is an if; the outer while body discards its
+  value but the inner if doesn't see that context.
+- **If-arm containing an Assign stmt.** `if (...) { foo() } else
+  { a = 1 }` — flagged by a user as still messy even when the
+  containing if is in statement position. Needs a concrete repro
+  to confirm what path is biting; might be the block-tail issue
+  above.
+
+Fix direction: make `_mark_stmt_if` recursive into arm tails. If
+an arm's body is a Block whose tail is itself an IfExpr (or whose
+tail is a block ending in an IfExpr), mark that nested if too.
+Cheap — call `_mark_stmt_if` on any IfExpr found as a tail of a
+statement-position arm.
+
+### Recursive seal fails in certain situations
+
+User-reported: recursive `seal`s (e.g. `seal Tree<T> { Branch(wedge
+Tree<T>, wedge Tree<T>), Leaf }`) fail to compile in some shapes.
+Needs a concrete repro — probably the monomorphization path not
+handling the self-reference in the generic-seal case, or the
+payload-width computation choking on a self-referential variant
+field type.
+
+Fix direction: mirror what we did for recursive tablets (`tablet
+Node<T> { next: wedge Node<T> }`) — declare the identified type
+up-front, resolve variant field types once all seals are visible,
+let self-references hit the cached type. Also ensure the
+monomorph path for generic seals handles the case where a variant
+holds a `wedge Self<TArgs>`.
+
+File a repro-driven bug: what's the exact declaration + usage
+pattern that crashes? Without that, wild guessing. If the
+community can send the failing decl it's probably a one-line fix
+in `_resolve_seal_variants` / `_get_monomorph_seal`.
+
 ### Deep-clone for struct-with-tablets-field
 
 Returning a struct via Field/Index currently deep-clones through
