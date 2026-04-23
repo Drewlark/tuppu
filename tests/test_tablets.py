@@ -338,18 +338,12 @@ def test_tablets_index_returns_borrow(tmp_path):
     assert out == b"ab\ncd\n"
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Copying an Index-borrowed struct value and re-pushing into a "
-        "tablets creates two entries sharing the same cap>0 str bytes; "
-        "the release walk frees them both, double-freeing. The fix "
-        "belongs with the broader 'struct-copy ownership' story — "
-        "either neuter field caps on Index reads, or clone fields on "
-        "push of an Index-sourced struct. Filed under NEXT.md §7."
-    ),
-    strict=True,
-)
-def test_reindex_and_repush_struct_double_free(tmp_path):
+def test_reindex_and_repush_struct_no_double_free(tmp_path):
+    # Copying an Index-borrowed struct back into the same tablets
+    # must not double-free: Index reads return borrows (cleanup
+    # markers neutered), so the copied entry has cap=0 str fields
+    # that the release walk no-ops on. Original entry still owns,
+    # gets freed exactly once.
     src = (
         "tablet Entry { key: str, val: str }\n"
         "fn find(mut store: tablets[4]Entry, key: str) -> wedge Entry {\n"
@@ -372,6 +366,131 @@ def test_reindex_and_repush_struct_double_free(tmp_path):
     rc, out = run_with_stdlib(src, tmp_path)
     assert rc == 0
     assert out == b"v1\n"
+
+
+def test_assign_transfers_ownership_from_ident_rhs(tmp_path):
+    # `x = owned_k` where owned_k has cleanup registered: the target
+    # takes over, source cleanup is transferred (entry removed from
+    # frame), no double-free when both the binding and source would
+    # otherwise release the same bytes.
+    src = (
+        "fn main() -> i32 {\n"
+        "  mut x: str = \"\"\n"
+        "  step owned = \"alpha\" + \"beta\"\n"
+        "  x = owned\n"
+        "  println(x)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"alphabeta\n"
+
+
+def test_tablets_slot_assign_transfers_from_ident(tmp_path):
+    # `t[i] = owned_k` transfers ownership into the tablets slot.
+    # Tablets release walks and frees; caller's owned_k cleanup is
+    # transferred → no-op. One free total.
+    src = (
+        "fn main() -> i32 {\n"
+        "  mut t: tablets[2]str\n"
+        "  step _x = t.push(\"a\")\n"
+        "  step _y = t.push(\"b\")\n"
+        "  step owned = \"xxx\" + \"yyy\"\n"
+        "  t[0] = owned\n"
+        "  println(t[0])\n"
+        "  println(t[1])\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"xxxyyy\nb\n"
+
+
+def test_struct_field_assign_transfers_from_ident(tmp_path):
+    src = (
+        "tablet Row { label: str }\n"
+        "fn main() -> i32 {\n"
+        "  mut r: Row = Row { label: \"\" }\n"
+        "  step owned = \"he\" + \"llo\"\n"
+        "  r.label = owned\n"
+        "  println(r.label)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello\n"
+
+
+def test_return_struct_from_container_deep_clones(tmp_path):
+    # Returning a struct via Index from a container deep-clones it:
+    # each cleanup-bearing field (here, a str) gets a fresh heap
+    # allocation so the caller's copy has independent ownership
+    # from the container's copy. Both can be released safely at
+    # their respective scope exits.
+    src = (
+        "tablet Row { label: str, n: i64 }\n"
+        "fn get(store: tablets[4]Row, i: i64) -> Row {\n"
+        "  store[i]\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  mut store: tablets[4]Row\n"
+        "  step _a = store.push(Row { label: \"hi\" + \"!\", n: 1 })\n"
+        "  step _b = store.push(Row { label: \"bye\" + \"!\", n: 2 })\n"
+        "  step r0 = get(store, 0)\n"
+        "  step r1 = get(store, 1)\n"
+        "  println(r0.label)\n"
+        "  println(r0.n)\n"
+        "  println(r1.label)\n"
+        "  println(r1.n)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hi!\n1\nbye!\n2\n"
+
+
+def test_return_nested_struct_field_deep_clones(tmp_path):
+    # Nested struct with str fields: the clone fn walks recursively.
+    src = (
+        "tablet Inner { s: str }\n"
+        "tablet Outer { inner: Inner, n: i64 }\n"
+        "fn get_inner(o: Outer) -> Inner { o.inner }\n"
+        "fn main() -> i32 {\n"
+        "  step o = Outer { inner: Inner { s: \"hello\" + \"x\" }, n: 5 }\n"
+        "  step i = get_inner(o)\n"
+        "  println(i.s)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hellox\n"
+
+
+def test_return_field_of_local_struct_no_uaf(tmp_path):
+    # Fn body tail is a Field read off a local struct. The struct's
+    # cleanup fires at block exit; without a clone-on-return the
+    # returned cap=0 borrow would dangle and the caller would read
+    # freed memory.
+    src = (
+        "tablet Row { label: str }\n"
+        "fn build() -> str {\n"
+        "  step r: Row = Row { label: \"abc\" + \"def\" }\n"
+        "  r.label\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  step s = build()\n"
+        "  println(s)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"abcdef\n"
 
 
 def test_yield_field_of_wedge_no_double_free(tmp_path):

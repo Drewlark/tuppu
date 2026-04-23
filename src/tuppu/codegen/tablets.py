@@ -72,24 +72,36 @@ class TabletsMixin:
     def _gen_tablets_index(
         self, info: TabletsInfo, var: Variable, idx_expr: A.Expr,
     ) -> ir.Value:
-        if not isinstance(var.ir_ref.type, ir.PointerType):
-            raise CodegenError(
-                "tablets indexing requires a slot-backed binding "
-                "(mut or tablets-literal step)"
-            )
         assert self.builder is not None
+        # Non-pointer-backed binding (e.g. a non-mut tablets fn param):
+        # spill the SSA value to a temp alloca so info.get has a ptr
+        # to chain-walk. The spill is a local copy of the metadata
+        # only; the chunks still live in the caller's storage, so
+        # reads return the current state.
+        if not isinstance(var.ir_ref.type, ir.PointerType):
+            slot = self._alloca_entry(var.ir_ref.type, ".tbls.view")
+            self.builder.store(var.ir_ref, slot)
+            t_ptr = slot
+        else:
+            t_ptr = var.ir_ref
         idx = self._gen_expr(idx_expr)
         if idx is None:
             raise CodegenError("tablets index has no value")
         idx = self._coerce(idx, I64)
         len_addr = self.builder.gep(
-            var.ir_ref,
+            t_ptr,
             [ir.Constant(I32, 0), ir.Constant(I32, 2)],
             inbounds=True,
         )
         length = self.builder.load(len_addr)
         self._emit_dynamic_bounds_trap(idx, length)
-        return self.builder.call(info.get, [var.ir_ref, idx])
+        val = self.builder.call(info.get, [t_ptr, idx])
+        # Reads from a container are borrows — the container owns the
+        # bytes; the caller gets a view. Neuter cleanup markers so
+        # copying the value (into another struct, another container,
+        # etc.) doesn't create a second "owner" that would double-free
+        # at release-walk time.
+        return self._read_borrow(val)
 
     def _emit_dynamic_bounds_trap(self, idx: ir.Value, length: ir.Value) -> None:
         assert self.builder is not None

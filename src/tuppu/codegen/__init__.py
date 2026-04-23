@@ -77,6 +77,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         # Built lazily; only emitted for structs that transitively hold
         # cleanup-bearing fields (str / tablets / nested cleanup struct).
         self._struct_release_cache: dict[int, ir.Function] = {}
+        # Per-struct clone fns, keyed by id(struct_ty). Emitted lazily
+        # on first use at a Field/Index return site, where the
+        # returned value needs independently-owned bytes so the
+        # caller doesn't UAF when the source's cleanup fires first.
+        self._struct_clone_cache: dict[int, ir.Function] = {}
         # table name -> (global array, length, lo bound, element LLVM type)
         self._tables: dict[str, tuple[ir.GlobalVariable, int, int, ir.Type]] = {}
         # Tablets monomorphizations: key is (N, str(elem_type)).
@@ -1726,26 +1731,13 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         self._emit_all_cleanups_for_early_return()
         self.builder.ret(coerced)
 
-    def _neuter_return_if_borrow(
-        self, val: ir.Value, expr: "A.Expr",
-    ) -> ir.Value:
-        """When a fn returns a cleanup-bearing value that the callee
-        doesn't own — a Field read off a struct, an Index into a
-        container, etc. — we hand the caller a BORROW (cap=0 for str,
-        zero cleanup markers for struct). Without this, the caller's
-        scope-exit release would free bytes the source container
-        still references, double-freeing when the container itself
-        is released.
-
-        The borrow-back means the caller should not outlive the
-        container. In practice the container is usually in the
-        caller's own scope (or an outer one), so lifetime nests
-        correctly. Patterns that genuinely need ownership should
-        explicitly clone — e.g. `yield str_clone(cur.val)` — since
-        the compiler can't tell without escape analysis whether the
-        caller will outlive the source."""
-        if not isinstance(expr, (A.Field, A.Index)):
-            return val
+    def _read_borrow(self, val: ir.Value) -> ir.Value:
+        """Neuter cleanup markers on a value read from a container or
+        aggregate — str gets cap=0, struct-with-cleanup gets all its
+        cleanup-bearing fields zeroed (recursively). Represents the
+        "borrow view" of the read: the underlying container still owns
+        the bytes; the caller sees a view that won't double-free when
+        copied, compared, or passed along."""
         if self._is_str_value(val.type):
             return self._str_as_borrow(val)
         if (
@@ -1753,6 +1745,47 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             and self._struct_needs_cleanup(val.type)
         ):
             return self._struct_as_borrow(val, val.type)
+        return val
+
+    def _neuter_return_if_borrow(
+        self, val: ir.Value, expr: "A.Expr",
+    ) -> ir.Value:
+        """When a fn returns a cleanup-bearing value that the callee
+        doesn't own — a Field read off a struct, an Index into a
+        container, etc. — deep-clone so the caller receives
+        independently-owned bytes. Cloning sidesteps both double-free
+        and UAF risks. Users who want to avoid the alloc can return a
+        wedge / handle instead, or return an Ident of a locally-bound
+        struct (which transfers ownership cleanly)."""
+        if not isinstance(expr, (A.Field, A.Index)):
+            return val
+        return self._deep_clone_if_cleanup_bearing(val)
+
+    def _deep_clone_if_cleanup_bearing(self, val: ir.Value) -> ir.Value:
+        """Deep-clone `val` if it's a cleanup-bearing type — str, or a
+        user struct whose fields recursively require cloning. Scalars
+        pass through unchanged. A tablets-holding struct raises a
+        codegen error from `_get_struct_clone`: cloning a tablets
+        requires walking + cloning each element, which isn't
+        implemented."""
+        assert self.builder is not None
+        if self._is_str_value(val.type):
+            return self.builder.call(self._get_str_clone(), [val])
+        if (
+            self._struct_fields_for(val.type) is not None
+            and self._struct_needs_cleanup(val.type)
+        ):
+            return self.builder.call(
+                self._get_struct_clone(val.type), [val],
+            )
+        # Bare tablets return from Field/Index — rare; reject clearly.
+        if self._tablets_info_for(val.type) is not None:
+            raise CodegenError(
+                "returning a tablets value via Field/Index isn't "
+                "supported — cloning a tablets requires walking + "
+                "cloning each element, which isn't implemented. "
+                "Return a wedge handle or restructure the fn."
+            )
         return val
 
     def _emit_all_cleanups_for_early_return(self) -> None:
@@ -2013,6 +2046,60 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         b.ret_void()
         return fn
 
+    def _get_struct_clone(self, struct_ty: ir.Type) -> ir.Function:
+        """Build (once, caching by LLVM-type identity) a deep-clone fn
+        for a user struct: `__tuppu_struct_<name>_clone(src: struct_ty)
+        -> struct_ty`. Returns a fresh value with cloned str fields
+        (new heap allocations), recursively-cloned nested struct
+        fields, and scalar fields copied by value. Rejects tablets
+        fields — cloning those requires walking and cloning each
+        element, which is a bigger-scope piece of work; users
+        needing to return a struct-with-tablets-field should
+        restructure or clone manually."""
+        cached = self._struct_clone_cache.get(id(struct_ty))
+        if cached is not None:
+            return cached
+        name = self._struct_name_for(struct_ty) or "anon"
+        fn = ir.Function(
+            self.module,
+            ir.FunctionType(struct_ty, [struct_ty]),
+            name=f"__tuppu_struct_{name}_clone",
+        )
+        # Cache up front so recursive struct clones (nested fields of
+        # the same type) see the in-progress function rather than
+        # rebuilding it into an infinite loop.
+        self._struct_clone_cache[id(struct_ty)] = fn
+
+        entry = fn.append_basic_block("entry")
+        b = ir.IRBuilder(entry)
+        src = fn.args[0]
+        result: ir.Value = ir.Constant(struct_ty, ir.Undefined)
+        fields = self._struct_fields_for(struct_ty) or []
+        for i, (_fname, fty) in enumerate(fields):
+            field_val = b.extract_value(src, i)
+            if self._is_str_value(fty):
+                cloned = b.call(self._get_str_clone(), [field_val])
+                result = b.insert_value(result, cloned, i)
+                continue
+            if self._tablets_info_for(fty) is not None:
+                raise CodegenError(
+                    f"struct {name!r}: deep-cloning a tablets field "
+                    f"isn't supported yet. Returning a struct that "
+                    f"holds tablets by Field/Index isn't supported — "
+                    f"restructure or construct a fresh struct."
+                )
+            if (
+                self._struct_fields_for(fty) is not None
+                and self._struct_needs_cleanup(fty)
+            ):
+                cloned = b.call(self._get_struct_clone(fty), [field_val])
+                result = b.insert_value(result, cloned, i)
+                continue
+            # Scalars, pointers, wedges: copy by value.
+            result = b.insert_value(result, field_val, i)
+        b.ret(result)
+        return fn
+
     def _register_str_rvalue_cleanup(
         self, val: ir.Value, src: A.Expr,
     ) -> None:
@@ -2064,6 +2151,17 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                     self._get_struct_release(slot_ty), [slot_ptr],
                 )
         self.builder.store(self._coerce(value, slot_ty), slot_ptr)
+        # Ownership transfer: if the RHS is an Ident whose cleanup is
+        # registered, the assignment target now owns those bytes. The
+        # source binding's scope-exit release would race with the
+        # target's release (mut binding cleanup / struct or tablets
+        # walk) and double-free. Matches the transfer semantics at
+        # push / struct-lit sites.
+        if (
+            isinstance(a.value, A.Ident)
+            and self._is_cleanup_bearing_ty(slot_ty)
+        ):
+            self._transfer_cleanup_into_container(a.value.name)
 
     def _lvalue_slot(self, target: A.Expr) -> tuple[ir.Value, ir.Type]:
         """Resolve an lvalue to (pointer-to-slot, value-type-at-slot).
@@ -2335,6 +2433,19 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 and isinstance(b.tail, A.Ident)
             ):
                 self._transfer_ownership_out(b.tail.name)
+            # Field / Index tail of a cleanup-bearing type: the bytes
+            # are owned elsewhere (by a local struct, a container,
+            # etc.). Clone BEFORE firing scope-exit cleanups — the
+            # source's cleanup may run here and free the original
+            # bytes. Cloning into a caller-owned value sidesteps both
+            # the UAF-via-local-cleanup case and the double-free-via-
+            # container-walk case.
+            if (
+                not self._is_terminated()
+                and tail_val is not None
+                and isinstance(b.tail, (A.Field, A.Index))
+            ):
+                tail_val = self._deep_clone_if_cleanup_bearing(tail_val)
             # Emit cleanups for this frame on fall-through (not on early
             # return — yield emits its own chain before the ret).
             if not self._is_terminated():
@@ -3152,7 +3263,12 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                             [ir.Constant(I32, 0), ir.Constant(I32, i)],
                             inbounds=True,
                         )
-                        return self.builder.load(field_ptr)
+                        # Wedge-deref reads BORROW the container's
+                        # storage — the tablets owns the underlying
+                        # bytes. Neuter cleanup markers so passing
+                        # this value to a container-owning site
+                        # doesn't create a second owner.
+                        return self._read_borrow(self.builder.load(field_ptr))
                 raise CodegenError(
                     f"tablet has no field {e.name!r}"
                 )
@@ -3163,7 +3279,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         if fields is not None:
             for i, (fname, _fty) in enumerate(fields):
                 if fname == e.name:
-                    return self.builder.extract_value(target, i)
+                    # Field read is a borrow — see the wedge-deref
+                    # comment above. Same neutering rule.
+                    return self._read_borrow(
+                        self.builder.extract_value(target, i),
+                    )
             raise CodegenError(
                 f"tablet has no field {e.name!r}"
             )

@@ -242,6 +242,36 @@ class StrsMixin:
         self._str_slice = fn
         return fn
 
+    def _get_str_clone(self) -> ir.Function:
+        """`__tuppu_str_clone(s: str) -> str`. Returns a fresh heap-
+        owned copy of `s`: malloc(len+1) + memcpy + NUL-terminate +
+        cap = len. Used at Field/Index return sites to hand the
+        caller independently-owned bytes — without this, returning
+        a str field / element UAFs when the source's lifetime ends
+        before the caller reads the value."""
+        cached = getattr(self, "_str_clone_fn", None)
+        if cached is not None:
+            return cached
+        str_ty = self._str_ty()
+        fn = ir.Function(
+            self.module,
+            ir.FunctionType(str_ty, [str_ty]),
+            name="__tuppu_str_clone",
+        )
+        fn.args[0].name = "s"
+        entry = fn.append_basic_block("entry")
+        b = ir.IRBuilder(entry)
+        src = b.extract_value(fn.args[0], 0)
+        length = b.extract_value(fn.args[0], 1)
+        alloc_size = b.add(length, ir.Constant(I64, 1))
+        raw = b.call(self._get_malloc(), [alloc_size])
+        b.call(self._get_memcpy(), [raw, src, length])
+        b.store(ir.Constant(I8, 0), b.gep(raw, [length], inbounds=True))
+        out = self._str_build_value_in(b, raw, length, length)
+        b.ret(out)
+        self._str_clone_fn = fn
+        return fn
+
     # --- int / rat / bool → str ---------------------------------------
 
     def _get_int_to_str(self) -> ir.Function:

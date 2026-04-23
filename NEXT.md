@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **577 tests passing.**
+- **585 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -1010,27 +1010,6 @@ pressure before committing to one.
   full str ownership story. Overdue but purely editorial — cut
   a half-day when the feature surface stabilizes.
 
-### Known bugs filed here, tests pending
-
-- **Copying an Index-borrowed struct, then re-pushing.** `step cur =
-  store[i]` is an Index-init borrow (correct). If the user then
-  `store.push(cur)` (or pushes into a different tablets), the second
-  container gets a copy of the struct with cap>0 str fields *shared*
-  with the original. Release walks on both containers will hit the
-  same ptr → double-free. See
-  `tests/test_tablets.py::test_reindex_and_repush_struct_double_free`
-  (xfail). The fix belongs with the broader "struct-copy ownership"
-  story: either neuter field caps on Index reads (consistent with
-  the "Index is a borrow" rule), or clone fields on push when the
-  source is Index-derived. Probably the former — matches how str
-  args get neutered at fn-call sites.
-
-- **`_gen_assign` transfer for Ident RHS.** Push and struct-lit both
-  transfer ownership from an Ident RHS; `_gen_assign` (covering
-  `mut x = owned_k`, `p.field = owned_k`, `t[i] = owned_k`) doesn't.
-  Not a blocker for the community's real code (they use push /
-  struct-lit exclusively), but a latent footgun worth closing.
-
 ### Known friction spots worth a look
 
 - **Struct returns across colophon.** Currently rejected — we
@@ -1087,7 +1066,7 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 577 passing.
+2. `.venv/bin/pytest` — expect 585 passing.
 3. `git log --oneline -15` — recent timeline: sum types + generic
    monomorphization, str ownership sentinel on fn args, slicing,
    str_buf pattern via tablets-backed byte buffer + `bytes_to_str`,
