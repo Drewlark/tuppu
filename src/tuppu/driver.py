@@ -65,9 +65,9 @@ def compile_sources_to_ir(sources: list[tuple[str, str]]) -> str:
     """Generate LLVM IR text from a list of (label, source_text) pairs.
     Any non-fatal warnings from the type checker are written to stderr."""
     prog = _parse_labeled(sources)
-    warnings = check(prog)
-    _emit_warnings(warnings)
-    return str(codegen(prog))
+    checker = check(prog)
+    _emit_warnings(checker.warnings)
+    return str(codegen(prog, checker))
 
 
 def _emit_warnings(warnings: list[CompileWarning]) -> None:

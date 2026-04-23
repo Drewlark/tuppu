@@ -33,7 +33,11 @@ from .tablets import TabletsMixin
 
 
 class Codegen(SexMixin, RatMixin, TabletsMixin):
-    def __init__(self) -> None:
+    def __init__(self, checker=None) -> None:
+        # Checker provides monomorphization sidebands — `mono_call_args`
+        # keyed by id(Call) and `mono_struct_args` keyed by id(StructLit).
+        # Plus `struct_type_params` / `fn_type_params` for name → params.
+        self._checker = checker
         # Fresh LLVM context per Codegen so identified struct types
         # (e.g. user `seal Point { ... }`) don't leak across test runs
         # or multiple compilations in the same process.
@@ -64,6 +68,16 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         self._cleanup_frames: list[list[tuple[ir.Function, ir.Value, str]]] = []
         self._struct_types: dict[str, ir.LiteralStructType] = {}
         self._struct_fields: dict[str, list[tuple[str, ir.Type]]] = {}
+        # Generic monomorphizations. Keys are (name, tuple-of-LLVM-types).
+        # Values are the specialized LLVM types / functions. Populated
+        # on demand via `_get_monomorph_struct` / `_get_monomorph_fn`.
+        self._struct_monomorphs: dict[tuple, ir.IdentifiedStructType] = {}
+        self._struct_mono_fields: dict[tuple, list[tuple[str, ir.Type]]] = {}
+        self._fn_monomorphs: dict[tuple, ir.Function] = {}
+        # Current generic-body type-arg substitution, source-param name
+        # → concrete LLVM type. Set by `_emit_fn_specialization` while
+        # walking a specialization of a generic fn body.
+        self._type_arg_subst: dict[str, ir.Type] = {}
         # Most-recent AST source location, updated as we walk statements
         # and expressions. Used to attach line:col to codegen errors that
         # don't otherwise carry one.
@@ -135,9 +149,18 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
             [d for d in prog.decls if isinstance(d, A.StructDecl)]
         )
 
-        # Phase 1: forward-declare all user functions.
+        # Generic fns are monomorphized lazily at call sites, so we
+        # don't declare/emit them here — just stash the AST.
+        self._generic_fn_decls: dict[str, A.FnDecl] = {
+            d.name: d for d in prog.decls
+            if isinstance(d, A.FnDecl) and d.type_params
+        }
+
+        # Phase 1: forward-declare all non-generic user functions.
         for decl in prog.decls:
             if isinstance(decl, A.FnDecl):
+                if decl.type_params:
+                    continue
                 self._declare_fn(decl)
             elif isinstance(decl, A.TableDecl):
                 pass  # handled in phase 2 after function decls are visible
@@ -155,10 +178,13 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
             if isinstance(decl, A.TableDecl):
                 self._emit_table(decl)
 
-        # Phase 3: emit function bodies. Tables are already visible so
-        # table[i] access works from user code.
+        # Phase 3: emit bodies of non-generic functions. Generic fn
+        # specializations are emitted on demand when we see a call to
+        # them (see `_get_monomorph_fn`).
         for decl in prog.decls:
             if isinstance(decl, A.FnDecl):
+                if decl.type_params:
+                    continue
                 self._gen_fn_body(decl)
         return self.module
 
@@ -263,9 +289,16 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
             # and rat is a real conversion, not a no-op.
             if t.name in ("sex", "dish"):
                 return SEX
+            # Generic-body type parameter in scope — resolve to the
+            # current specialization's concrete LLVM type.
+            if t.name in self._type_arg_subst:
+                return self._type_arg_subst[t.name]
             if t.name in self._struct_types:
                 return self._struct_types[t.name]
             raise CodegenError(f"type {t.name!r} not supported in this stage")
+        if isinstance(t, A.TypeApply):
+            arg_tys = tuple(self._lower_type(a) for a in t.args)
+            return self._get_monomorph_struct(t.name, arg_tys)
         if isinstance(t, A.TypeTablets):
             elem = self._lower_type(t.element)
             return self._get_tablets(t.size, elem).tablets_ty
@@ -282,16 +315,21 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         )
 
     def _register_structs(self, decls: list[A.StructDecl]) -> None:
-        """Build LLVM types for user-defined structs.
+        """Build LLVM types for user-defined tablets.
 
         Two phases enable recursive and mutually-recursive types: first
-        we declare every struct name as an empty identified LLVM type;
+        we declare every tablet name as an empty identified LLVM type;
         then we resolve field types now that every name is visible, so
-        `*Node` inside `Node`'s body resolves cleanly.
+        `wedge Node` inside `Node`'s body resolves cleanly.
 
-        A struct that contains itself without pointer indirection would
-        have infinite size — we detect that explicitly and point the
-        user at `*T` as the fix."""
+        Generic tablets (those with type parameters) are NOT emitted
+        here — we can't compute a layout without concrete type args.
+        Their AST declarations are stashed for on-demand specialization
+        via `_get_monomorph_struct(name, concrete_arg_tys)`."""
+        self._generic_struct_decls: dict[str, A.StructDecl] = {
+            d.name: d for d in decls if d.type_params
+        }
+        decls = [d for d in decls if not d.type_params]
         by_name = {d.name: d for d in decls}
 
         # Phase A: declare empty identified types for every struct.
@@ -346,10 +384,184 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
                 zip([n for n, _ in d.fields], field_tys)
             )
 
+    def _get_monomorph_struct(
+        self, name: str, arg_tys: tuple,
+    ) -> ir.IdentifiedStructType:
+        """Return (building once, caching thereafter) the specialized
+        identified LLVM struct type for a generic tablet at a specific
+        type-arg tuple. E.g. `_get_monomorph_struct("Node", (I64,))`
+        yields `Node_i64`.
+
+        Field bodies are set by substituting the declaration's type
+        parameters with `arg_tys` and lowering through `_lower_type` —
+        which means fields of type `wedge Node<T>` correctly produce
+        a pointer to this same monomorphized type (thanks to the
+        identified type being registered before we compute the body,
+        matching the non-generic case's two-phase approach)."""
+        if not arg_tys:
+            # Delegate to the non-generic path.
+            return self._struct_types[name]
+        key = (name, arg_tys)
+        cached = self._struct_monomorphs.get(key)
+        if cached is not None:
+            return cached
+        decl = self._generic_struct_decls.get(name)
+        if decl is None:
+            raise CodegenError(
+                f"unknown generic tablet {name!r} for monomorphization"
+            )
+        # Build a stable identified-type name from the args. llvmlite
+        # keeps the string as-is so we escape special chars lightly.
+        arg_tag = "_".join(str(a).replace(" ", "").replace('"', "")
+                           for a in arg_tys)
+        mono_name = f"{name}__{arg_tag}"
+        ident_ty = self.module.context.get_identified_type(mono_name)
+        self._struct_monomorphs[key] = ident_ty
+        # Set the subst so any reference to a type param inside the
+        # body resolves to the concrete arg. Also register this
+        # monomorph under `self._struct_types[decl.name]` temporarily
+        # so `wedge Node<T>` resolves back to the same identified type
+        # via the name lookup path. We pop the shadowing afterward.
+        saved_subst = self._type_arg_subst
+        self._type_arg_subst = dict(zip(decl.type_params, arg_tys))
+        saved_struct_ty = self._struct_types.get(name)
+        self._struct_types[name] = ident_ty
+        try:
+            field_tys = [self._lower_type(ftype) for _, ftype in decl.fields]
+        finally:
+            self._type_arg_subst = saved_subst
+            if saved_struct_ty is None:
+                del self._struct_types[name]
+            else:
+                self._struct_types[name] = saved_struct_ty
+        ident_ty.set_body(*field_tys)
+        self._struct_mono_fields[key] = list(
+            zip([n for n, _ in decl.fields], field_tys)
+        )
+        return ident_ty
+
+    def _get_monomorph_fn(
+        self, name: str, arg_tys: tuple,
+    ) -> ir.Function:
+        """Emit (once, caching thereafter) a specialization of a
+        generic fn at a concrete type-arg tuple. Walks the fn body
+        AST with `_type_arg_subst` set so type-parameter references
+        resolve to the concrete LLVM type."""
+        key = (name, arg_tys)
+        cached = self._fn_monomorphs.get(key)
+        if cached is not None:
+            return cached
+        decl = self._generic_fn_decls.get(name)
+        if decl is None:
+            raise CodegenError(
+                f"unknown generic fn {name!r} for monomorphization"
+            )
+        saved_subst = self._type_arg_subst
+        saved_builder = self.builder
+        saved_scopes = self.scopes
+        saved_cleanup = self._cleanup_frames
+        saved_loc = self._current_loc
+        # Give the specialization a fresh scope + cleanup stack so it
+        # doesn't inherit state from whichever outer emit we're nested
+        # inside. _gen_fn_body will overwrite self.scopes anyway but
+        # the cleanup stack needs to start empty here.
+        self._cleanup_frames = []
+        self._type_arg_subst = dict(zip(decl.type_params, arg_tys))
+        # Declare with a tagged name. Fresh function — distinct from
+        # the generic AST decl.name which we never emit directly.
+        arg_tag = "_".join(str(a).replace(" ", "").replace('"', "")
+                           for a in arg_tys)
+        mono_name = f"{name}__{arg_tag}"
+        param_types = []
+        for p in decl.params:
+            t = self._lower_type(p.type)
+            if p.is_mut and self._tablets_info_for(t) is not None:
+                t = t.as_pointer()
+            param_types.append(t)
+        ret_type = (
+            self._lower_type(decl.return_type)
+            if decl.return_type else ir.VoidType()
+        )
+        fn_type = ir.FunctionType(ret_type, param_types)
+        llvm_fn = ir.Function(self.module, fn_type, name=mono_name)
+        for i, p in enumerate(decl.params):
+            llvm_fn.args[i].name = p.name
+        self._fn_monomorphs[key] = llvm_fn
+        # Temporarily install this specialization under the decl's
+        # source name so recursive calls inside the body find it and
+        # don't trigger a second monomorphization pass.
+        saved_functions = self.functions.get(name)
+        self.functions[name] = llvm_fn
+        try:
+            self._gen_fn_body(decl)
+        finally:
+            self._type_arg_subst = saved_subst
+            self.builder = saved_builder
+            self.scopes = saved_scopes
+            self._cleanup_frames = saved_cleanup
+            self._current_loc = saved_loc
+            if saved_functions is None:
+                del self.functions[name]
+            else:
+                self.functions[name] = saved_functions
+        return llvm_fn
+
+    def _lower_ty(self, ty) -> ir.Type:
+        """Convert a `typecheck.Ty` object (the resolved-type form the
+        checker works in) to an `ir.Type`. Used by monomorphization
+        paths where we have checker-resolved types, not AST nodes."""
+        from ..typecheck import (
+            TyInt, TyBool, TyRat, TyDish, TyUnit, TyHandle, TyTablets,
+            TyStruct, TyVar,
+        )
+        if isinstance(ty, TyVar):
+            # Inside a generic fn specialization, a TyVar that survived
+            # typechecking refers to one of this specialization's type
+            # parameters. Look it up via the current subst.
+            if ty.name in self._type_arg_subst:
+                return self._type_arg_subst[ty.name]
+            raise CodegenError(
+                f"unbound type variable {ty.name!r} during codegen"
+            )
+        if isinstance(ty, TyInt):
+            return ir.IntType(ty.width)
+        if isinstance(ty, TyBool):
+            return I1
+        if isinstance(ty, TyRat):
+            return RAT
+        if isinstance(ty, TyDish):
+            return SEX
+        if isinstance(ty, TyUnit):
+            return ir.VoidType()
+        if isinstance(ty, TyHandle):
+            return self._lower_ty(ty.element).as_pointer()
+        if isinstance(ty, TyTablets):
+            return self._get_tablets(ty.size, self._lower_ty(ty.element)).tablets_ty
+        if isinstance(ty, TyStruct):
+            if ty.args:
+                arg_tys = tuple(self._lower_ty(a) for a in ty.args)
+                return self._get_monomorph_struct(ty.name, arg_tys)
+            return self._struct_types[ty.name]
+        raise CodegenError(f"cannot lower checker type {ty!r} to LLVM")
+
     def _struct_name_for(self, llvm_ty: ir.Type) -> str | None:
         for name, ty in self._struct_types.items():
             if ty is llvm_ty:
                 return name
+        for (name, _args), ty in self._struct_monomorphs.items():
+            if ty is llvm_ty:
+                return name
+        return None
+
+    def _struct_fields_for(self, llvm_ty: ir.Type) -> list[tuple[str, ir.Type]] | None:
+        """Look up field list by LLVM type (for either non-generic or
+        monomorphized tablets). Returns None if not a known tablet."""
+        for name, ty in self._struct_types.items():
+            if ty is llvm_ty:
+                return self._struct_fields[name]
+        for key, ty in self._struct_monomorphs.items():
+            if ty is llvm_ty:
+                return self._struct_mono_fields[key]
         return None
 
     def _coerce(self, value: ir.Value, target_ty: ir.Type) -> ir.Value:
@@ -724,12 +936,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
             return var.ir_ref, var.value_ty
         if isinstance(target, A.Field):
             parent_ptr, parent_ty = self._lvalue_slot(target.target)
-            struct_name = self._struct_name_for(parent_ty)
-            if struct_name is None:
+            fields = self._struct_fields_for(parent_ty)
+            if fields is None:
                 raise CodegenError(
-                    f"field assignment: {parent_ty} is not a user struct"
+                    f"field assignment: {parent_ty} is not a user tablet"
                 )
-            fields = self._struct_fields[struct_name]
             for i, (fname, fty) in enumerate(fields):
                 if fname == target.name:
                     field_ptr = self.builder.gep(
@@ -739,7 +950,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
                     )
                     return field_ptr, fty
             raise CodegenError(
-                f"tablet {struct_name!r} has no field {target.name!r}"
+                f"tablet has no field {target.name!r}"
             )
         raise CodegenError(
             f"assignment target must be a variable or field chain, "
@@ -1060,7 +1271,18 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         if name == "rat":
             return self._gen_rat_ctor(e.args)
 
-        fn = self.functions.get(name)
+        # Generic fn call: look up the concrete type args inferred by
+        # the checker and dispatch to (emitting if necessary) the
+        # matching monomorphization. Non-generic calls take the normal
+        # path via self.functions.
+        mono_args = None
+        if self._checker is not None:
+            mono_args = self._checker.mono_call_args.get(id(e))
+        if mono_args is not None:
+            arg_tys_llvm = tuple(self._lower_ty(a) for a in mono_args)
+            fn = self._get_monomorph_fn(name, arg_tys_llvm)
+        else:
+            fn = self.functions.get(name)
         if fn is None:
             raise CodegenError(f"unknown function {name!r}")
         if len(e.args) != len(fn.args):
@@ -1216,9 +1438,9 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         # underlying struct; GEP into it to the field slot, then load.
         if isinstance(target.type, ir.PointerType):
             pointee = target.type.pointee
-            struct_name = self._struct_name_for(pointee)
-            if struct_name is not None:
-                for i, (fname, _fty) in enumerate(self._struct_fields[struct_name]):
+            fields = self._struct_fields_for(pointee)
+            if fields is not None:
+                for i, (fname, _fty) in enumerate(fields):
                     if fname == e.name:
                         field_ptr = self.builder.gep(
                             target,
@@ -1227,18 +1449,18 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
                         )
                         return self.builder.load(field_ptr)
                 raise CodegenError(
-                    f"tablet {struct_name!r} has no field {e.name!r}"
+                    f"tablet has no field {e.name!r}"
                 )
-        # Check user-defined structs BEFORE rat: a `struct P { x: i64, y: i64 }`
+        # Check user-defined tablets BEFORE rat: a `tablet P { x: i64, y: i64 }`
         # is structurally equal to RAT at the LLVM level, but identity
         # comparison against _struct_types distinguishes them correctly.
-        struct_name = self._struct_name_for(target.type)
-        if struct_name is not None:
-            for i, (fname, _fty) in enumerate(self._struct_fields[struct_name]):
+        fields = self._struct_fields_for(target.type)
+        if fields is not None:
+            for i, (fname, _fty) in enumerate(fields):
                 if fname == e.name:
                     return self.builder.extract_value(target, i)
             raise CodegenError(
-                f"tablet {struct_name!r} has no field {e.name!r}"
+                f"tablet has no field {e.name!r}"
             )
         if target.type == RAT:
             if e.name == "num":
@@ -1275,10 +1497,21 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
 
     def _gen_struct_lit(self, e: A.StructLit) -> ir.Value:
         assert self.builder is not None
-        if e.name not in self._struct_types:
-            raise CodegenError(f"unknown struct {e.name!r}")
-        struct_ty = self._struct_types[e.name]
-        fields = self._struct_fields[e.name]
+        # Generic tablet: consult the checker's mono_struct_args to
+        # find the concrete type-arg tuple inferred for this literal,
+        # then monomorphize.
+        mono_args = None
+        if self._checker is not None:
+            mono_args = self._checker.mono_struct_args.get(id(e))
+        if mono_args is not None:
+            arg_tys = tuple(self._lower_ty(a) for a in mono_args)
+            struct_ty = self._get_monomorph_struct(e.name, arg_tys)
+            fields = self._struct_mono_fields[(e.name, arg_tys)]
+        else:
+            if e.name not in self._struct_types:
+                raise CodegenError(f"unknown tablet {e.name!r}")
+            struct_ty = self._struct_types[e.name]
+            fields = self._struct_fields[e.name]
         provided: dict[str, A.Expr] = dict(e.fields)
         value: ir.Value = ir.Constant(struct_ty, ir.Undefined)
         for i, (fname, fty) in enumerate(fields):
@@ -1382,5 +1615,5 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
 
         raise CodegenError("indexing is only supported on tables, tablets, and str")
 
-def codegen(program: A.Program) -> ir.Module:
-    return Codegen().gen(program)
+def codegen(program: A.Program, checker=None) -> ir.Module:
+    return Codegen(checker=checker).gen(program)

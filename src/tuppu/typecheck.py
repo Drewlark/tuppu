@@ -35,6 +35,15 @@ def _suggest(name: str, candidates: Iterable[str]) -> str:
     return f" (did you mean {matches[0]!r}?)"
 
 
+class _UnifyError(Exception):
+    """Internal: structural unification failure. Wrapped into a
+    CheckError by the caller so the message includes call-site
+    context and source position."""
+    def __init__(self, detail: str = "") -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
 class CheckError(CompileError):
     def __init__(self, message: str, line: int = 0, col: int = 0) -> None:
         if line:
@@ -118,8 +127,22 @@ class TyTablets:
 
 @dataclass(frozen=True)
 class TyStruct:
-    """A user-defined struct. Nominally typed — equal by name only.
-    Field layout lives in Checker.struct_fields, keyed by name."""
+    """A user-defined tablet (product) type. Nominally typed — equal
+    by name only, with an optional tuple of instantiated type args
+    for generic tablets. `Node<i64>` and `Node<str>` are different
+    TyStructs; `Node` (non-generic) has args=()."""
+    name: str
+    args: tuple = ()    # tuple of Ty, type arguments for generic tablets
+    def __str__(self) -> str:
+        if not self.args:
+            return self.name
+        return f"{self.name}<{', '.join(str(a) for a in self.args)}>"
+
+@dataclass(frozen=True)
+class TyVar:
+    """A type variable — appears during generic-fn body checking and
+    during unification at a call site. Resolved away by the end of
+    typechecking a concrete call."""
     name: str
     def __str__(self) -> str: return self.name
 
@@ -215,6 +238,18 @@ class Checker:
         self.tables: dict[str, TyTable] = {}
         self.structs: dict[str, TyStruct] = {}
         self.struct_fields: dict[str, tuple[tuple[str, Ty], ...]] = {}
+        # Generics: per-tablet type-parameter names, in declaration order.
+        self.struct_type_params: dict[str, tuple[str, ...]] = {}
+        # Generics: per-fn type-parameter names.
+        self.fn_type_params: dict[str, tuple[str, ...]] = {}
+        # Type variables visible while resolving a specific generic body.
+        # Maps the source-level name ("T") to a TyVar sentinel.
+        self._active_type_vars: dict[str, "TyVar"] = {}
+        # Per-AST-node monomorphization sidebands, keyed by id(node).
+        # Filled by the checker at calls / literals; codegen consults
+        # these to know which specialization to emit.
+        self.mono_call_args: dict[int, tuple] = {}   # Call node → tuple of Ty
+        self.mono_struct_args: dict[int, tuple] = {} # StructLit → tuple of Ty
         self.scopes: list[dict[str, Ty]] = [{}]
         self.current_fn: str = "<top>"
         self.warnings: list[CompileWarning] = []
@@ -260,24 +295,33 @@ class Checker:
             )
         if s.name in self.structs:
             raise CheckError(
-                f"duplicate struct {s.name!r}", s.line, s.col,
+                f"duplicate tablet {s.name!r}", s.line, s.col,
             )
         self.structs[s.name] = TyStruct(name=s.name)
+        self.struct_type_params[s.name] = tuple(s.type_params)
 
     def _resolve_struct_fields(self, s: A.StructDecl) -> None:
         seen: set[str] = set()
         resolved: list[tuple[str, Ty]] = []
-        for fname, ftype in s.fields:
-            if fname in seen:
-                raise CheckError(
-                    f"tablet {s.name!r}: duplicate field {fname!r}",
-                    s.line, s.col,
-                )
-            seen.add(fname)
-            resolved.append((
-                fname,
-                self._resolve_type(ftype, f"field {fname!r} of struct {s.name!r}"),
-            ))
+        # Inside a generic tablet's body, its type parameters are in
+        # scope as type variables. `Node<T> { next: wedge Node<T> }`
+        # resolves the field type with T bound to TyVar("T").
+        saved = self._active_type_vars
+        self._active_type_vars = {name: TyVar(name) for name in s.type_params}
+        try:
+            for fname, ftype in s.fields:
+                if fname in seen:
+                    raise CheckError(
+                        f"tablet {s.name!r}: duplicate field {fname!r}",
+                        s.line, s.col,
+                    )
+                seen.add(fname)
+                resolved.append((
+                    fname,
+                    self._resolve_type(ftype, f"field {fname!r} of tablet {s.name!r}"),
+                ))
+        finally:
+            self._active_type_vars = saved
         self.struct_fields[s.name] = tuple(resolved)
 
     def _register_fn(self, fn: A.FnDecl) -> None:
@@ -290,14 +334,22 @@ class Checker:
             raise CheckError(
                 f"duplicate function {fn.name!r}", fn.line, fn.col,
             )
-        params = tuple(
-            self._resolve_type(p.type, f"parameter {p.name!r} of {fn.name!r}")
-            for p in fn.params
-        )
-        ret = (
-            self._resolve_type(fn.return_type, f"return type of {fn.name!r}")
-            if fn.return_type else UNIT
-        )
+        # Generic fns: type parameters are in scope as TyVars while we
+        # resolve the signature and (later) check the body.
+        self.fn_type_params[fn.name] = tuple(fn.type_params)
+        saved = self._active_type_vars
+        self._active_type_vars = {name: TyVar(name) for name in fn.type_params}
+        try:
+            params = tuple(
+                self._resolve_type(p.type, f"parameter {p.name!r} of {fn.name!r}")
+                for p in fn.params
+            )
+            ret = (
+                self._resolve_type(fn.return_type, f"return type of {fn.name!r}")
+                if fn.return_type else UNIT
+            )
+        finally:
+            self._active_type_vars = saved
         self.fns[fn.name] = TyFn(params=params, ret=ret)
         if fn.name == "main":
             if ret != I32:
@@ -343,10 +395,17 @@ class Checker:
         self.scopes = [{}]
         self._local_tablets = set()
         self._tainted = {}
+        # Type params are in scope while we check the body so local
+        # bindings with annotations like `mut cur: wedge Node<T>` work.
+        saved = self._active_type_vars
+        self._active_type_vars = {name: TyVar(name) for name in fn.type_params}
         fn_ty = self.fns[fn.name]
-        for param, pty in zip(fn.params, fn_ty.params):
-            self.scopes[0][param.name] = pty
-        body_ty = self._tc_expr(fn.body)
+        try:
+            for param, pty in zip(fn.params, fn_ty.params):
+                self.scopes[0][param.name] = pty
+            body_ty = self._tc_expr(fn.body)
+        finally:
+            self._active_type_vars = saved
         expected = fn_ty.ret
         if not _coerces_to(body_ty, expected) and not isinstance(body_ty, TyDiverge):
             raise CheckError(
@@ -370,11 +429,42 @@ class Checker:
         if isinstance(t, A.TypeName):
             if t.name in PRIM_TYPES:
                 return PRIM_TYPES[t.name]
+            # Inside a generic decl body, the type-parameter names are
+            # in scope as fresh type variables.
+            if t.name in self._active_type_vars:
+                return self._active_type_vars[t.name]
             if t.name in self.structs:
+                # Using a generic tablet's name without type args is
+                # only valid if the tablet is non-generic.
+                params = self.struct_type_params.get(t.name, ())
+                if params:
+                    raise CheckError(
+                        f"{where}: tablet {t.name!r} expects "
+                        f"{len(params)} type argument(s): "
+                        f"write `{t.name}<...>`",
+                        t.line, t.col,
+                    )
                 return self.structs[t.name]
             raise CheckError(
                 f"{where}: unknown type {t.name!r}", t.line, t.col,
             )
+        if isinstance(t, A.TypeApply):
+            if t.name not in self.structs:
+                raise CheckError(
+                    f"{where}: unknown tablet {t.name!r}",
+                    t.line, t.col,
+                )
+            params = self.struct_type_params.get(t.name, ())
+            if len(params) != len(t.args):
+                raise CheckError(
+                    f"{where}: tablet {t.name!r} expects "
+                    f"{len(params)} type argument(s), got {len(t.args)}",
+                    t.line, t.col,
+                )
+            resolved_args = tuple(
+                self._resolve_type(a, f"{where} type arg") for a in t.args
+            )
+            return TyStruct(name=t.name, args=resolved_args)
         if isinstance(t, A.TypeTablets):
             inner = self._resolve_type(t.element, f"{where} element")
             return TyTablets(size=t.size, element=inner)
@@ -729,7 +819,7 @@ class Checker:
             if dish_involved and _coerces_to(lhs, RAT) and _coerces_to(rhs, RAT):
                 return BOOL
             # Tablet handles: == / != only (ordering isn't meaningful).
-            # Either both are `tablet T` with matching T, or one side
+            # Either both are `wedge T` with matching T, or one side
             # is `lost` which coerces to any handle type.
             if op in ("==", "!="):
                 handle_involved = isinstance(lhs, (TyHandle, TyLost)) or isinstance(rhs, (TyHandle, TyLost))
@@ -738,12 +828,120 @@ class Checker:
                     or isinstance(lhs, TyLost) or isinstance(rhs, TyLost)
                 ):
                     return BOOL
+            # Inside a generic fn body, two TyVars with the same name
+            # stand for whatever the eventual specialization binds.
+            # Accept `==`/`!=` here; if the specialization picks a type
+            # that doesn't actually support equality, codegen will
+            # surface the problem.
+            if (
+                op in ("==", "!=")
+                and isinstance(lhs, TyVar) and isinstance(rhs, TyVar)
+                and lhs.name == rhs.name
+            ):
+                return BOOL
             raise CheckError(
                 f"{op} requires matching comparable operands, got {lhs} and {rhs}",
                 e.line, e.col,
             )
 
         raise CheckError(f"unknown binary operator {op!r}", e.line, e.col)
+
+    # --- generics: unification & substitution --------------------------
+
+    def _unify(self, pattern: Ty, concrete: Ty, subst: dict[str, Ty]) -> None:
+        """Match a parameterized `pattern` against a concrete type,
+        accumulating type-variable bindings into `subst`. Raises
+        `_UnifyError` if the shapes disagree. Accepts coercion-friendly
+        shapes on the leaves (lost → handle, int → dish, etc.) so call
+        sites pass the same way they did pre-generics.
+
+        Note: we apply the current subst to the pattern as we go, so
+        if T was already bound to i64 in a previous param, a later
+        pattern reference to T gets the concrete form."""
+        pattern = self._substitute(pattern, subst)
+        concrete = self._substitute(concrete, subst)
+        if isinstance(pattern, TyVar) and isinstance(concrete, TyVar):
+            if pattern.name == concrete.name:
+                return   # same variable — already aligned, no-op
+            subst[pattern.name] = concrete
+            return
+        if isinstance(pattern, TyVar):
+            # Bind the variable. If it's `lost`, leave unbound for now;
+            # the variable gets pinned later when another param supplies
+            # a concrete element type.
+            if isinstance(concrete, TyLost):
+                return
+            if self._occurs_in(pattern.name, concrete):
+                raise _UnifyError(f"occurs check: {pattern} in {concrete}")
+            subst[pattern.name] = concrete
+            return
+        if isinstance(concrete, TyVar):
+            if self._occurs_in(concrete.name, pattern):
+                raise _UnifyError(f"occurs check: {concrete} in {pattern}")
+            subst[concrete.name] = pattern
+            return
+        if isinstance(pattern, TyHandle) and isinstance(concrete, TyHandle):
+            self._unify(pattern.element, concrete.element, subst)
+            return
+        if isinstance(pattern, TyHandle) and isinstance(concrete, TyLost):
+            return
+        if isinstance(pattern, TyTablets) and isinstance(concrete, TyTablets):
+            if pattern.size != concrete.size:
+                raise _UnifyError(
+                    f"tablets size mismatch: {pattern.size} vs {concrete.size}",
+                )
+            self._unify(pattern.element, concrete.element, subst)
+            return
+        if isinstance(pattern, TyStruct) and isinstance(concrete, TyStruct):
+            if pattern.name != concrete.name:
+                raise _UnifyError(f"{pattern.name} vs {concrete.name}")
+            if len(pattern.args) != len(concrete.args):
+                raise _UnifyError(
+                    f"{pattern.name}: arity mismatch "
+                    f"{len(pattern.args)} vs {len(concrete.args)}",
+                )
+            for p, c in zip(pattern.args, concrete.args):
+                self._unify(p, c, subst)
+            return
+        # Leaves — rely on the coercion rules that already govern call
+        # sites. If pattern == concrete exactly, trivially fine;
+        # otherwise let `_coerces_to` handle it later. Here we only
+        # raise on obvious structural disagreement.
+        if pattern == concrete:
+            return
+        # Permit integer / dish / rat mixes — the caller will still
+        # gate those via `_coerces_to` after unification.
+        if _coerces_to(concrete, pattern):
+            return
+        raise _UnifyError(f"{pattern} vs {concrete}")
+
+    def _occurs_in(self, var_name: str, ty: Ty) -> bool:
+        """Does TyVar(var_name) appear anywhere in `ty`? Used by unify's
+        occurs check to reject cyclic bindings like T = wedge T."""
+        if isinstance(ty, TyVar):
+            return ty.name == var_name
+        if isinstance(ty, TyHandle):
+            return self._occurs_in(var_name, ty.element)
+        if isinstance(ty, TyTablets):
+            return self._occurs_in(var_name, ty.element)
+        if isinstance(ty, TyStruct):
+            return any(self._occurs_in(var_name, a) for a in ty.args)
+        return False
+
+    def _substitute(self, ty: Ty, subst: dict[str, Ty]) -> Ty:
+        if isinstance(ty, TyVar):
+            bound = subst.get(ty.name)
+            return self._substitute(bound, subst) if bound is not None else ty
+        if isinstance(ty, TyHandle):
+            inner = self._substitute(ty.element, subst)
+            return TyHandle(element=inner)
+        if isinstance(ty, TyTablets):
+            inner = self._substitute(ty.element, subst)
+            return TyTablets(size=ty.size, element=inner)
+        if isinstance(ty, TyStruct) and ty.args:
+            new_args = tuple(self._substitute(a, subst) for a in ty.args)
+            return TyStruct(name=ty.name, args=new_args)
+        return ty
 
     def _tc_call(self, e: A.Call) -> Ty:
         # Method call on a tablets variable: t.push(x), t.release(), ...
@@ -809,14 +1007,52 @@ class Checker:
                 f"{name} expects {len(fn.params)} args, got {len(e.args)}",
                 e.line, e.col,
             )
-        for i, (arg, pty) in enumerate(zip(e.args, fn.params)):
-            at = self._tc_expr(arg)
-            if not _coerces_to(at, pty):
+        # Infer type-parameter substitutions for a generic fn by
+        # unifying each param's declared type against the actual arg
+        # type. For non-generic fns the instantiation map is empty
+        # and everything works as before.
+        #
+        # We freshen the callee's type-parameter TyVars at this call
+        # site. Without freshening, a generic-in-generic call (list_
+        # contains<T> → list_find<T>) would unify TyVar("T") against
+        # TyVar("T") and learn nothing — the callee's T and the
+        # caller's T share a name but are distinct bindings.
+        type_params = self.fn_type_params.get(name, ())
+        inst_names = [f"{name}.{tp}#{id(e)}" for tp in type_params]
+        inst_subst = {tp: TyVar(fresh) for tp, fresh in zip(type_params, inst_names)}
+        subst: dict[str, Ty] = {}
+        arg_tys = [self._tc_expr(a) for a in e.args]
+        for i, (at, pty) in enumerate(zip(arg_tys, fn.params)):
+            freshened = self._substitute(pty, inst_subst)
+            try:
+                self._unify(freshened, at, subst)
+            except _UnifyError as ex:
                 raise CheckError(
-                    f"call to {name!r}: arg {i} has type {at}, expected {pty}",
+                    f"call to {name!r}: arg {i} has type {at}, expected {pty}"
+                    f"{f' ({ex.detail})' if ex.detail else ''}",
+                    e.line, e.col,
+                ) from None
+        for i, (at, pty) in enumerate(zip(arg_tys, fn.params)):
+            inst = self._substitute(self._substitute(pty, inst_subst), subst)
+            if not _coerces_to(at, inst):
+                raise CheckError(
+                    f"call to {name!r}: arg {i} has type {at}, expected {inst}",
                     e.line, e.col,
                 )
-        return fn.ret
+        ret = self._substitute(self._substitute(fn.ret, inst_subst), subst)
+        # Record the concrete type-arg tuple for codegen monomorphization.
+        if type_params:
+            missing = [tp for tp, fresh in zip(type_params, inst_names) if fresh not in subst]
+            if missing:
+                raise CheckError(
+                    f"call to {name!r}: could not infer type parameter(s) "
+                    f"{', '.join(missing)} from argument types",
+                    e.line, e.col,
+                )
+            self.mono_call_args[id(e)] = tuple(
+                self._substitute(subst[fresh], subst) for fresh in inst_names
+            )
+        return ret
 
     def _tc_method_call(self, e: A.Call) -> Ty:
         assert isinstance(e.callee, A.Field) and isinstance(e.callee.target, A.Ident)
@@ -874,9 +1110,20 @@ class Checker:
             )
         if isinstance(target_ty, TyStruct):
             fields = self.struct_fields[target_ty.name]
+            # For generic tablets, substitute the instantiated type
+            # args into the declared field type before returning it.
+            # Skip no-op self-bindings (T → TyVar("T")) which would
+            # otherwise produce a cyclic subst when the arg is still
+            # a type variable from the enclosing fn's scope.
+            type_params = self.struct_type_params.get(target_ty.name, ())
+            subst = {}
+            for tp, arg in zip(type_params, target_ty.args):
+                if isinstance(arg, TyVar) and arg.name == tp:
+                    continue
+                subst[tp] = arg
             for fname, fty in fields:
                 if fname == e.name:
-                    return fty
+                    return self._substitute(fty, subst)
             field_names = [n for n, _ in fields]
             raise CheckError(
                 f"tablet {target_ty.name!r} has no field {e.name!r}"
@@ -891,13 +1138,22 @@ class Checker:
     def _tc_struct_lit(self, e: A.StructLit) -> Ty:
         if e.name not in self.structs:
             raise CheckError(
-                f"unknown struct {e.name!r}"
+                f"unknown tablet {e.name!r}"
                 f"{_suggest(e.name, self.structs)}",
                 e.line, e.col,
             )
         declared = self.struct_fields[e.name]
-        declared_map = {n: t for n, t in declared}
+        type_params = self.struct_type_params.get(e.name, ())
+        # Instantiate fresh type variables for the tablet's type params
+        # so unification doesn't alias them to identically-named TyVars
+        # from the enclosing fn's scope. `Node.T#<id(e)>` is unique
+        # per literal, so inferred bindings stay scoped to this site.
+        fresh_names = [f"{e.name}.{tp}#{id(e)}" for tp in type_params]
+        inst_subst = {tp: TyVar(fresh) for tp, fresh in zip(type_params, fresh_names)}
+        declared_map = {n: self._substitute(t, inst_subst) for n, t in declared}
         seen: set[str] = set()
+        subst: dict[str, Ty] = {}
+        field_val_tys: dict[str, Ty] = {}
         for fname, fexpr in e.fields:
             if fname not in declared_map:
                 raise CheckError(
@@ -912,10 +1168,21 @@ class Checker:
                 )
             seen.add(fname)
             val_ty = self._tc_expr(fexpr)
-            if not _coerces_to(val_ty, declared_map[fname]):
+            field_val_tys[fname] = val_ty
+            if type_params:
+                try:
+                    self._unify(declared_map[fname], val_ty, subst)
+                except _UnifyError:
+                    # fall through to the concrete coercion check below,
+                    # which produces a sharper error message for the user.
+                    pass
+        # After inference, check each field concretely with the subst.
+        for fname, val_ty in field_val_tys.items():
+            inst = self._substitute(declared_map[fname], subst)
+            if not _coerces_to(val_ty, inst):
                 raise CheckError(
                     f"tablet {e.name!r} field {fname!r}: got {val_ty}, "
-                    f"expected {declared_map[fname]}",
+                    f"expected {inst}",
                     e.line, e.col,
                 )
         missing = [n for n, _ in declared if n not in seen]
@@ -924,6 +1191,23 @@ class Checker:
                 f"tablet {e.name!r}: missing field(s) {', '.join(repr(n) for n in missing)}",
                 e.line, e.col,
             )
+        if type_params:
+            missing_params = [
+                tp for tp, fresh in zip(type_params, fresh_names)
+                if fresh not in subst
+            ]
+            if missing_params:
+                raise CheckError(
+                    f"tablet {e.name!r}: could not infer type parameter(s) "
+                    f"{', '.join(missing_params)} from field initializers "
+                    f"(a type annotation on the binding would fix this)",
+                    e.line, e.col,
+                )
+            concrete_args = tuple(
+                self._substitute(subst[fresh], subst) for fresh in fresh_names
+            )
+            self.mono_struct_args[id(e)] = concrete_args
+            return TyStruct(name=e.name, args=concrete_args)
         return self.structs[e.name]
 
     def _tc_index(self, e: A.Index) -> Ty:
@@ -1018,9 +1302,10 @@ class Checker:
         return unified
 
 
-def check(program: A.Program) -> list[CompileWarning]:
-    """Run type-checking. Raises CheckError on any problem. Returns any
-    non-fatal warnings collected during the pass (may be empty)."""
+def check(program: A.Program) -> "Checker":
+    """Run type-checking. Raises CheckError on any problem. Returns the
+    Checker instance so downstream passes can consult the mono sidebands
+    (mono_call_args, mono_struct_args) and any collected warnings."""
     checker = Checker(program)
     checker.check()
-    return checker.warnings
+    return checker

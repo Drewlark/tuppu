@@ -86,10 +86,10 @@ EXPECTED: dict[str, dict] = {
         "exit": 0,
         "stdout": (
             b"length: 5\n"
-            b"sum:    15\n"
             b"items:\n"
             b"1\n2\n3\n4\n5\n"
             b"found 3; its successor is 4\n"
+            b"99 not in list\n"
         ),
     },
     "reciprocal_table.tpu":  {

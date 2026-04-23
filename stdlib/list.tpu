@@ -1,36 +1,32 @@
-// Singly-linked list of i64, tablets-backed.
+// Generic singly-linked list, tablets-backed.
 //
 // A list is a pair: the backing tablets that owns the nodes, and a
-// `wedge IntNode` head handle pointing into it. Callers hold the
-// tablets (for auto-release) and the head (the "current front").
-// Pushing returns a new head; the old head stays reachable through
-// the new head's `next`.
+// `wedge Node<T>` head pointing into it. Callers hold the tablets
+// (for auto-release) and the head (the "current front").
 //
 // Storage model: all nodes for a given list live in one tablets,
 // which auto-releases at scope exit. Lists are therefore arena-
 // lifetimed — all handles die together when the tablets dies.
 //
-// Chunk size is pinned at 16 (the most common number for demos).
-// When generics land, this file generalizes to `List<T>`; for now,
-// `int_list_*` is the honest name.
+// Chunk size is pinned at 16; when we add numeric-generic parameters
+// (v0.2) that can be lifted.
 
-tablet IntNode {
-  value: i64,
-  next:  wedge IntNode,
+tablet Node<T> {
+  value: T,
+  next:  wedge Node<T>,
 }
 
-// Return a new head that prepends `v` to `head`. `store` owns the
-// node storage — caller passes their own tablets by `mut`, so the
-// push persists and auto-release at the caller's scope frees every
-// node at once.
-fn int_list_push(mut store: tablets[16]IntNode, head: wedge IntNode, v: i64) -> wedge IntNode {
-  store.push(IntNode { value: v, next: head })
+// Prepend `v` to `head`. `store` owns the node storage — caller
+// passes their own tablets by `mut`, so the push persists and
+// auto-release at the caller's scope frees every node at once.
+fn list_push<T>(mut store: tablets[16]Node<T>, head: wedge Node<T>, v: T) -> wedge Node<T> {
+  store.push(Node { value: v, next: head })
 }
 
 // Count nodes in the list. Walks from head to lost.
-fn int_list_len(head: wedge IntNode) -> i64 {
+fn list_len<T>(head: wedge Node<T>) -> i64 {
   mut n: i64 = 0
-  mut cur: wedge IntNode = head
+  mut cur: wedge Node<T> = head
   while cur != lost {
     n += 1
     cur = cur.next
@@ -38,20 +34,11 @@ fn int_list_len(head: wedge IntNode) -> i64 {
   n
 }
 
-// Sum of all values. Handy for quick checks.
-fn int_list_sum(head: wedge IntNode) -> i64 {
-  mut total: i64 = 0
-  mut cur: wedge IntNode = head
-  while cur != lost {
-    total += cur.value
-    cur = cur.next
-  }
-  total
-}
-
-// Return the first node whose value equals `v`, or `lost` if absent.
-fn int_list_find(head: wedge IntNode, v: i64) -> wedge IntNode {
-  mut cur: wedge IntNode = head
+// Return the first node whose value-equality against `v` matches,
+// or `lost` if absent. T must support `==` — the monomorphization
+// fails if not.
+fn list_find<T>(head: wedge Node<T>, v: T) -> wedge Node<T> {
+  mut cur: wedge Node<T> = head
   while cur != lost {
     if cur.value == v { yield cur }
     cur = cur.next
@@ -60,15 +47,6 @@ fn int_list_find(head: wedge IntNode, v: i64) -> wedge IntNode {
 }
 
 // True if `v` appears in the list.
-fn int_list_contains(head: wedge IntNode, v: i64) -> bool {
-  int_list_find(head, v) != lost
-}
-
-// Print each value on its own line. Handy for demos and debugging.
-fn int_list_print(head: wedge IntNode) {
-  mut cur: wedge IntNode = head
-  while cur != lost {
-    println(cur.value)
-    cur = cur.next
-  }
+fn list_contains<T>(head: wedge Node<T>, v: T) -> bool {
+  list_find(head, v) != lost
 }

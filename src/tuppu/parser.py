@@ -111,6 +111,7 @@ class Parser:
     def parse_fn(self) -> A.FnDecl:
         start = self.eat(Tok.FN)
         name = self.eat(Tok.IDENT, "function name").value
+        type_params = self.parse_type_params()
         self.eat(Tok.LPAREN)
         params: list[A.Param] = []
         if not self.check(Tok.RPAREN):
@@ -128,7 +129,23 @@ class Parser:
         body = self.parse_block()
         return _at(start, A.FnDecl(
             name=name, params=params, return_type=return_type, body=body,
+            type_params=type_params,
         ))
+
+    def parse_type_params(self) -> list[str]:
+        """Parse an optional `<T>` / `<T, U>` type-parameter list.
+        Returns an empty list if the next token isn't `<`."""
+        if not self.check(Tok.LT):
+            return []
+        self.advance()
+        params: list[str] = []
+        if not self.check(Tok.GT):
+            params.append(self.eat(Tok.IDENT, "type parameter").value)
+            while self.check(Tok.COMMA):
+                self.advance()
+                params.append(self.eat(Tok.IDENT, "type parameter").value)
+        self.eat(Tok.GT)
+        return params
 
     def parse_param(self) -> A.Param:
         start = self.peek()
@@ -144,6 +161,7 @@ class Parser:
     def parse_struct_decl(self) -> A.StructDecl:
         start = self.eat(Tok.STRUCT)
         name = self.eat(Tok.IDENT, "tablet name").value
+        type_params = self.parse_type_params()
         self.eat(Tok.LBRACE)
         fields: list[tuple[str, A.TypeExpr]] = []
         self.skip_newlines()
@@ -165,7 +183,9 @@ class Parser:
                 f"tablet {name!r} must declare at least one field",
                 start.line, start.col,
             )
-        return _at(start, A.StructDecl(name=name, fields=fields))
+        return _at(start, A.StructDecl(
+            name=name, fields=fields, type_params=type_params,
+        ))
 
     def parse_struct_lit(self) -> A.StructLit:
         name_tok = self.eat(Tok.IDENT, "tablet name")
@@ -213,6 +233,20 @@ class Parser:
             return _at(t, A.TypeName(name=t.value))
         if t.kind is Tok.IDENT:
             self.advance()
+            # Generic type application: `Name<arg1, arg2>`. In type
+            # position the `<` is always the type-arg-list bracket —
+            # no ambiguity with less-than because type positions don't
+            # admit arbitrary expressions.
+            if self.check(Tok.LT):
+                self.advance()
+                args: list[A.TypeExpr] = []
+                if not self.check(Tok.GT):
+                    args.append(self.parse_type())
+                    while self.check(Tok.COMMA):
+                        self.advance()
+                        args.append(self.parse_type())
+                self.eat(Tok.GT)
+                return _at(t, A.TypeApply(name=t.value, args=args))
             return _at(t, A.TypeName(name=t.value))
         if t.kind is Tok.TABLETS:
             self.advance()

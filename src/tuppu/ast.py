@@ -53,7 +53,7 @@ class TypePointer:
 
 @dataclass
 class TypeHandle:
-    """`tablet T` — a handle into some `tablets[N]T`. A single-slot
+    """`wedge T` — a handle into some `tablets[N]T`. A single-slot
     reference; in runtime terms a pointer to the element slot inside
     a tablets chunk. Obtained by `tablets.push(...)` (returns the
     handle to the newly pushed element). Compared for equality with
@@ -63,7 +63,20 @@ class TypeHandle:
     line: int = _pos()
     col:  int = _pos()
 
-TypeExpr = Union[TypeName, TypeArray, TypeTablets, TypePointer, TypeHandle]
+@dataclass
+class TypeApply:
+    """A parameterized type application like `List<i64>` or `Node<T>`.
+    `name` is the user-defined tablet name; `args` is the list of
+    instantiated type arguments (each itself a TypeExpr). Only valid
+    in type positions, never in expression positions — the parser
+    never allows `Foo<bar>` to appear where it could ambiguate with
+    comparison."""
+    name: str
+    args: list["TypeExpr"]
+    line: int = _pos()
+    col:  int = _pos()
+
+TypeExpr = Union[TypeName, TypeArray, TypeTablets, TypePointer, TypeHandle, TypeApply]
 
 
 # --- expressions -------------------------------------------------------------
@@ -275,6 +288,7 @@ class FnDecl:
     params: list[Param]
     return_type: TypeExpr | None
     body: Block
+    type_params: list[str] = field(default_factory=list)
     line: int = _pos()
     col:  int = _pos()
 
@@ -290,11 +304,14 @@ class TableDecl:
 
 @dataclass
 class StructDecl:
-    """A user-defined struct type. Fields are stored in parse order and
-    are nominally typed (two structurally identical structs with different
-    names do not unify)."""
+    """A user-defined tablet (product) type. Fields are stored in parse
+    order and are nominally typed — two structurally identical tablets
+    with different names do not unify. `type_params` lists the type
+    variables introduced by the declaration, e.g. ["T"] for
+    `tablet Node<T> { ... }`; empty for non-generic tablets."""
     name: str
     fields: list[tuple[str, TypeExpr]]
+    type_params: list[str] = field(default_factory=list)
     line: int = _pos()
     col:  int = _pos()
 

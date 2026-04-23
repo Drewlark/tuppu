@@ -1,34 +1,44 @@
-// Linked list: a singly-linked chain of i64 nodes, all allocated into
-// a tablets-backed arena. Demonstrates recursive structs, tablet
-// handles, auto-release, and mut-tablets pass-through.
+// Linked list: a singly-linked chain of nodes, all allocated into a
+// tablets-backed arena. Demonstrates generics (`Node<T>`), recursive
+// tablets, wedge handles, auto-release, and mut-tablets pass-through.
 //
-// The stdlib module `stdlib/list.tpu` supplies `int_list_push`,
-// `int_list_len`, `int_list_sum`, `int_list_find`, `int_list_contains`,
-// and `int_list_print` — all in pure Tuppu, no compiler magic.
+// The stdlib module `stdlib/list.tpu` supplies `list_push`, `list_len`,
+// `list_find`, `list_contains` — all generic over T, in pure Tuppu.
 
 fn main() -> i32 {
-  // `store` is the tablets that owns every IntNode we push. When
+  // `store` is the tablets that owns every Node<i64> we push. When
   // main returns, auto-release frees every chunk — no explicit free.
-  mut store: tablets[16]IntNode
-  mut head: wedge IntNode = lost
+  mut store: tablets[16]Node<i64>
+  mut head: wedge Node<i64> = lost
 
   // Push 5, 4, 3, 2, 1 to the front. Each push returns the new head.
-  head = int_list_push(store, head, 5)
-  head = int_list_push(store, head, 4)
-  head = int_list_push(store, head, 3)
-  head = int_list_push(store, head, 2)
-  head = int_list_push(store, head, 1)
+  head = list_push(store, head, 5)
+  head = list_push(store, head, 4)
+  head = list_push(store, head, 3)
+  head = list_push(store, head, 2)
+  head = list_push(store, head, 1)
 
   // The list now reads 1 → 2 → 3 → 4 → 5 → lost.
-  println("length: ", int_list_len(head))
-  println("sum:    ", int_list_sum(head))
+  println("length: ", list_len(head))
+
+  // Walk and print — inline so the demo doesn't need a print helper.
   println("items:")
-  int_list_print(head)
+  mut cur: wedge Node<i64> = head
+  while cur != lost {
+    println(cur.value)
+    cur = cur.next
+  }
 
   // Search returns a handle to the matching node, or `lost`.
-  step maybe_three: wedge IntNode = int_list_find(head, 3)
+  step maybe_three: wedge Node<i64> = list_find(head, 3)
   if maybe_three != lost {
     println("found 3; its successor is ", maybe_three.next.value)
+  }
+
+  if list_contains(head, 99) {
+    println("should not print")
+  } else {
+    println("99 not in list")
   }
 
   0

@@ -222,7 +222,7 @@ def test_unknown_field_access_rejected():
 
 
 def test_duplicate_struct_rejected():
-    with pytest.raises(CompileError, match="duplicate struct"):
+    with pytest.raises(CompileError, match="duplicate tablet"):
         compile_to_ir(
             "tablet Point { x: i64 }\n"
             "tablet Point { y: i64 }\n"
@@ -250,7 +250,7 @@ def test_empty_struct_rejected():
 
 
 def test_unknown_struct_in_literal_rejected():
-    with pytest.raises(CompileError, match="unknown struct"):
+    with pytest.raises(CompileError, match="unknown tablet"):
         compile_to_ir(
             "fn main() -> i32 { step p = Point { x: 1 }\n 0 }\n"
         )
@@ -571,3 +571,89 @@ def test_mut_tablets_param_pass_through(tmp_path):
     # lib.len should reflect all three pushes (by-ref), and the walk
     # prints 1, 2, 3.
     assert out == b"3\n1\n2\n3\n"
+
+
+# --- generics --------------------------------------------------------------
+
+def test_generic_tablet_basic(tmp_path):
+    # Box<T> over i64 — simplest generic tablet, no recursion.
+    src = (
+        "tablet Box<T> { value: T }\n"
+        "fn main() -> i32 {\n"
+        "  step b = Box { value: 42 }\n"
+        "  println(b.value)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"42\n"
+
+
+def test_generic_fn_inference_from_arg(tmp_path):
+    # identity<T>(x) — T inferred from the argument's concrete type.
+    src = (
+        "fn identity<T>(x: T) -> T { x }\n"
+        "fn main() -> i32 {\n"
+        "  println(identity(7))\n"
+        "  println(identity(true))\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"7\ntrue\n"
+
+
+def test_generic_tablet_two_instantiations(tmp_path):
+    # Box<i64> and Box<bool> as distinct monomorphs in the same program.
+    src = (
+        "tablet Box<T> { v: T }\n"
+        "fn main() -> i32 {\n"
+        "  step a = Box { v: 10 }\n"
+        "  step b = Box { v: false }\n"
+        "  println(a.v)\n"
+        "  println(b.v)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"10\nfalse\n"
+
+
+def test_generic_recursive_with_wedge(tmp_path):
+    # Node<T> with wedge Node<T> next — the stdlib List pattern.
+    src = (
+        "tablet Node<T> { value: T, next: wedge Node<T> }\n"
+        "fn main() -> i32 {\n"
+        "  mut lib: tablets[8]Node<i64>\n"
+        "  mut head: wedge Node<i64> = lost\n"
+        "  head = lib.push(Node { value: 1, next: head })\n"
+        "  head = lib.push(Node { value: 2, next: head })\n"
+        "  println(head.value)\n"
+        "  println(head.next.value)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"2\n1\n"
+
+
+def test_generic_arity_mismatch_rejected():
+    with pytest.raises(CompileError, match="expects 1 type argument"):
+        compile_to_ir(
+            "tablet Box<T> { v: T }\n"
+            "fn main() -> i32 {\n"
+            "  step b: Box<i64, i64> = Box { v: 1 }\n"
+            "  0\n"
+            "}\n"
+        )
+
+
+def test_generic_missing_type_arg_rejected():
+    with pytest.raises(CompileError, match="expects 1 type argument"):
+        compile_to_ir(
+            "tablet Box<T> { v: T }\n"
+            "fn main() -> i32 {\n"
+            "  step b: Box = Box { v: 1 }\n"
+            "  0\n"
+            "}\n"
+        )

@@ -280,7 +280,7 @@ def test_suggest_typo_unknown_struct():
         "  step t = Tablt { id: 1 }\n"
         "  0\n"
         "}\n",
-        r"unknown struct 'Tablt' \(did you mean 'Tablet'\?\)",
+        r"unknown tablet 'Tablt' \(did you mean 'Tablet'\?\)",
     )
 
 
