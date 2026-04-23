@@ -409,15 +409,20 @@ class Parser:
         return _at(t, A.ExprStmt(expr=expr))
 
     def _check_lvalue(self, expr: A.Expr, start) -> None:
-        """An assignment target must be an Ident or a `.`-chain of Field
-        accesses rooted at an Ident. No calls, indexes, or literals."""
+        """An assignment target must be an Ident, a `.`-chain of Field
+        accesses, or one rooted at a tablets index (`arr[n].field = v`).
+        The index case terminates the walk at the Index node; codegen's
+        `_lvalue_slot` resolves the target mut binding and does the
+        runtime bounds check."""
         node = expr
         while isinstance(node, A.Field):
             node = node.target
+        if isinstance(node, A.Index) and isinstance(node.target, A.Ident):
+            return
         if not isinstance(node, A.Ident):
             raise ParseError(
-                "assignment target must be a variable or a `.`-chain "
-                "of fields rooted at a variable",
+                "assignment target must be a variable, a `.`-chain "
+                "of fields, or an indexed tablet element",
                 start.line, start.col,
             )
 

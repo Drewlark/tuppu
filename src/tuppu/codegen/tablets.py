@@ -129,6 +129,7 @@ class TabletsMixin:
             N=N, elem_ty=elem_ty, node_ty=node_ty, tablets_ty=tablets_ty,
             push=self._build_tablets_push(N, elem_ty, node_ty, tablets_ty, suffix),
             get=self._build_tablets_get(N, elem_ty, node_ty, tablets_ty, suffix),
+            get_addr=self._build_tablets_get_addr(N, elem_ty, node_ty, tablets_ty, suffix),
             release=self._build_tablets_release(N, elem_ty, node_ty, tablets_ty, suffix),
         )
         self._tablets_types[key] = info
@@ -261,6 +262,57 @@ class TabletsMixin:
         b.position_at_end(done)
         slot = b.gep(cur_phi, [ZERO_I32, ZERO_I32, idx_phi], inbounds=True)
         b.ret(b.load(slot))
+        return fn
+
+    def _build_tablets_get_addr(
+        self, N: int, elem_ty: ir.Type,
+        node_ty: ir.IdentifiedStructType, tablets_ty: ir.LiteralStructType,
+        suffix: str,
+    ) -> ir.Function:
+        """Like `get`, but returns a pointer to the slot instead of
+        loading it. Used by the lvalue path so `arr[n].field = v` can
+        compute the address of `arr[n]` and GEP through to the field.
+        Caller is responsible for bounds-checking; this mirrors `get`
+        which doesn't bounds-check either (the checker/emitter at the
+        call site does)."""
+        fn = ir.Function(
+            self.module,
+            ir.FunctionType(elem_ty.as_pointer(), [tablets_ty.as_pointer(), I64]),
+            name=f"__tuppu_tbls_{suffix}_get_addr",
+        )
+        fn.args[0].name = "t"
+        fn.args[1].name = "idx"
+        t_ptr, idx_arg = fn.args
+
+        ZERO_I32 = ir.Constant(I32, 0)
+
+        entry   = fn.append_basic_block("entry")
+        loop    = fn.append_basic_block("loop")
+        advance = fn.append_basic_block("advance")
+        done    = fn.append_basic_block("done")
+
+        b = ir.IRBuilder(entry)
+        head = b.load(b.gep(t_ptr, [ZERO_I32, ZERO_I32], inbounds=True))
+        b.branch(loop)
+
+        b.position_at_end(loop)
+        cur_phi = b.phi(node_ty.as_pointer(), "cur")
+        idx_phi = b.phi(I64, "i")
+        cur_phi.add_incoming(head, entry)
+        idx_phi.add_incoming(idx_arg, entry)
+        need_adv = b.icmp_signed(">=", idx_phi, ir.Constant(I64, N))
+        b.cbranch(need_adv, advance, done)
+
+        b.position_at_end(advance)
+        next_node = b.load(b.gep(cur_phi, [ZERO_I32, ir.Constant(I32, 2)], inbounds=True))
+        new_idx = b.sub(idx_phi, ir.Constant(I64, N))
+        cur_phi.add_incoming(next_node, advance)
+        idx_phi.add_incoming(new_idx, advance)
+        b.branch(loop)
+
+        b.position_at_end(done)
+        slot = b.gep(cur_phi, [ZERO_I32, ZERO_I32, idx_phi], inbounds=True)
+        b.ret(slot)
         return fn
 
     def _build_tablets_release(

@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **501 tests passing.**
+- **507 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -95,6 +95,14 @@ What works:
   codegen GEPs to the inner slot and dispatches on a synthetic mut
   reference. Root must still be a mut Ident so the lvalue
   machinery has a slot to mutate.
+- **Lvalue indexing into tablets** — `arr[n] = v`, `arr[n].f = v`,
+  `arr[n].inner.f += v` all work. Runtime walks the chunk chain
+  via a new `get_addr(t, n) -> *T` helper, bounds-checks (trap on
+  OOB mirroring the read path), and hands back a slot pointer the
+  existing Field-GEP machinery composes on top of. Parser's
+  `_check_lvalue` was tightened accordingly: an Index rooted at
+  an Ident is a valid assignment target alongside the existing
+  variable / field-chain shapes.
 - **Escape check** rejects returning a `wedge T` whose underlying
   tablets is declared locally — the common UAF pattern. Parameters
   and `lost` are safe to return.
@@ -519,7 +527,7 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 501 passing.
+2. `.venv/bin/pytest` — expect 507 passing.
 3. `git log --oneline -12` — recent timeline: sex Phase 3a/3b,
    struct field mutation, codegen.py split into mixins package,
    elif + did-you-mean, recursive tablets + wedge handles + auto-

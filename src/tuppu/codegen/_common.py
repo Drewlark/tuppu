@@ -82,6 +82,7 @@ class TabletsInfo:
     tablets_ty: ir.LiteralStructType   # {head: Node*, tail: Node*, len: i64}
     push: ir.Function
     get: ir.Function
+    get_addr: ir.Function
     release: ir.Function
 
 

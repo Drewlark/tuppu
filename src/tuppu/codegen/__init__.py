@@ -1870,6 +1870,41 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             raise CodegenError(
                 f"tablet has no field {target.name!r}"
             )
+        if isinstance(target, A.Index):
+            # lvalue indexing into a mut tablets: `arr[n] = v` or
+            # `arr[n].field = v`. Resolve the inner tablets binding,
+            # bounds-check the index, and return the slot pointer
+            # (not the loaded value) so Field chains built on top can
+            # GEP through the struct.
+            if not isinstance(target.target, A.Ident):
+                raise CodegenError(
+                    f"lvalue indexing: target must be a mut tablets "
+                    f"binding, got {type(target.target).__name__}"
+                )
+            var = self._lookup(target.target.name)
+            if not var.is_mut:
+                raise CodegenError(
+                    f"cannot assign into step binding {target.target.name!r}"
+                )
+            info = self._tablets_info_for(var.value_ty)
+            if info is None:
+                raise CodegenError(
+                    f"lvalue indexing: {target.target.name!r} is not a "
+                    f"tablets (got {var.value_ty})"
+                )
+            idx_val = self._gen_expr(target.index)
+            if idx_val is None:
+                raise CodegenError("lvalue index has no value")
+            idx_val = self._coerce(idx_val, I64)
+            len_addr = self.builder.gep(
+                var.ir_ref,
+                [ir.Constant(I32, 0), ir.Constant(I32, 2)],
+                inbounds=True,
+            )
+            length = self.builder.load(len_addr)
+            self._emit_dynamic_bounds_trap(idx_val, length)
+            slot = self.builder.call(info.get_addr, [var.ir_ref, idx_val])
+            return slot, info.elem_ty
         raise CodegenError(
             f"assignment target must be a variable or field chain, "
             f"got {type(target).__name__}"

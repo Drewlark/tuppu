@@ -286,6 +286,106 @@ def test_auto_release_fires_on_yield(tmp_path):
     assert len(release_calls) >= 1, release_calls
 
 
+def test_lvalue_index_assign_whole_element(tmp_path):
+    src = (
+        "tablet P { x: i64, y: i64 }\n"
+        "fn main() -> i32 {\n"
+        "  mut arr: tablets[4]P\n"
+        "  arr.push(P { x: 0, y: 0 })\n"
+        "  arr[0] = P { x: 3, y: 4 }\n"
+        "  println(arr[0].x)\n"
+        "  println(arr[0].y)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out = run(src, tmp_path)
+    assert out == b"3\n4\n"
+
+
+def test_lvalue_index_assign_field(tmp_path):
+    # `arr[n].field = v` writes one field of an indexed element
+    # without rebuilding the whole struct.
+    src = (
+        "tablet P { x: i64, y: i64 }\n"
+        "fn main() -> i32 {\n"
+        "  mut arr: tablets[4]P\n"
+        "  arr.push(P { x: 1, y: 1 })\n"
+        "  arr.push(P { x: 2, y: 2 })\n"
+        "  arr[0].x = 99\n"
+        "  arr[1].y = 42\n"
+        "  println(arr[0].x)\n"
+        "  println(arr[0].y)\n"
+        "  println(arr[1].x)\n"
+        "  println(arr[1].y)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out = run(src, tmp_path)
+    assert out == b"99\n1\n2\n42\n"
+
+
+def test_lvalue_index_assign_nested_field(tmp_path):
+    src = (
+        "tablet Inner { v: i64 }\n"
+        "tablet Outer { i: Inner, tag: i64 }\n"
+        "fn main() -> i32 {\n"
+        "  mut arr: tablets[4]Outer\n"
+        "  arr.push(Outer { i: Inner { v: 0 }, tag: 0 })\n"
+        "  arr[0].i.v = 77\n"
+        "  arr[0].tag = 5\n"
+        "  println(arr[0].i.v)\n"
+        "  println(arr[0].tag)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out = run(src, tmp_path)
+    assert out == b"77\n5\n"
+
+
+def test_lvalue_index_aug_assign(tmp_path):
+    src = (
+        "tablet P { x: i64 }\n"
+        "fn main() -> i32 {\n"
+        "  mut arr: tablets[4]P\n"
+        "  arr.push(P { x: 10 })\n"
+        "  arr[0].x += 5\n"
+        "  arr[0].x *= 2\n"
+        "  println(arr[0].x)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out = run(src, tmp_path)
+    assert out == b"30\n"
+
+
+def test_lvalue_index_bounds_trap(tmp_path):
+    src = (
+        "tablet P { x: i64 }\n"
+        "fn main() -> i32 {\n"
+        "  mut arr: tablets[4]P\n"
+        "  arr.push(P { x: 1 })\n"
+        "  arr[5].x = 0\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, _ = run(src, tmp_path)
+    assert rc != 0
+
+
+def test_lvalue_index_rejects_step_binding():
+    with pytest.raises(CompileError, match="step binding"):
+        compile_to_ir(
+            "tablet P { x: i64 }\n"
+            "fn main() -> i32 {\n"
+            "  mut src: tablets[4]P\n"
+            "  src.push(P { x: 1 })\n"
+            "  step arr = src\n"
+            "  arr[0].x = 0\n"
+            "  0\n"
+            "}\n"
+        )
+
+
 def test_auto_release_inner_block_only(tmp_path):
     # A mut tablets declared in a nested block should release at that
     # block's end, independent of the outer function.
