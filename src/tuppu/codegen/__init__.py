@@ -29,10 +29,11 @@ from ._common import (
 )
 from .rat import RatMixin
 from .sex import SexMixin
+from .strs import StrsMixin
 from .tablets import TabletsMixin
 
 
-class Codegen(SexMixin, RatMixin, TabletsMixin):
+class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
     def __init__(self, checker=None) -> None:
         # Checker provides monomorphization sidebands — `mono_call_args`
         # keyed by id(Call) and `mono_struct_args` keyed by id(StructLit).
@@ -56,6 +57,17 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         self._int_to_sex: ir.Function | None = None
         self._rat_to_sex: ir.Function | None = None
         self._trap: ir.Function | None = None
+        # Dynamic-string runtime: release (free if cap > 0), concat, slice,
+        # value→str conversions. All built lazily on first use.
+        self._str_release: ir.Function | None = None
+        self._str_concat: ir.Function | None = None
+        self._str_slice: ir.Function | None = None
+        self._int_to_str: ir.Function | None = None
+        self._rat_to_str: ir.Function | None = None
+        self._sex_to_str: ir.Function | None = None
+        self._bool_to_str: ir.Function | None = None
+        self._memcpy: ir.Function | None = None
+        self._snprintf: ir.Function | None = None
         # table name -> (global array, length, lo bound, element LLVM type)
         self._tables: dict[str, tuple[ir.GlobalVariable, int, int, ir.Type]] = {}
         # Tablets monomorphizations: key is (N, str(elem_type)).
@@ -242,53 +254,67 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         self.builder = ir.IRBuilder(entry)
         self.scopes = [{}]
 
-        # Parameters: step-bound (direct SSA ref) unless the user wrote
-        # `mut` — in which case we alloca + store the incoming arg and
-        # bind the alloca, so methods requiring a mut binding (notably
-        # `tablets.push`) work on the parameter. No auto-release is
-        # registered here — the caller owns the storage.
-        #
-        # Special case: mut tablets params arrive already as a pointer
-        # to the caller's storage (see `_declare_fn`). We bind the
-        # incoming pointer directly as the Variable's ir_ref — no
-        # alloca+store — so method dispatch gets a stable pointer to
-        # the caller's tablets and mutations persist.
-        for i, p in enumerate(fn.params):
-            arg = llvm_fn.args[i]
-            param_decl_ty = self._lower_type(p.type)
-            is_mut_tablets = (
-                p.is_mut and self._tablets_info_for(param_decl_ty) is not None
-            )
-            if is_mut_tablets:
-                self.scopes[-1][p.name] = Variable(
-                    is_mut=True, ir_ref=arg, value_ty=param_decl_ty,
+        # Params live in a dedicated cleanup frame that wraps the fn body.
+        # A mut str param needs release at scope exit so a reassignment
+        # to a heap-owned str doesn't leak; the incoming value is a
+        # borrow (caller forced cap=0), so the initial release is a no-op.
+        # Non-mut str params stay SSA — they can't be reassigned, and the
+        # cap=0 borrow has nothing to free.
+        self._cleanup_frames.append([])
+        try:
+            # Parameters: step-bound (direct SSA ref) unless the user wrote
+            # `mut` — in which case we alloca + store the incoming arg and
+            # bind the alloca, so methods requiring a mut binding (notably
+            # `tablets.push`) work on the parameter.
+            #
+            # Special case: mut tablets params arrive already as a pointer
+            # to the caller's storage (see `_declare_fn`). We bind the
+            # incoming pointer directly as the Variable's ir_ref — no
+            # alloca+store — so method dispatch gets a stable pointer to
+            # the caller's tablets and mutations persist.
+            for i, p in enumerate(fn.params):
+                arg = llvm_fn.args[i]
+                param_decl_ty = self._lower_type(p.type)
+                is_mut_tablets = (
+                    p.is_mut and self._tablets_info_for(param_decl_ty) is not None
                 )
-            elif p.is_mut:
-                slot = self._alloca_entry(arg.type, p.name)
-                self.builder.store(arg, slot)
-                self.scopes[-1][p.name] = Variable(
-                    is_mut=True, ir_ref=slot, value_ty=arg.type,
-                )
+                if is_mut_tablets:
+                    self.scopes[-1][p.name] = Variable(
+                        is_mut=True, ir_ref=arg, value_ty=param_decl_ty,
+                    )
+                elif p.is_mut:
+                    slot = self._alloca_entry(arg.type, p.name)
+                    self.builder.store(arg, slot)
+                    self.scopes[-1][p.name] = Variable(
+                        is_mut=True, ir_ref=slot, value_ty=arg.type,
+                    )
+                    self._maybe_register_cleanup(p.name, arg.type, slot)
+                else:
+                    self.scopes[-1][p.name] = Variable(
+                        is_mut=False, ir_ref=arg, value_ty=arg.type,
+                    )
+
+            value = self._gen_expr(fn.body)
+
+            if self._is_terminated():
+                # Body already returned via yield — the yield path unwound
+                # every live cleanup frame (including this one).
+                return
+            if fn.return_type is None:
+                self._emit_frame_cleanups(self._cleanup_frames[-1])
+                self.builder.ret_void()
             else:
-                self.scopes[-1][p.name] = Variable(
-                    is_mut=False, ir_ref=arg, value_ty=arg.type,
-                )
-
-        value = self._gen_expr(fn.body)
-
-        if self._is_terminated():
-            # Body already returned via yield.
-            return
-        if fn.return_type is None:
-            self.builder.ret_void()
-        else:
-            if value is None:
-                raise CodegenError(
-                    f"function {fn.name!r} must produce a value for return type "
-                    f"{fn.return_type}, but its body has no trailing expression"
-                )
-            expected = self._lower_type(fn.return_type)
-            self.builder.ret(self._coerce(value, expected))
+                if value is None:
+                    raise CodegenError(
+                        f"function {fn.name!r} must produce a value for return type "
+                        f"{fn.return_type}, but its body has no trailing expression"
+                    )
+                expected = self._lower_type(fn.return_type)
+                coerced = self._coerce(value, expected)
+                self._emit_frame_cleanups(self._cleanup_frames[-1])
+                self.builder.ret(coerced)
+        finally:
+            self._cleanup_frames.pop()
 
     def _is_terminated(self) -> bool:
         assert self.builder is not None
@@ -1064,7 +1090,10 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         if isinstance(s, A.ReleaseStmt):
             self._gen_release(s); return
         if isinstance(s, A.ExprStmt):
-            self._gen_expr(s.expr); return  # discard value
+            val = self._gen_expr(s.expr)
+            if val is not None:
+                self._register_str_rvalue_cleanup(val, s.expr)
+            return
         raise CodegenError(f"statement not supported yet: {type(s).__name__}")
 
     def _gen_release(self, s: A.ReleaseStmt) -> None:
@@ -1290,17 +1319,54 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
             self._bind(b.name, Variable(is_mut=True, ir_ref=slot, value_ty=init_val.type))
             self._maybe_register_cleanup(b.name, init_val.type, slot)
         else:
+            # Step-bound str still needs cleanup (it may be heap-owned).
+            # Spill to a dedicated slot solely for the release path; keep
+            # the SSA value as the access path so reads stay direct and
+            # reassignment remains impossible at the source level.
+            if self._is_str_value(init_val.type):
+                assert self.builder is not None
+                cleanup_slot = self._alloca_entry(init_val.type, f"{b.name}.cleanup")
+                self.builder.store(init_val, cleanup_slot)
+                self._maybe_register_cleanup(b.name, init_val.type, cleanup_slot)
             self._bind(b.name, Variable(is_mut=False, ir_ref=init_val, value_ty=init_val.type))
 
     def _maybe_register_cleanup(
         self, name: str, value_ty: ir.Type, slot: ir.Value,
     ) -> None:
-        """If `value_ty` is a cleanup-having type (currently: tablets),
+        """If `value_ty` is a cleanup-having type (tablets or str),
         record a release call for the innermost cleanup frame so it
         fires automatically at scope exit."""
         info = self._tablets_info_for(value_ty)
         if info is not None and self._cleanup_frames:
             self._cleanup_frames[-1].append((info.release, slot, name))
+            return
+        if self._is_str_value(value_ty) and self._cleanup_frames:
+            self._cleanup_frames[-1].append(
+                (self._get_str_release(), slot, name),
+            )
+
+    def _register_str_rvalue_cleanup(
+        self, val: ir.Value, src: A.Expr,
+    ) -> None:
+        """Anonymous-temp auto-release for a str rvalue the caller doesn't
+        bind. The heap bytes in `val` need an owner somewhere; if the
+        source expression can produce a freshly-owned str (a Call) we
+        spill it to a local slot and register release at current-scope
+        exit. Idents and Fields are intentionally skipped — they read a
+        value someone else already owns. String literals carry cap=0,
+        so there's nothing to free."""
+        if not self._is_str_value(val.type):
+            return
+        if isinstance(src, (A.Ident, A.Field, A.StringLit)):
+            return
+        if not self._cleanup_frames:
+            return
+        assert self.builder is not None
+        slot = self._alloca_entry(val.type, ".str.temp")
+        self.builder.store(val, slot)
+        self._cleanup_frames[-1].append(
+            (self._get_str_release(), slot, ".str.temp"),
+        )
 
     def _gen_assign(self, a: A.Assign) -> None:
         assert self.builder is not None
@@ -1311,6 +1377,12 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         value = self._gen_expr(a.value)
         if value is None:
             raise CodegenError("assignment RHS has no value")
+        # Mut str reassignment: release the old value before overwriting.
+        # The old value may be heap-owned (cap > 0) or borrowed (cap = 0);
+        # __tuppu_str_release handles both (free if cap > 0, else no-op).
+        # Without this, any prior heap ptr leaks on reassign.
+        if self._is_str_value(slot_ty):
+            self.builder.call(self._get_str_release(), [slot_ptr])
         self.builder.store(self._coerce(value, slot_ty), slot_ptr)
 
     def _lvalue_slot(self, target: A.Expr) -> tuple[ir.Value, ir.Type]:
@@ -1680,6 +1752,20 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
             return self._gen_read_int(e.args)
         if name == "rat":
             return self._gen_rat_ctor(e.args)
+        if name == "str_concat":
+            return self._gen_str_concat_call(e.args)
+        if name == "str_slice":
+            return self._gen_str_slice_call(e.args)
+        if name == "int_to_str":
+            return self._gen_to_str_call(e.args, self._get_int_to_str(), I64)
+        if name == "rat_to_str":
+            from ._common import RAT as _RAT
+            return self._gen_to_str_call(e.args, self._get_rat_to_str(), _RAT)
+        if name == "sex_to_str":
+            from ._common import SEX as _SEX
+            return self._gen_to_str_call(e.args, self._get_sex_to_str(), _SEX)
+        if name == "bool_to_str":
+            return self._gen_to_str_call(e.args, self._get_bool_to_str(), I1)
 
         # Generic fn call: look up the concrete type args inferred by
         # the checker and dispatch to (emitting if necessary) the
@@ -1722,7 +1808,15 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
             v = self._gen_expr(arg)
             if v is None:
                 raise CodegenError(f"argument {i} of call to {name} has no value")
-            call_args.append(self._coerce(v, expected_ty))
+            coerced = self._coerce(v, expected_ty)
+            # Str arg: transfer ownership to an anonymous local slot (so the
+            # heap bytes outlive this call and get freed at scope exit),
+            # then hand the callee a cap=0 borrow so its own cleanup frame
+            # can register the param without double-freeing.
+            if self._is_str_value(expected_ty):
+                self._register_str_rvalue_cleanup(coerced, arg)
+                coerced = self._str_as_borrow(coerced)
+            call_args.append(coerced)
         return self.builder.call(fn, call_args)
 
     # --- intrinsics: stdlib I/O -----------------------------------------
@@ -1756,6 +1850,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
             val = self._gen_expr(arg)
             if val is None:
                 raise CodegenError("print argument has no value")
+            self._register_str_rvalue_cleanup(val, arg)
             last = (i == len(args) - 1)
             self._emit_one_print(val, newline=(newline and last))
 
@@ -1826,6 +1921,47 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         den = self._coerce(den, I64)
         return self.builder.call(self._get_rat_reduce(), [num, den])
 
+    # --- dynamic-string intrinsic emitters ----------------------------
+
+    # Ownership rule: str intrinsic results are heap-owned (cap > 0).
+    # When consumed as an arg to another call — intrinsic or user fn —
+    # the consumer registers an anonymous cleanup slot so the heap bytes
+    # outlive the call and get freed at scope exit. User fn calls
+    # additionally zero the callee's cap so the callee's own cleanup
+    # frame can register the param uniformly without double-free.
+
+    def _gen_str_concat_call(self, args: list[A.Expr]) -> ir.Value:
+        assert self.builder is not None
+        a = self._gen_expr(args[0])
+        b = self._gen_expr(args[1])
+        if a is None or b is None:
+            raise CodegenError("str_concat argument has no value")
+        self._register_str_rvalue_cleanup(a, args[0])
+        self._register_str_rvalue_cleanup(b, args[1])
+        return self.builder.call(self._get_str_concat(), [a, b])
+
+    def _gen_str_slice_call(self, args: list[A.Expr]) -> ir.Value:
+        assert self.builder is not None
+        s = self._gen_expr(args[0])
+        lo = self._gen_expr(args[1])
+        hi = self._gen_expr(args[2])
+        if s is None or lo is None or hi is None:
+            raise CodegenError("str_slice argument has no value")
+        self._register_str_rvalue_cleanup(s, args[0])
+        lo = self._coerce(lo, I64)
+        hi = self._coerce(hi, I64)
+        return self.builder.call(self._get_str_slice(), [s, lo, hi])
+
+    def _gen_to_str_call(
+        self, args: list[A.Expr], fn: ir.Function, arg_ty: ir.Type,
+    ) -> ir.Value:
+        assert self.builder is not None
+        v = self._gen_expr(args[0])
+        if v is None:
+            raise CodegenError("to_str argument has no value")
+        v = self._coerce(v, arg_ty)
+        return self.builder.call(fn, [v])
+
     # --- field access ---------------------------------------------------
 
     def _gen_field(self, e: A.Field) -> ir.Value:
@@ -1885,12 +2021,13 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         raise CodegenError(f"field access on {target.type} not supported yet")
 
     def _gen_string_lit(self, data: bytes) -> ir.Value:
-        """Lower a string literal to a `str` seal value: `{ ptr: *u8, len: i64 }`.
-        Backing bytes live in a deduped internal global."""
+        """Lower a string literal to a `str` tablet: `{ ptr, len, cap }`.
+        Literals carry cap=0 to mark them as borrowed (immortal global
+        storage — `str_release` is a no-op for cap=0)."""
         assert self.builder is not None
         if "str" not in self._struct_types:
             raise CodegenError(
-                "string literal used but `str` seal is not registered "
+                "string literal used but `str` tablet is not registered "
                 "(driver should have auto-injected it)"
             )
         struct_ty = self._struct_types["str"]
@@ -1899,6 +2036,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin):
         value: ir.Value = ir.Constant(struct_ty, ir.Undefined)
         value = self.builder.insert_value(value, ptr, 0)
         value = self.builder.insert_value(value, length, 1)
+        value = self.builder.insert_value(value, ir.Constant(I64, 0), 2)
         return value
 
     def _is_str_value(self, llvm_ty: ir.Type) -> bool:

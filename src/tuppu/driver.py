@@ -31,16 +31,19 @@ from .typecheck import CheckError, check
 # --- IR generation --------------------------------------------------------
 
 def _builtin_decls() -> list[A.Decl]:
-    """Decls injected into every compilation. Currently just the `str`
-    tablet: `{ ptr: *u8, len: i64 }`. Keeping the definition here
-    (rather than in a .tpu stdlib file) means string literals work
-    even with `--no-stdlib`."""
+    """Decls injected into every compilation. Currently the `str` tablet:
+    `{ ptr: *u8, len: i64, cap: i64 }`. The `cap` sentinel discriminates
+    ownership: cap == 0 means borrowed (string literals pointing into an
+    immortal global); cap > 0 means heap-owned (freed by the scope-exit
+    cleanup). Keeping the definition here (rather than in a .tpu stdlib
+    file) means string literals work even with `--no-stdlib`."""
     return [
         A.StructDecl(
             name="str",
             fields=[
                 ("ptr", A.TypePointer(element=A.TypeName(name="u8"))),
                 ("len", A.TypeName(name="i64")),
+                ("cap", A.TypeName(name="i64")),
             ],
         ),
     ]

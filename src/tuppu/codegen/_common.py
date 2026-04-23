@@ -81,4 +81,10 @@ class TabletsInfo:
 
 # Names that the user cannot shadow — they resolve to compiler intrinsics.
 # "rat" is both a type and a construction intrinsic (rat(num, den) -> rat).
-INTRINSICS: frozenset[str] = frozenset({"print", "println", "read_int", "rat"})
+INTRINSICS: frozenset[str] = frozenset({
+    "print", "println", "read_int", "rat",
+    # Dynamic-string intrinsics: all return heap-owned `str` values
+    # which the caller's cleanup frame releases at scope exit.
+    "str_concat", "str_slice",
+    "int_to_str", "rat_to_str", "sex_to_str", "bool_to_str",
+})

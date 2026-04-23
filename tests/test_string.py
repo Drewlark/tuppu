@@ -150,6 +150,110 @@ def test_string_as_return_value(tmp_path):
     assert out == b"zero\nnonzero\n"
 
 
+# --- ownership across fn boundaries ---------------------------------------
+#
+# The cap=0 borrow sentinel: call-site forces cap=0 on every str arg so
+# the callee registers the param uniformly — release becomes a no-op for
+# borrows, caller retains sole ownership of the heap bytes.
+
+def test_heap_str_passed_to_fn_usable_after(tmp_path):
+    # If the callee double-freed an owned str, the second println would
+    # hit freed memory. Shipping the borrow means the caller still owns.
+    src = (
+        'fn show(s: str) { println(s) }\n'
+        'fn main() -> i32 {\n'
+        '  step s = str_concat("hi, ", "Drew")\n'
+        '  show(s)\n'
+        '  println(s)\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"hi, Drew\nhi, Drew\n"
+
+
+def test_mut_str_param_reassign_releases(tmp_path):
+    # Reassigning a mut str param to a heap-owned str must free the new
+    # storage at scope exit — otherwise we leak every call.
+    src = (
+        'fn rebuild(mut s: str) {\n'
+        '  s = str_concat(s, "!")\n'
+        '  println(s)\n'
+        '}\n'
+        'fn main() -> i32 {\n'
+        '  rebuild("hi")\n'
+        '  rebuild("bye")\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"hi!\nbye!\n"
+
+
+def test_unbound_concat_does_not_crash(tmp_path):
+    # `println(str_concat(...))` used to leak; the anonymous-temp auto-
+    # release machinery registers the rvalue in the caller's frame so it
+    # frees at scope exit. Correctness proxy: program runs + right output.
+    src = (
+        'fn main() -> i32 {\n'
+        '  println(str_concat("foo", "bar"))\n'
+        '  0\n'
+        '}\n'
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"foobar\n"
+
+
+def test_nested_concat_inside_call_no_leak(tmp_path):
+    # Each inner str_concat produces a heap str consumed by the outer
+    # call; every layer must register a cleanup so intermediates get
+    # freed. If this hits the allocator repeatedly without freeing,
+    # long loops would blow out RSS — here we just verify the program
+    # terminates with the right output.
+    src = (
+        'fn main() -> i32 {\n'
+        '  mut i: i64 = 0\n'
+        '  while i < 1000 {\n'
+        '    println(str_concat(str_concat("a", "b"), int_to_str(i)))\n'
+        '    i = i + 1\n'
+        '  }\n'
+        '  0\n'
+        '}\n'
+    )
+    rc, out, _ = run(src, tmp_path)
+    assert rc == 0
+    lines = out.split(b"\n")
+    assert lines[0] == b"ab0"
+    assert lines[999] == b"ab999"
+
+
+def test_mut_str_param_release_is_wired(tmp_path):
+    # Compile-only check: a mut str param needs a release call so a
+    # reassignment to a heap value doesn't leak at scope exit. Non-mut
+    # params stay SSA with cap=0 (nothing to free), so this test uses
+    # `mut` deliberately.
+    src = (
+        'fn maybe_grow(mut s: str) { println(s) }\n'
+        'fn main() -> i32 { maybe_grow("hi")\n 0 }\n'
+    )
+    ir = compile_to_ir(src)
+    assert "__tuppu_str_release" in ir
+
+
+def test_str_rvalue_temp_release_is_wired(tmp_path):
+    # `println(str_concat(a, b))` must register an anonymous cleanup for
+    # the concat result — the IR should show at least one release call
+    # in main after the concat.
+    src = (
+        'fn main() -> i32 {\n'
+        '  println(str_concat("foo", "bar"))\n'
+        '  0\n'
+        '}\n'
+    )
+    ir = compile_to_ir(src)
+    assert "__tuppu_str_release" in ir
+
+
 # --- stdlib helpers --------------------------------------------------------
 
 def test_stdlib_str_eq(tmp_path):

@@ -176,6 +176,18 @@ class Field:
     col:  int = _pos()
 
 @dataclass
+class Slice:
+    """A Python-style slice expression: `s[lo:hi]`, `s[:hi]`, `s[lo:]`,
+    or `s[:]`. Either bound may be `None`, in which case codegen fills
+    in `0` / `s.len` respectively. Distinct from `Index` — an `Index`
+    always has a single non-optional subscript."""
+    target: "Expr"
+    lo: "Expr | None"
+    hi: "Expr | None"
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
 class Cast:
     value: "Expr"
     type: TypeExpr
@@ -248,7 +260,7 @@ class MatchExpr:
 
 Expr = Union[
     IntLit, SexLit, StringLit, CharLit, BoolLit, LostLit, Ident,
-    Unary, Binary, Call, Index, Field, Cast, StructLit,
+    Unary, Binary, Call, Index, Slice, Field, Cast, StructLit,
     Block, IfExpr, MatchExpr,
 ]
 

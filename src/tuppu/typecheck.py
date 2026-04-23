@@ -187,7 +187,11 @@ PRIM_TYPES: dict[str, Ty] = {
     "sex": DISH, "dish": DISH,
 }
 
-INTRINSIC_NAMES = {"print", "println", "read_int", "rat"}
+INTRINSIC_NAMES = {
+    "print", "println", "read_int", "rat",
+    "str_concat", "str_slice",
+    "int_to_str", "rat_to_str", "sex_to_str", "bool_to_str",
+}
 
 
 # --- helpers ----------------------------------------------------------------
@@ -1124,6 +1128,12 @@ class Checker:
                     )
             return RAT
 
+        if name in ("str_concat", "str_slice"):
+            return self._tc_str_intrinsic(e, name)
+
+        if name in ("int_to_str", "rat_to_str", "sex_to_str", "bool_to_str"):
+            return self._tc_to_str_intrinsic(e, name)
+
         fn = self.fns.get(name)
         if fn is None:
             raise CheckError(
@@ -1191,6 +1201,88 @@ class Checker:
                 self._substitute(subst[fresh], subst) for fresh in inst_names
             )
         return ret
+
+    def _tc_str_intrinsic(self, e: A.Call, name: str) -> Ty:
+        str_ty = self.structs.get("str")
+        if str_ty is None:
+            raise CheckError(
+                f"{name}: str type not in scope (stdlib may be missing)",
+                e.line, e.col,
+            )
+        if name == "str_concat":
+            if len(e.args) != 2:
+                raise CheckError(
+                    "str_concat(a, b) takes exactly two str arguments",
+                    e.line, e.col,
+                )
+            for i, a in enumerate(e.args):
+                at = self._tc_expr(a)
+                if at != str_ty:
+                    raise CheckError(
+                        f"str_concat: argument {i} has type {at}, expected str",
+                        e.line, e.col,
+                    )
+            return str_ty
+        if name == "str_slice":
+            if len(e.args) != 3:
+                raise CheckError(
+                    "str_slice(s, lo, hi) takes exactly three arguments",
+                    e.line, e.col,
+                )
+            at = self._tc_expr(e.args[0])
+            if at != str_ty:
+                raise CheckError(
+                    f"str_slice: first argument must be str, got {at}",
+                    e.line, e.col,
+                )
+            for i in (1, 2):
+                bt = self._tc_expr(e.args[i])
+                if not _is_int(bt):
+                    raise CheckError(
+                        f"str_slice: argument {i} must be integer, got {bt}",
+                        e.line, e.col,
+                    )
+            return str_ty
+        raise CheckError(f"unknown str intrinsic {name!r}", e.line, e.col)
+
+    def _tc_to_str_intrinsic(self, e: A.Call, name: str) -> Ty:
+        str_ty = self.structs.get("str")
+        if str_ty is None:
+            raise CheckError(
+                f"{name}: str type not in scope (stdlib may be missing)",
+                e.line, e.col,
+            )
+        if len(e.args) != 1:
+            raise CheckError(
+                f"{name} takes exactly one argument", e.line, e.col,
+            )
+        at = self._tc_expr(e.args[0])
+        expected: Ty
+        if name == "int_to_str":
+            if not _is_int(at):
+                raise CheckError(
+                    f"int_to_str: argument must be integer, got {at}",
+                    e.line, e.col,
+                )
+        elif name == "rat_to_str":
+            if not isinstance(at, TyRat):
+                raise CheckError(
+                    f"rat_to_str: argument must be rat, got {at}",
+                    e.line, e.col,
+                )
+        elif name == "sex_to_str":
+            if not isinstance(at, TyDish):
+                raise CheckError(
+                    f"sex_to_str: argument must be sex/dish, got {at}",
+                    e.line, e.col,
+                )
+        elif name == "bool_to_str":
+            if not isinstance(at, TyBool):
+                raise CheckError(
+                    f"bool_to_str: argument must be bool, got {at}",
+                    e.line, e.col,
+                )
+        return str_ty
 
     def _tc_method_call(self, e: A.Call) -> Ty:
         assert isinstance(e.callee, A.Field) and isinstance(e.callee.target, A.Ident)

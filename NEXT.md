@@ -8,7 +8,7 @@ front; imports and dynamic strings are queued behind it.
 - **v0.1 feature-complete** per SPEC.md — lexer, Pratt parser, type
   checker, LLVM codegen via llvmlite.
 - Private repo: https://github.com/Drewlark/tuppu (branch `main`).
-- **434 tests passing.**
+- **440 tests passing.**
 - CLI: `./tuppu run file.tpu` and `./tuppu build ... -o out`.
 - Bundled stdlib auto-included; pass `--no-stdlib` to opt out.
 - Compiler's in Python (`src/tuppu/`); stdlib's in Tuppu
@@ -25,7 +25,16 @@ What works:
   `p.x = 5` and chained `l.a.x = 5` via GEP into the alloca; `p.x +=
   1` aug-assign also works. `step`-bound structs remain immutable.
 - **Variable-length strings** — `str` is a built-in tablet
-  `{ ptr: *u8, len: i64 }`, auto-injected. `fn f(s: str)`, `s.len`,
+  `{ ptr: *u8, len: i64, cap: i64 }`, auto-injected. `cap == 0`
+  marks a borrow (string literals, fn params, reads of tracked
+  values); `cap > 0` marks heap ownership. `__tuppu_str_release`
+  frees only when `cap > 0` — so passing a str through a call is
+  safe: the call site forces cap=0 on every str arg, the callee
+  registers the param in its cleanup frame uniformly, release
+  becomes a no-op, caller keeps sole ownership. Unbound rvalues
+  (`println(str_concat(a, b))`) get an anonymous cleanup slot at
+  the consumer site so heap bytes are freed at the surrounding
+  scope's exit — no leaks in tight loops. `fn f(s: str)`, `s.len`,
   `s[i]`, `print(s)`/`println(s)` via `write(2)` (embedded NULs
   survive). Stdlib `str_eq`/`str_starts_with`/`str_ends_with`/
   `str_is_empty`/`str_index_of`.
@@ -102,14 +111,7 @@ What works:
 - Compile-time warning infrastructure.
 
 What doesn't yet:
-- Sum-type match patterns: no nesting (`Some(Circle(r))`), no guards
-  (`Some(x) if x > 0`), no or-patterns (`Some(1) | Some(2)`). v0.1
-  intentionally stops at flat patterns.
-- Named fields on variants (`Circle(radius: rat)`). Positional only
-  for now.
-- SPEC.md coverage of `seal` / `match` — source of truth is the test
-  and example files until the spec gets updated.
-- Fn-as-value / closures — the next planned chunk.
+- Fn-as-value / closures — the next planned chunk after dynamic strings.
 - Native sex `%` (still warn-lower to rat; rat % itself isn't
   implemented either, so this errors at codegen).
 - Mixed sex × rat ops (still warn, stay as rat — deliberate, since
@@ -118,15 +120,61 @@ What doesn't yet:
   — the big compiler-learning chunk).
 - `--strict-dish` flag (see FUTURE_OPTIMIZATIONS.md for the sketch).
 - Imports / namespacing.
-- Dynamic string ops (concat, slice, case) — needs tablets-backed
-  alloc plus a lifetime/ownership story.
-- `read_line() -> str` — same blocker.
+- `read_line() -> str` — needs stdin wrapper, not yet added.
 - Expression-level pointer ops (`*p`, `&x`, `p + 1`) — intentional.
-- Recursive structs (would need identified types + heap indirection).
 - `impress` reinterpret cast (documented in SPEC §14).
 - f64 (lexed but no codegen; `sex as f64` errors cleanly).
 - Closures / first-class functions.
 - Self-hosting.
+
+## Known v0.1 limitations (deliberate cuts)
+
+Things that are shipping with known reductions, documented here so
+future-us doesn't trip on them and a v0.2 pass can revisit them:
+
+### Sum types (`seal` / `match`)
+- **Flat patterns only.** No nesting (`Some(Circle(r))`), no guards
+  (`Some(x) if x > 0`), no or-patterns (`Some(1) | Some(2)`).
+  Adding these is a v0.2 effort — ML-family matching is a bigger
+  design lift than it looks (exhaustiveness for nesting is subtle).
+- **Positional variant fields only.** `Circle(rat)` works, but
+  `Circle(radius: rat)` doesn't parse. Trivial to add once we want
+  named-field patterns.
+- **Globally-unique variant names.** `seal A { X }; seal B { X }`
+  is rejected because variants are looked up in one flat table.
+  Qualified syntax (`A::X`) would unblock this; not yet designed.
+- **Nullary variants of generic seals need context to pin T.**
+  `step x = None` (no annotation) errors with "cannot infer T".
+  Works fine in return position, call args, or annotated bindings
+  (`step x: Option<i64> = None`) thanks to the expected-type
+  threading. Turbofish (`None::<i64>`) isn't supported.
+- **SPEC.md doesn't cover `seal` / `match` yet.** Source of truth
+  is `tests/test_sum.py` and `examples/omens.tpu` until the spec
+  pass catches up.
+
+### Dynamic strings
+- **Slicing always copies.** `str_slice(s, lo, hi)` allocates a
+  fresh buffer and memcpies. Zero-copy views would need lifetime
+  or refcount machinery we don't have; the copy keeps the model
+  coherent and is the honest price of value semantics. Move/borrow
+  analysis later can elide the copy when the source is provably
+  unused past the call.
+- **Immutable strings only.** All ops produce new strings; `mut s`
+  allows reassignment (old value is released before storing new),
+  but there's no in-place `str_push` or growable `str_buf` type.
+- **No f-strings or format mini-language.** Build via
+  `str_concat` + `int_to_str` / `rat_to_str` / `sex_to_str` /
+  `bool_to_str`. Format syntax is a post-overloads feature.
+- **Accessor door kept open.** Reads of `.ptr` / `.len` / `.cap` go
+  through `StrsMixin._str_extract` in codegen (not raw field
+  extract) so a future small-string optimization can add a
+  discriminator branch without touching callers. Stdlib
+  `str.tpu` still uses `s.ptr` / `s.len` as field access; if we
+  switch layouts, those become accessor-dispatches transparently.
+- **SSO (small-string optimization) deferred.** Design discussed
+  during this pass; layout was kept 24-byte `{ptr, len, cap}`
+  rather than the SSO variant to keep v0.1 simple. Switchable
+  later without user-code breakage thanks to the accessor path.
 
 ## Priority order (agreed)
 
@@ -401,7 +449,7 @@ Notes for future-self (or future-user) reading scratch files:
 If starting a fresh session after this compact:
 
 1. `cd /Users/drew/code/compilerfun` and read this file.
-2. `.venv/bin/pytest` — expect 434 passing.
+2. `.venv/bin/pytest` — expect 440 passing.
 3. `git log --oneline -12` — recent timeline: sex Phase 3a/3b,
    struct field mutation, codegen.py split into mixins package,
    elif + did-you-mean, recursive tablets + wedge handles + auto-

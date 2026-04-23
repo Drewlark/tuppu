@@ -568,9 +568,25 @@ class Parser:
             self.eat(Tok.RPAREN)
             return _at(op_tok, A.Call(callee=left, args=args))
         if op_tok.kind is Tok.LBRACKET:
-            idx = self.parse_expr()
+            # Distinguish `x[expr]` (Index) from `x[lo:hi]` (Slice).
+            # Either bound may be elided — `[:]`, `[lo:]`, `[:hi]`.
+            lo: A.Expr | None = None
+            hi: A.Expr | None = None
+            if self.check(Tok.COLON):
+                self.advance()
+                if not self.check(Tok.RBRACKET):
+                    hi = self.parse_expr()
+                self.eat(Tok.RBRACKET)
+                return _at(op_tok, A.Slice(target=left, lo=lo, hi=hi))
+            lo = self.parse_expr()
+            if self.check(Tok.COLON):
+                self.advance()
+                if not self.check(Tok.RBRACKET):
+                    hi = self.parse_expr()
+                self.eat(Tok.RBRACKET)
+                return _at(op_tok, A.Slice(target=left, lo=lo, hi=hi))
             self.eat(Tok.RBRACKET)
-            return _at(op_tok, A.Index(target=left, index=idx))
+            return _at(op_tok, A.Index(target=left, index=lo))
         if op_tok.kind is Tok.DOT:
             name = self.eat(Tok.IDENT, "field name").value
             return _at(op_tok, A.Field(target=left, name=name))
