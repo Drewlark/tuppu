@@ -82,6 +82,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         # returned value needs independently-owned bytes so the
         # caller doesn't UAF when the source's cleanup fires first.
         self._struct_clone_cache: dict[int, ir.Function] = {}
+        # Per-seal release + clone fns, keyed by id(seal_ty). Emitted
+        # lazily; only built for seals that transitively hold cleanup-
+        # bearing payload fields.
+        self._seal_release_cache: dict[int, ir.Function] = {}
+        self._seal_clone_cache: dict[int, ir.Function] = {}
         # table name -> (global array, length, lo bound, element LLVM type)
         self._tables: dict[str, tuple[ir.GlobalVariable, int, int, ir.Type]] = {}
         # Tablets monomorphizations: key is (N, str(elem_type)).
@@ -1789,8 +1794,9 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
 
     def _deep_clone_if_cleanup_bearing(self, val: ir.Value) -> ir.Value:
         """Deep-clone `val` if it's a cleanup-bearing type — str, a
-        user struct whose fields recursively require cloning, or a
-        tablets value. Scalars pass through unchanged."""
+        user struct whose fields recursively require cloning, a
+        tablets value, or a seal carrying cleanup-bearing payload.
+        Scalars pass through unchanged."""
         assert self.builder is not None
         if self._is_str_value(val.type):
             return self.builder.call(self._get_str_clone(), [val])
@@ -1808,6 +1814,13 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             self.builder.store(val, src_slot)
             return self.builder.call(
                 self._get_tablets_clone(info), [src_slot],
+            )
+        if (
+            self._seal_key_for_ty(val.type) is not None
+            and self._seal_needs_cleanup(val.type)
+        ):
+            return self.builder.call(
+                self._get_seal_clone(val.type), [val],
             )
         return val
 
@@ -1886,6 +1899,10 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                     self._struct_fields_for(init_val.type) is not None
                     and self._struct_needs_cleanup(init_val.type)
                 )
+                or (
+                    self._seal_key_for_ty(init_val.type) is not None
+                    and self._seal_needs_cleanup(init_val.type)
+                )
             )
             transfer_on_tail = None
             # Indexing a container yields a borrow of the container's
@@ -1925,8 +1942,9 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
     ) -> None:
         """If `value_ty` is a cleanup-having type, record a release call
         for the innermost cleanup frame so it fires automatically at
-        scope exit. Handled: tablets, the built-in str, and user
-        structs that (transitively) hold any of those."""
+        scope exit. Handled: tablets, the built-in str, user structs
+        that (transitively) hold any of those, and seals whose
+        variants carry cleanup-bearing payloads."""
         if not self._cleanup_frames:
             return
         info = self._tablets_info_for(value_ty)
@@ -1945,13 +1963,22 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             self._cleanup_frames[-1].append(
                 (self._get_struct_release(value_ty), slot, name),
             )
+            return
+        if (
+            self._seal_key_for_ty(value_ty) is not None
+            and self._seal_needs_cleanup(value_ty)
+        ):
+            self._cleanup_frames[-1].append(
+                (self._get_seal_release(value_ty), slot, name),
+            )
 
     def _struct_needs_cleanup(self, struct_ty: ir.Type) -> bool:
         """Does this user struct (transitively) hold any cleanup-bearing
-        fields? Walks the declared field list — str, tablets, and nested
-        user structs that themselves need cleanup all count. Pointer /
-        handle fields don't — they borrow into some other storage whose
-        owner does the release."""
+        fields? Walks the declared field list — str, tablets, nested
+        user structs that themselves need cleanup, and seals that carry
+        cleanup-bearing payloads all count. Pointer / handle fields
+        don't — they borrow into some other storage whose owner does
+        the release."""
         fields = self._struct_fields_for(struct_ty)
         if fields is None:
             return False
@@ -1963,6 +1990,41 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             if self._struct_fields_for(fty) is not None:
                 if self._struct_needs_cleanup(fty):
                     return True
+            if (
+                self._seal_key_for_ty(fty) is not None
+                and self._seal_needs_cleanup(fty)
+            ):
+                return True
+        return False
+
+    def _seal_needs_cleanup(self, seal_ty: ir.Type) -> bool:
+        """Does this seal (transitively) hold any cleanup-bearing
+        payload fields? Walks each variant's payload tuple looking for
+        str / tablets / nested struct-with-cleanup / nested seal-with-
+        cleanup. A seal with only nullary variants or scalar payloads
+        returns False — no release fn needed."""
+        seal_key = self._seal_key_for_ty(seal_ty)
+        if seal_key is None:
+            return False
+        variants = self._seal_variants.get(seal_key)
+        if variants is None:
+            return False
+        for _vname, payload_ty in variants:
+            for fty in payload_ty.elements:
+                if self._is_str_value(fty):
+                    return True
+                if self._tablets_info_for(fty) is not None:
+                    return True
+                if (
+                    self._struct_fields_for(fty) is not None
+                    and self._struct_needs_cleanup(fty)
+                ):
+                    return True
+                if (
+                    self._seal_key_for_ty(fty) is not None
+                    and self._seal_needs_cleanup(fty)
+                ):
+                    return True
         return False
 
     def _struct_as_borrow(
@@ -1970,11 +2032,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
     ) -> ir.Value:
         """Produce a view of `val` with every str field forced to cap=0
         and every nested cleanup struct recursively neutered. Tablets
-        fields are left intact — they lack a cap-style sentinel, so
-        zeroing them would destroy read access. The push / struct-lit /
-        assign code paths deep-clone on borrow inputs, so the borrow
-        view is safe to copy around without aliasing the container's
-        chunks at a release site."""
+        and seal fields are left intact — neither has a cap-style
+        sentinel, and zeroing would destroy read access. The push /
+        struct-lit / assign / variant-ctor code paths deep-clone on
+        borrow inputs, so the borrow view is safe to copy around
+        without aliasing the container's storage at a release site."""
         assert self.builder is not None
         fields = self._struct_fields_for(struct_ty)
         if fields is None:
@@ -2064,6 +2126,16 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                     inbounds=True,
                 )
                 b.call(self._get_struct_release(fty), [field_ptr])
+                continue
+            if (
+                self._seal_key_for_ty(fty) is not None
+                and self._seal_needs_cleanup(fty)
+            ):
+                field_ptr = b.gep(
+                    s_ptr, [ir.Constant(I32, 0), ir.Constant(I32, i)],
+                    inbounds=True,
+                )
+                b.call(self._get_seal_release(fty), [field_ptr])
         b.ret_void()
         return fn
 
@@ -2125,10 +2197,228 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 cloned = b.call(self._get_struct_clone(fty), [field_val])
                 result = b.insert_value(result, cloned, i)
                 continue
+            if (
+                self._seal_key_for_ty(fty) is not None
+                and self._seal_needs_cleanup(fty)
+            ):
+                cloned = b.call(self._get_seal_clone(fty), [field_val])
+                result = b.insert_value(result, cloned, i)
+                continue
             # Scalars, pointers, wedges: copy by value.
             result = b.insert_value(result, field_val, i)
         b.ret(result)
         return fn
+
+    def _get_seal_release(self, seal_ty: ir.Type) -> ir.Function:
+        """Build (once, cached by LLVM-type identity) a release fn for a
+        seal: `__tuppu_seal_<tag>_release(*seal_ty)`. Loads the tag,
+        switches on each variant index, and for variants with
+        cleanup-bearing payload fields bitcasts the payload slot to
+        the variant struct and releases each field via its
+        appropriate release helper. Variants with no cleanup-bearing
+        fields (including nullary) fall through to the default
+        (no-op) block."""
+        cached = self._seal_release_cache.get(id(seal_ty))
+        if cached is not None:
+            return cached
+        tag = self._seal_fn_suffix(seal_ty)
+        fn = ir.Function(
+            self.module,
+            ir.FunctionType(ir.VoidType(), [seal_ty.as_pointer()]),
+            name=f"__tuppu_seal_{tag}_release",
+        )
+        self._seal_release_cache[id(seal_ty)] = fn
+        slot = fn.args[0]
+        slot.name = "s"
+
+        entry = fn.append_basic_block("entry")
+        done = fn.append_basic_block("done")
+        b = ir.IRBuilder(entry)
+        seal_key = self._seal_key_for_ty(seal_ty)
+        variants = self._seal_variants[seal_key]
+        tag_ptr = b.gep(
+            slot, [ir.Constant(I32, 0), ir.Constant(I32, 0)], inbounds=True,
+        )
+        # GEP the payload slot BEFORE the switch (the switch is a
+        # terminator — anything after it in `entry` is invalid IR).
+        payload_ptr = None
+        if len(seal_ty.elements) >= 2:
+            payload_ptr = b.gep(
+                slot, [ir.Constant(I32, 0), ir.Constant(I32, 1)],
+                inbounds=True,
+            )
+        tag_val = b.load(tag_ptr)
+        switch = b.switch(tag_val, done)
+
+        for vidx, (vname, payload_ty) in enumerate(variants):
+            needs = any(
+                self._field_needs_cleanup(fty) for fty in payload_ty.elements
+            )
+            if not needs:
+                continue
+            case_bb = fn.append_basic_block(f"release.{vname}")
+            switch.add_case(ir.Constant(I8, vidx), case_bb)
+            b.position_at_end(case_bb)
+            assert payload_ptr is not None
+            typed = b.bitcast(payload_ptr, payload_ty.as_pointer())
+            for fi, fty in enumerate(payload_ty.elements):
+                field_ptr = b.gep(
+                    typed,
+                    [ir.Constant(I32, 0), ir.Constant(I32, fi)],
+                    inbounds=True,
+                )
+                if self._is_str_value(fty):
+                    b.call(self._get_str_release(), [field_ptr])
+                    continue
+                info = self._tablets_info_for(fty)
+                if info is not None:
+                    b.call(info.release, [field_ptr])
+                    continue
+                if (
+                    self._struct_fields_for(fty) is not None
+                    and self._struct_needs_cleanup(fty)
+                ):
+                    b.call(self._get_struct_release(fty), [field_ptr])
+                    continue
+                if (
+                    self._seal_key_for_ty(fty) is not None
+                    and self._seal_needs_cleanup(fty)
+                ):
+                    b.call(self._get_seal_release(fty), [field_ptr])
+                    continue
+            b.branch(done)
+
+        b.position_at_end(done)
+        # After releasing, zero the tag so repeat releases (shouldn't
+        # happen, but the transfer-zeroing path relies on it) walk the
+        # default no-op block.
+        b.store(ir.Constant(I8, 0), tag_ptr)
+        b.ret_void()
+        return fn
+
+    def _get_seal_clone(self, seal_ty: ir.Type) -> ir.Function:
+        """Build (once, cached by LLVM-type identity) a deep-clone fn
+        for a seal: `__tuppu_seal_<tag>_clone(seal_ty) -> seal_ty`.
+        Loads the tag, switches on the variant, and deep-clones each
+        cleanup-bearing payload field into a fresh seal value. Scalar
+        payload fields copy by value."""
+        cached = self._seal_clone_cache.get(id(seal_ty))
+        if cached is not None:
+            return cached
+        tag = self._seal_fn_suffix(seal_ty)
+        fn = ir.Function(
+            self.module,
+            ir.FunctionType(seal_ty, [seal_ty]),
+            name=f"__tuppu_seal_{tag}_clone",
+        )
+        self._seal_clone_cache[id(seal_ty)] = fn
+        src_arg = fn.args[0]
+        src_arg.name = "src"
+
+        entry = fn.append_basic_block("entry")
+        merge = fn.append_basic_block("merge")
+        b = ir.IRBuilder(entry)
+        # Spill src to a stack slot so we can GEP/bitcast the payload.
+        src_slot = b.alloca(seal_ty, name="src.slot")
+        b.store(src_arg, src_slot)
+        dst_slot = b.alloca(seal_ty, name="dst.slot")
+        # Start with a scalar copy — covers the tag + any scalar payload
+        # bytes. Deep-cloned fields overwrite on top.
+        b.store(src_arg, dst_slot)
+
+        seal_key = self._seal_key_for_ty(seal_ty)
+        variants = self._seal_variants[seal_key]
+        tag_ptr = b.gep(
+            src_slot, [ir.Constant(I32, 0), ir.Constant(I32, 0)], inbounds=True,
+        )
+        # GEP the payload slots BEFORE the switch terminator.
+        src_payload_ptr = None
+        dst_payload_ptr = None
+        if len(seal_ty.elements) >= 2:
+            src_payload_ptr = b.gep(
+                src_slot, [ir.Constant(I32, 0), ir.Constant(I32, 1)],
+                inbounds=True,
+            )
+            dst_payload_ptr = b.gep(
+                dst_slot, [ir.Constant(I32, 0), ir.Constant(I32, 1)],
+                inbounds=True,
+            )
+        tag_val = b.load(tag_ptr)
+        switch = b.switch(tag_val, merge)
+
+        for vidx, (vname, payload_ty) in enumerate(variants):
+            needs = any(
+                self._field_needs_cleanup(fty) for fty in payload_ty.elements
+            )
+            if not needs:
+                continue
+            case_bb = fn.append_basic_block(f"clone.{vname}")
+            switch.add_case(ir.Constant(I8, vidx), case_bb)
+            b.position_at_end(case_bb)
+            assert src_payload_ptr is not None and dst_payload_ptr is not None
+            src_typed = b.bitcast(src_payload_ptr, payload_ty.as_pointer())
+            dst_typed = b.bitcast(dst_payload_ptr, payload_ty.as_pointer())
+            for fi, fty in enumerate(payload_ty.elements):
+                if not self._field_needs_cleanup(fty):
+                    continue
+                src_field_ptr = b.gep(
+                    src_typed,
+                    [ir.Constant(I32, 0), ir.Constant(I32, fi)],
+                    inbounds=True,
+                )
+                dst_field_ptr = b.gep(
+                    dst_typed,
+                    [ir.Constant(I32, 0), ir.Constant(I32, fi)],
+                    inbounds=True,
+                )
+                src_field_val = b.load(src_field_ptr)
+                saved = self.builder
+                self.builder = b
+                try:
+                    cloned = self._deep_clone_if_cleanup_bearing(src_field_val)
+                finally:
+                    self.builder = saved
+                b.store(cloned, dst_field_ptr)
+            b.branch(merge)
+
+        b.position_at_end(merge)
+        b.ret(b.load(dst_slot))
+        return fn
+
+    def _field_needs_cleanup(self, fty: ir.Type) -> bool:
+        """Helper: does this LLVM type need a release fn? (str, tablets,
+        struct-with-cleanup, or seal-with-cleanup-payload.)"""
+        if self._is_str_value(fty):
+            return True
+        if self._tablets_info_for(fty) is not None:
+            return True
+        if (
+            self._struct_fields_for(fty) is not None
+            and self._struct_needs_cleanup(fty)
+        ):
+            return True
+        if (
+            self._seal_key_for_ty(fty) is not None
+            and self._seal_needs_cleanup(fty)
+        ):
+            return True
+        return False
+
+    def _seal_fn_suffix(self, seal_ty: ir.Type) -> str:
+        """Turn a seal LLVM type into a stable fn-name suffix. Uses the
+        seal name for non-generic seals and `Name__arg_tag` for
+        monomorphs, matching the identified-type naming scheme."""
+        key = self._seal_key_for_ty(seal_ty)
+        if isinstance(key, str):
+            return key
+        if isinstance(key, tuple):
+            name, arg_tys = key
+            arg_tag = "_".join(
+                str(a).replace(" ", "").replace('"', "")
+                for a in arg_tys
+            )
+            return f"{name}__{arg_tag}"
+        return "anon_seal"
 
     def _register_str_rvalue_cleanup(
         self, val: ir.Value, src: A.Expr,
@@ -2179,6 +2469,13 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             ):
                 self.builder.call(
                     self._get_struct_release(slot_ty), [slot_ptr],
+                )
+            elif (
+                self._seal_key_for_ty(slot_ty) is not None
+                and self._seal_needs_cleanup(slot_ty)
+            ):
+                self.builder.call(
+                    self._get_seal_release(slot_ty), [slot_ptr],
                 )
         # Ownership into the slot: transfer from an owning Ident or
         # deep-clone a borrow so the slot's release doesn't double-
@@ -2503,6 +2800,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         if (
             self._struct_fields_for(ty) is not None
             and self._struct_needs_cleanup(ty)
+        ):
+            return True
+        if (
+            self._seal_key_for_ty(ty) is not None
+            and self._seal_needs_cleanup(ty)
         ):
             return True
         return False

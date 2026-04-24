@@ -322,10 +322,9 @@ def test_tablets_of_tablets_owned_transfer(tmp_path):
 
 def test_reassign_mut_seal_with_heap_payload(tmp_path):
     # `mut m: Msg = Text(...)` then `m = Text(other)`. The mut seal
-    # slot's reassignment releases... currently shallow (seals have
-    # no release helper yet), but the read after reassignment must
-    # hit the new payload, not the old, and execution must complete
-    # cleanly.
+    # slot's reassignment releases the old variant's payload via the
+    # per-seal release helper, then the new value's payload transfers
+    # in. No leak, no UAF, no double-free.
     src = (
         "seal Msg { Text(str), Silent }\n"
         "fn main() -> i32 {\n"
@@ -341,3 +340,170 @@ def test_reassign_mut_seal_with_heap_payload(tmp_path):
     rc, out = run(src, tmp_path)
     assert rc == 0
     assert out == b"second!\n"
+
+
+# --- seal release (scope-exit + composition) --------------------------
+
+def test_seal_binding_releases_payload_at_scope_exit(tmp_path):
+    # Tight loop that allocates a heap str into a seal variant each
+    # iteration. Without a per-seal release the heap bytes accumulate
+    # unboundedly; with it, peak memory stays flat. We verify the
+    # loop completes cleanly — a missing release would eventually
+    # exhaust address space or at least show in the IR as a missing
+    # call at scope exit.
+    src = (
+        "seal Msg { Text(str), Silent }\n"
+        "fn main() -> i32 {\n"
+        "  mut n: i64 = 0\n"
+        "  while n < 10000 {\n"
+        "    step m = Text(\"aa\" + \"bb\")\n"
+        "    match m {\n"
+        "      Text(s) => {},\n"
+        "      Silent => {},\n"
+        "    }\n"
+        "    n = n + 1\n"
+        "  }\n"
+        "  println(\"done\")\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"done\n"
+
+
+def test_seal_release_wired_into_ir(tmp_path):
+    # IR-level check that a `step m = Text(...)` binding emits a
+    # __tuppu_seal_<name>_release call at scope exit.
+    from tuppu.driver import compile_to_ir
+    src = (
+        "seal Msg { Text(str), Silent }\n"
+        "fn main() -> i32 {\n"
+        "  step m = Text(\"hi\" + \"!\")\n"
+        "  0\n"
+        "}\n"
+    )
+    ir = compile_to_ir(src)
+    # Release helper is defined and a call is emitted at main's exit.
+    assert "define void @\"__tuppu_seal_Msg_release\"" in ir
+    assert "call void @\"__tuppu_seal_Msg_release\"" in ir
+
+
+def test_tablets_of_seal_walks_payload_on_release(tmp_path):
+    # tablets[N]Msg with heap-bearing Msg variants. The element-walk
+    # release must dispatch to the per-seal release for each slot so
+    # each variant's heap payload gets freed.
+    src = (
+        "seal Msg { Text(str), Silent }\n"
+        "fn main() -> i32 {\n"
+        "  mut n: i64 = 0\n"
+        "  while n < 1000 {\n"
+        "    mut t: tablets[8]Msg\n"
+        "    step _a = t.push(Text(\"aa\" + \"bb\"))\n"
+        "    step _b = t.push(Text(\"cc\" + \"dd\"))\n"
+        "    step _c = t.push(Silent)\n"
+        "    n = n + 1\n"
+        "  }\n"
+        "  println(\"done\")\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"done\n"
+
+
+def test_struct_with_seal_field_releases_payload(tmp_path):
+    # A tablet whose field is a seal with cleanup-bearing payload.
+    # Struct-release must walk to the seal field and dispatch to
+    # seal-release so nested heap bytes get freed.
+    src = (
+        "seal Msg { Text(str), Silent }\n"
+        "tablet Entry { m: Msg, count: i64 }\n"
+        "fn main() -> i32 {\n"
+        "  mut n: i64 = 0\n"
+        "  while n < 1000 {\n"
+        "    step e = Entry { m: Text(\"aa\" + \"bb\"), count: 1 }\n"
+        "    match e.m {\n"
+        "      Text(s) => {},\n"
+        "      Silent => {},\n"
+        "    }\n"
+        "    n = n + 1\n"
+        "  }\n"
+        "  println(\"done\")\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"done\n"
+
+
+def test_nested_seal_release_walks_inner(tmp_path):
+    # Outer seal holds an Inner seal payload that itself holds a
+    # heap str. Outer-release dispatches to inner-release which frees
+    # the str. A missing inner-release would leak the str bytes.
+    src = (
+        "seal Inner { Wrap(str) }\n"
+        "seal Outer { Hold(Inner), Empty }\n"
+        "fn main() -> i32 {\n"
+        "  mut n: i64 = 0\n"
+        "  while n < 1000 {\n"
+        "    step o = Hold(Wrap(\"aa\" + \"bb\"))\n"
+        "    match o {\n"
+        "      Hold(inner) => match inner {\n"
+        "        Wrap(s) => {},\n"
+        "      },\n"
+        "      Empty => {},\n"
+        "    }\n"
+        "    n = n + 1\n"
+        "  }\n"
+        "  println(\"done\")\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"done\n"
+
+
+def test_seal_deep_clone_from_borrow(tmp_path):
+    # Pushing a borrow Ident carrying a seal-with-heap-payload into
+    # another container must deep-clone the seal (which in turn
+    # clones the heap str). Releasing the source container must NOT
+    # dangle the destination's copy.
+    src = (
+        "seal Msg { Text(str) }\n"
+        "fn main() -> i32 {\n"
+        "  mut a: tablets[4]Msg\n"
+        "  mut b: tablets[4]Msg\n"
+        "  step _x = a.push(Text(\"al\" + \"ice\"))\n"
+        "  step p = a[0]\n"
+        "  step _y = b.push(p)\n"
+        "  release a\n"
+        "  match b[0] {\n"
+        "    Text(s) => println(s),\n"
+        "  }\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"alice\n"
+
+
+def test_seal_pure_enum_no_release_fn(tmp_path):
+    # A seal with only nullary / scalar-payload variants should NOT
+    # get a release fn — _seal_needs_cleanup returns False and no IR
+    # is emitted.
+    from tuppu.driver import compile_to_ir
+    src = (
+        "seal Color { Red, Green, Blue }\n"
+        "fn main() -> i32 {\n"
+        "  step c = Red\n"
+        "  match c { Red => 1, Green => 2, Blue => 3 }\n"
+        "  0\n"
+        "}\n"
+    )
+    ir = compile_to_ir(src)
+    assert "__tuppu_seal_Color_release" not in ir

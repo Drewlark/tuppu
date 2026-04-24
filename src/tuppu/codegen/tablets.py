@@ -555,6 +555,11 @@ class TabletsMixin:
             and self._struct_needs_cleanup(elem_ty)
         ):
             return self._get_struct_release(elem_ty)
+        if (
+            self._seal_key_for_ty(elem_ty) is not None
+            and self._seal_needs_cleanup(elem_ty)
+        ):
+            return self._get_seal_release(elem_ty)
         return None
 
     def _tablets_info_for(self, value_ty: ir.Type) -> TabletsInfo | None:
