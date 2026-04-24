@@ -660,6 +660,50 @@ def test_borrow_rejected_after_index_assign(tmp_path):
         compile_to_ir(src)
 
 
+def test_push_is_append_only_for_wedge_borrows(tmp_path):
+    # Tablets' pointer-stability guarantee means `.push()` never
+    # relocates existing slots, so a wedge obtained before any push
+    # stays valid after any number of subsequent pushes. Heap-bearing
+    # element types make no difference — the push allocates a NEW
+    # slot (possibly a new chunk) but never frees an existing one.
+    src = (
+        "tablet N { buf: str }\n"
+        "fn main() -> i32 {\n"
+        "  mut store: tablets[4]N\n"
+        "  step head = store.push(N { buf: \"first\" + \"!\" })\n"
+        "  step _a = store.push(N { buf: \"aa\" + \"a\" })\n"
+        "  step _b = store.push(N { buf: \"bb\" + \"b\" })\n"
+        "  step _c = store.push(N { buf: \"cc\" + \"c\" })\n"
+        "  step _d = store.push(N { buf: \"dd\" + \"d\" })\n"
+        "  println(head.buf)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"first!\n"
+
+
+def test_push_preserves_field_borrow_through_wedge(tmp_path):
+    # A field borrow obtained through a wedge (`step b = head.buf`)
+    # stays valid across subsequent pushes. The borrow aliases into
+    # slot 0, which push never touches.
+    src = (
+        "tablet N { buf: str }\n"
+        "fn main() -> i32 {\n"
+        "  mut store: tablets[4]N\n"
+        "  step head = store.push(N { buf: \"first\" + \"!\" })\n"
+        "  step b = head.buf\n"
+        "  step _other = store.push(N { buf: \"second\" + \"!\" })\n"
+        "  println(b)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"first!\n"
+
+
 def test_scalar_index_assign_does_not_invalidate_wedge(tmp_path):
     # `store[i] = N { val: ... }` where N has only scalar fields
     # doesn't free any heap. Wedges into store stay valid — the
