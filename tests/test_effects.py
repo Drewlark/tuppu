@@ -247,6 +247,113 @@ def test_colophon_call_remains_conservative(tmp_path, capsys):
     assert out == b"hello\n"
 
 
+# --- Tupsarru writeback UAF probes ------------------------------------
+#
+# The pattern `mut l = p.field; <maybe ops>; p.field = l` self-assigns
+# a struct through an alias. Assignment is drop-then-write: the store
+# to p.field first releases p.field's old heap, then copies l's fields
+# in. If l's inner heap-bearing fields still alias p.field's (no
+# auto-clone fired at the binding), the copy reads a freed pointer.
+#
+# Phase A fires the auto-clone iff the freeze rule has invalidated l
+# before the RHS of the assign is typechecked. Case (a) below has an
+# intervening mut-reach on l that invalidates correctly — safe. Case
+# (b) has no intervening mut-reach; the invalidation at the assign
+# itself fires AFTER the RHS read, so no implicit-copy fires and the
+# program UAFs at runtime. Case (c) has a write to a disjoint scalar
+# field which doesn't trigger the heap-invalidation path at all.
+#
+# These tests assert the correct runtime behavior. Any failure is a
+# real correctness hole.
+
+
+def test_writeback_with_intervening_mut_call_is_safe(tmp_path, capsys):
+    # Case (a): next_token(l) mutates l.pos → effective write
+    # overlaps l's path into p → l invalidated → `p.lex = l` read
+    # fires implicit-copy at l's binding. Currently passing.
+    src = (
+        "tablet Lex { src: str, pos: i64 }\n"
+        "tablet Parser { lex: Lex, cur: i64 }\n"
+        "fn next_token(mut l: Lex) -> i64 { l.pos = l.pos + 1\n l.pos }\n"
+        "fn p_bump(mut p: Parser) {\n"
+        "  mut l: Lex = p.lex\n"
+        "  p.cur = next_token(l)\n"
+        "  p.lex = l\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  mut p: Parser = Parser {\n"
+        "    lex: Lex { src: \"hel\" + \"lo_world\", pos: 0 },\n"
+        "    cur: 0,\n"
+        "  }\n"
+        "  p_bump(p)\n"
+        "  p_bump(p)\n"
+        "  println(p.lex.src)\n"
+        "  println(p.lex.pos)\n"
+        "  println(p.cur)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello_world\n2\n2\n"
+
+
+def test_writeback_pure_self_assign_preserves_bytes(tmp_path, capsys):
+    # Case (b): no intervening mutation. `p.lex = l` with l a live
+    # borrow of p.lex should either elide (semantic no-op) or
+    # deep-clone before releasing, so the struct's heap bytes
+    # survive intact.
+    src = (
+        "tablet Lex { src: str, pos: i64 }\n"
+        "tablet Parser { lex: Lex, cur: i64 }\n"
+        "fn p_bump(mut p: Parser) {\n"
+        "  mut l: Lex = p.lex\n"
+        "  p.lex = l\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  mut p: Parser = Parser {\n"
+        "    lex: Lex { src: \"hel\" + \"lo_world_here\", pos: 0 },\n"
+        "    cur: 0,\n"
+        "  }\n"
+        "  p_bump(p)\n"
+        "  println(p.lex.src)\n"
+        "  println(p.lex.pos)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello_world_here\n0\n"
+
+
+def test_writeback_after_scalar_field_write_preserves_bytes(tmp_path, capsys):
+    # Case (c): `l.pos = x` writes a non-heap field. This doesn't
+    # invalidate l (the write doesn't free any heap). Then `p.lex
+    # = l` runs into the same drop-then-write hazard as case (b).
+    src = (
+        "tablet Lex { src: str, pos: i64 }\n"
+        "tablet Parser { lex: Lex, cur: i64 }\n"
+        "fn p_bump(mut p: Parser) {\n"
+        "  mut l: Lex = p.lex\n"
+        "  l.pos = l.pos + 1\n"
+        "  p.lex = l\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  mut p: Parser = Parser {\n"
+        "    lex: Lex { src: \"hel\" + \"lo_world_here\", pos: 0 },\n"
+        "    cur: 0,\n"
+        "  }\n"
+        "  p_bump(p)\n"
+        "  println(p.lex.src)\n"
+        "  println(p.lex.pos)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello_world_here\n1\n"
+
+
 def test_index_write_does_not_invalidate_disjoint_field(tmp_path, capsys):
     # `store[0] = x` writes `(__index__,)`; a borrow of a different
     # wedge's field path `(__index__, buf)` overlaps at the index

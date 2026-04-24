@@ -1652,31 +1652,23 @@ class Checker:
         # the chain (field names must exist on their struct types) and
         # yields the expected type of the RHS.
         target_ty = self._tc_expr(a.target)
-        value_ty = self._tc_expr(a.value, expected=target_ty)
-        if not _coerces_to(value_ty, target_ty):
-            raise CheckError(
-                f"assignment target has type {target_ty}, "
-                f"value has type {value_ty}",
-                a.line, a.col,
-            )
-        # Taint propagation for mut handle bindings: once tainted,
-        # always tainted (covers the case `head = lib.push(...)` where
-        # `head` later gets returned).
-        if isinstance(target_ty, TyHandle) and isinstance(a.target, A.Ident):
-            if self._expr_escapes(a.value):
-                self._tainted[a.target.name] = True
         # Freeze-while-borrow: assignment to a cleanup-bearing path
         # can free old heap and thus invalidate borrows rooted at
-        # the target's base. Two cases differ:
+        # the target's base. We invalidate BEFORE reading the RHS so
+        # that a RHS ident naming one of the newly-invalidated
+        # borrows triggers the implicit-copy wrap at its binding
+        # site. This closes the writeback UAF class:
+        #   `mut l: Lex = p.lex; p.lex = l` — without the pre-read
+        #   invalidation, `l` would be read as a live borrow, the
+        #   assign would drop `p.lex`'s old heap, and the subsequent
+        #   deep-clone of `l` would read freed bytes. Two target
+        #   shapes differ:
         #
         # - Ident target that was itself a borrow: rebinding doesn't
         #   free the SOURCE's bytes (the slot only held a cap=0 view
         #   whose release no-ops). No invalidation; instead, update
-        #   the target's borrow registration to match the new RHS —
-        #   fresh-owner RHS turns the target into an owning binding,
-        #   borrow RHS rebinds to the new source. This is what makes
-        #   the `mut result = p.lex; result = fresh` accumulator
-        #   pattern work.
+        #   the target's borrow registration to match the new RHS
+        #   after the RHS is typechecked.
         #
         # - Field / Index target, or Ident target that owned its
         #   bytes: old heap IS freed, invalidate as before.
@@ -1691,17 +1683,31 @@ class Checker:
                 # effects-style invalidation so sibling borrows on
                 # disjoint fields aren't flagged.
                 target_path = self._expr_access_path(a.target)
-                single_write = ParamEffects(
-                    full=False, paths=frozenset({target_path}) if target_path else frozenset(),
-                )
                 if not target_path:
                     # Whole-binding reassignment: invalidate every
                     # borrow rooted here (legacy conservative path).
                     self._invalidate_root(root)
                 else:
+                    single_write = ParamEffects(
+                        full=False,
+                        paths=frozenset({target_path}),
+                    )
                     self._invalidate_root(
                         root, effects=single_write, write_path=(),
                     )
+        value_ty = self._tc_expr(a.value, expected=target_ty)
+        if not _coerces_to(value_ty, target_ty):
+            raise CheckError(
+                f"assignment target has type {target_ty}, "
+                f"value has type {value_ty}",
+                a.line, a.col,
+            )
+        # Taint propagation for mut handle bindings: once tainted,
+        # always tainted (covers the case `head = lib.push(...)` where
+        # `head` later gets returned).
+        if isinstance(target_ty, TyHandle) and isinstance(a.target, A.Ident):
+            if self._expr_escapes(a.value):
+                self._tainted[a.target.name] = True
         if target_is_ident and self._needs_borrow_tracking(target_ty):
             self._rebind_borrow(a.target.name, a.value)
 
