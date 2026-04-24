@@ -144,6 +144,18 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         self._write: ir.Function | None = None
         self._fflush: ir.Function | None = None
         self._strlen: ir.Function | None = None
+        # GC runtime externs (see runtime/tuppu_gc.c). Lazy.
+        self._gc_alloc_bytes: ir.Function | None = None
+        self._gc_push_root: ir.Function | None = None
+        self._gc_pop_roots: ir.Function | None = None
+        # Cache type descriptors keyed by a stable string form of the
+        # value type — one LLVM global per distinct type.
+        self._type_descs: dict[str, ir.GlobalVariable] = {}
+        # LLVM type for tuppu_type_t (see runtime/tuppu_gc.c):
+        # { i8* name; i64 size; i64 n_ptrs; i64* ptr_offsets }.
+        self._type_desc_ty = ir.LiteralStructType([
+            I8.as_pointer(), I64, I64, I64.as_pointer(),
+        ])
         # Colophon decls by Tuppu-level name, for call-site marshaling.
         self._colophon_decls: dict[str, A.ColophonDecl] = {}
 
@@ -183,6 +195,169 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 "free", ir.FunctionType(ir.VoidType(), [I8.as_pointer()]),
             )
         return self._free
+
+    def _get_gc_alloc_bytes(self) -> ir.Function:
+        """`__tuppu_gc_alloc_bytes(size) -> i8*` — GC-managed byte
+        buffer allocator. Used for leaf allocations (str contents,
+        tablet chunks) — things with no internal pointer fields."""
+        if self._gc_alloc_bytes is None:
+            self._gc_alloc_bytes = self._get_or_declare_libc(
+                "__tuppu_gc_alloc_bytes",
+                ir.FunctionType(I8.as_pointer(), [I64]),
+            )
+        return self._gc_alloc_bytes
+
+    def _get_gc_push_root(self) -> ir.Function:
+        """`__tuppu_gc_push_root(slot, type_desc)` — register a stack
+        slot as a GC root. `slot` points at an alloca holding the
+        object (by value); `type_desc` describes which offsets inside
+        that object are pointer fields the GC should trace."""
+        if self._gc_push_root is None:
+            self._gc_push_root = self._get_or_declare_libc(
+                "__tuppu_gc_push_root",
+                ir.FunctionType(
+                    ir.VoidType(),
+                    [I8.as_pointer(), I8.as_pointer()],
+                ),
+            )
+        return self._gc_push_root
+
+    def _get_gc_pop_roots(self) -> ir.Function:
+        """`__tuppu_gc_pop_roots(n)` — pop the top-n root entries off
+        the shadow stack, matching the push_root calls at fn entry."""
+        if self._gc_pop_roots is None:
+            self._gc_pop_roots = self._get_or_declare_libc(
+                "__tuppu_gc_pop_roots",
+                ir.FunctionType(ir.VoidType(), [I64]),
+            )
+        return self._gc_pop_roots
+
+    def _type_desc_key(self, value_ty: ir.Type) -> str | None:
+        """Stable string key identifying a type for descriptor
+        caching. Returns None for types that don't need GC tracing
+        (scalars, pointers, fn values)."""
+        if self._is_str_value(value_ty):
+            return "__tuppu_str"
+        if isinstance(value_ty, ir.IdentifiedStructType):
+            return f"__tuppu_struct_{value_ty.name}"
+        return None
+
+    def _type_ptr_offsets(self, value_ty: ir.Type) -> list[int]:
+        """Return byte offsets of pointer fields inside `value_ty`
+        that the GC needs to trace. For Tuppu's str ({ptr, len, cap})
+        that's offset 0 only. For user structs: walk fields and pick
+        up offsets of any str / ptr / cleanup-bearing fields."""
+        # str = { i8* ptr, i64 len, i64 cap }. ptr is at offset 0.
+        if self._is_str_value(value_ty):
+            return [0]
+        # Generic struct: for now only trace str-typed fields. Other
+        # cleanup-bearing fields (tablets chunks, nested user structs)
+        # will be added as their migrations land.
+        if isinstance(value_ty, ir.IdentifiedStructType):
+            offsets: list[int] = []
+            # Sum up offsets field-by-field. LLVM uses natural
+            # alignment; we assume 8-byte alignment for ptrs / i64.
+            offset = 0
+            for fty in value_ty.elements:
+                if self._is_str_value(fty):
+                    # str's ptr is at offset 0 within the struct,
+                    # so the absolute offset is just `offset`.
+                    offsets.append(offset)
+                offset += self._size_of_ty(fty)
+            return offsets
+        return []
+
+    def _size_of_ty(self, ty: ir.Type) -> int:
+        """Conservative byte size used for laying out type
+        descriptors. Matches the sizes clang emits on a 64-bit host
+        for the types Tuppu generates — scalars at their natural
+        width, pointers at 8, aggregates as a sum of fields. This
+        only feeds the GC's ptr_offset table; LLVM still owns the
+        actual layout in codegen."""
+        if isinstance(ty, ir.IntType):
+            return (ty.width + 7) // 8
+        if isinstance(ty, ir.PointerType):
+            return 8
+        if isinstance(ty, ir.DoubleType):
+            return 8
+        if isinstance(ty, ir.FloatType):
+            return 4
+        if isinstance(ty, ir.LiteralStructType) or isinstance(ty, ir.IdentifiedStructType):
+            return sum(self._size_of_ty(el) for el in ty.elements)
+        if isinstance(ty, ir.ArrayType):
+            return ty.count * self._size_of_ty(ty.element)
+        return 8  # fallback
+
+    def _get_type_desc(self, value_ty: ir.Type) -> ir.GlobalVariable | None:
+        """Fetch or emit a `tuppu_type_t` global for `value_ty`. Returns
+        None if the type needs no tracing (no pointer fields)."""
+        key = self._type_desc_key(value_ty)
+        if key is None:
+            return None
+        cached = self._type_descs.get(key)
+        if cached is not None:
+            return cached
+        offsets = self._type_ptr_offsets(value_ty)
+        if not offsets:
+            return None
+        # Offsets table as an LLVM global.
+        offsets_arr_ty = ir.ArrayType(I64, len(offsets))
+        offsets_arr = ir.GlobalVariable(
+            self.module, offsets_arr_ty, f"{key}_offsets",
+        )
+        offsets_arr.linkage = "internal"
+        offsets_arr.global_constant = True
+        offsets_arr.initializer = ir.Constant(
+            offsets_arr_ty, [ir.Constant(I64, o) for o in offsets],
+        )
+        # Name string as a global.
+        name_bytes = (key + "\0").encode("utf-8")
+        name_arr_ty = ir.ArrayType(I8, len(name_bytes))
+        name_arr = ir.GlobalVariable(
+            self.module, name_arr_ty, f"{key}_name",
+        )
+        name_arr.linkage = "internal"
+        name_arr.global_constant = True
+        name_arr.initializer = ir.Constant(
+            name_arr_ty, bytearray(name_bytes),
+        )
+        # Descriptor struct.
+        desc = ir.GlobalVariable(self.module, self._type_desc_ty, key)
+        desc.linkage = "internal"
+        desc.global_constant = True
+        desc.initializer = ir.Constant(self._type_desc_ty, [
+            name_arr.bitcast(I8.as_pointer()),
+            ir.Constant(I64, self._size_of_ty(value_ty)),
+            ir.Constant(I64, len(offsets)),
+            offsets_arr.bitcast(I64.as_pointer()),
+        ])
+        self._type_descs[key] = desc
+        return desc
+
+    def _emit_gc_push_root(self, slot: ir.Value, value_ty: ir.Type) -> bool:
+        """Emit a `__tuppu_gc_push_root(slot, type_desc)` call if the
+        type has pointer fields to trace. Returns True on emit so the
+        caller can count how many pops are needed at frame exit."""
+        desc = self._get_type_desc(value_ty)
+        if desc is None:
+            return False
+        b = self.builder
+        assert b is not None
+        b.call(
+            self._get_gc_push_root(),
+            [
+                b.bitcast(slot, I8.as_pointer()),
+                b.bitcast(desc, I8.as_pointer()),
+            ],
+        )
+        return True
+
+    def _emit_gc_pop_roots(self, n: int) -> None:
+        if n <= 0:
+            return
+        b = self.builder
+        assert b is not None
+        b.call(self._get_gc_pop_roots(), [ir.Constant(I64, n)])
 
     def _get_write(self) -> ir.Function:
         if self._write is None:
