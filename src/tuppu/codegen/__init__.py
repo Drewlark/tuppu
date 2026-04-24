@@ -1533,6 +1533,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 if not diverged:
                     val = self._finalize_arm_tail(arm.body, val)
                     self._emit_frame_cleanups(self._cleanup_frames[-1])
+                    self._emit_gc_frame_pop()
                     results.append((val, self.builder.block))
                     self.builder.branch(merge_bb)
             finally:
@@ -1551,6 +1552,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 if not diverged:
                     val = self._finalize_arm_tail(wildcard_arm.body, val)
                     self._emit_frame_cleanups(self._cleanup_frames[-1])
+                    self._emit_gc_frame_pop()
                     results.append((val, self.builder.block))
                     self.builder.branch(merge_bb)
             finally:
@@ -2066,12 +2068,28 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         self._cleanup_frames.append([])
         self._gc_root_counts.append(0)
 
+    def _emit_gc_frame_pop(self) -> None:
+        """Emit `__tuppu_gc_pop_roots(n)` for the innermost cleanup
+        frame's accumulated push count, WITHOUT mutating the
+        Python-side counter. Callers emit this just before closing
+        the basic block (branch / ret) so the pop lands in the live
+        control-flow path. The subsequent `_pop_cleanup_frame` still
+        tears down the Python-side bookkeeping."""
+        if (
+            self._gc_root_counts
+            and self._gc_root_counts[-1] > 0
+            and self.builder is not None
+            and not self.builder.block.is_terminated
+        ):
+            self._emit_gc_pop_roots(self._gc_root_counts[-1])
+
     def _pop_cleanup_frame(self) -> None:
-        """Pop the innermost cleanup frame AND emit the matching
-        `__tuppu_gc_pop_roots(n)` IR call for the roots pushed into
-        that frame. Skip IR emission if the current block is already
-        terminated — the ret has fired, the pop happened inline just
-        before it (via `_emit_all_gc_root_pops_for_early_return`)."""
+        """Tear down the innermost cleanup frame's Python-side state.
+        If the current block is still open and no matching
+        `_emit_gc_frame_pop` call has landed, also emit the
+        balancing `pop_roots(n)` IR. Already-terminated blocks skip
+        the emit; the caller was responsible for placing the pop
+        inline before the terminator."""
         if self._gc_root_counts:
             n = self._gc_root_counts.pop()
             if (

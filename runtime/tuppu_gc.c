@@ -111,6 +111,13 @@ void __tuppu_gc_pop_roots(size_t n) {
  * migration work to verify shadow-stack state at collect time. */
 static int gc_debug = 0;
 
+/* Stress mode: `TUPPU_GC_STRESS=1` forces a collection on every
+ * allocation, so any missed root registration fails immediately
+ * rather than hiding behind the normal threshold. Turn this on
+ * in CI / local testing to catch root-tracking bugs at the fastest
+ * possible cadence. */
+static int gc_stress = 0;
+
 static void mark_ptr(void* p);
 
 static void trace_struct(char* obj, const tuppu_type_t* type) {
@@ -190,7 +197,7 @@ void __tuppu_gc_collect(void) {
 }
 
 static void maybe_collect(void) {
-    if (live_bytes >= gc_threshold) {
+    if (gc_stress || live_bytes >= gc_threshold) {
         if (gc_debug) fprintf(stderr, "gc: collect start live=%zu top=%zu\n",
                               live_bytes, shadow_top);
         __tuppu_gc_collect();
@@ -202,10 +209,29 @@ static void maybe_collect(void) {
     }
 }
 
+__attribute__((destructor))
+static void gc_fini(void) {
+    /* Program exit: the shadow stack should be empty if every fn
+     * entry's push was matched by a paired pop. A non-zero depth
+     * means codegen emitted unbalanced push/pop IR somewhere —
+     * silent leak today, deterministic memory bug later. Abort so
+     * it's caught in testing. Suppress in production builds if
+     * ever needed, but during the migration this check is the
+     * cheapest correctness oracle we have. */
+    if (shadow_top != 0) {
+        fprintf(stderr,
+                "tuppu: GC shadow-stack leak at exit: %zu roots still pushed\n",
+                shadow_top);
+        abort();
+    }
+}
+
 __attribute__((constructor))
 static void gc_init(void) {
-    const char* env = getenv("TUPPU_GC_DEBUG");
-    gc_debug = (env && env[0] == '1');
+    const char* dbg = getenv("TUPPU_GC_DEBUG");
+    gc_debug = (dbg && dbg[0] == '1');
+    const char* str = getenv("TUPPU_GC_STRESS");
+    gc_stress = (str && str[0] == '1');
 }
 
 static void* raw_alloc(size_t obj_size, const tuppu_type_t* type) {
