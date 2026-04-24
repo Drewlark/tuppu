@@ -471,16 +471,34 @@ def test_return_nested_struct_field_deep_clones(tmp_path):
     assert out == b"hellox\n"
 
 
-def test_return_field_of_local_struct_no_uaf(tmp_path):
+def test_return_field_of_local_struct_rejected(tmp_path):
     # Fn body tail is a Field read off a local struct. The struct's
-    # cleanup fires at block exit; without a clone-on-return the
-    # returned cap=0 borrow would dangle and the caller would read
-    # freed memory.
+    # cleanup fires at block exit; the caller would read freed
+    # memory. Escape analysis rejects at typecheck with a `copy`
+    # suggestion.
     src = (
         "tablet Row { label: str }\n"
         "fn build() -> str {\n"
         "  step r: Row = Row { label: \"abc\" + \"def\" }\n"
         "  r.label\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  step s = build()\n"
+        "  println(s)\n"
+        "  0\n"
+        "}\n"
+    )
+    with pytest.raises(CompileError, match="borrow of local binding 'r'"):
+        compile_to_ir(src)
+
+
+def test_return_field_of_local_struct_copy_works(tmp_path):
+    # Same program but `copy r.label` returns independent bytes.
+    src = (
+        "tablet Row { label: str }\n"
+        "fn build() -> str {\n"
+        "  step r: Row = Row { label: \"abc\" + \"def\" }\n"
+        "  copy r.label\n"
         "}\n"
         "fn main() -> i32 {\n"
         "  step s = build()\n"

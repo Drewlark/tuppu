@@ -902,6 +902,116 @@ def test_mut_binding_copy_opt_out(tmp_path):
     assert out == b"hello\n1\n"
 
 
+# --- escape analysis -----------------------------------------------
+
+def test_escape_field_return_rejected(tmp_path):
+    # Returning a Field read of a local struct — the struct dies at
+    # fn exit, caller would read freed memory.
+    src = (
+        "tablet Row { label: str }\n"
+        "fn leak() -> str {\n"
+        "  step r: Row = Row { label: \"hel\" + \"lo\" }\n"
+        "  r.label\n"
+        "}\n"
+        "fn main() -> i32 { 0 }\n"
+    )
+    with pytest.raises(CompileError, match="borrow of local binding 'r'"):
+        compile_to_ir(src)
+
+
+def test_escape_match_binder_return_rejected(tmp_path):
+    # Returning a match binder — aliases scrutinee's seal payload,
+    # which dies with the local scrutinee.
+    src = (
+        "seal M { Text(str), Silent }\n"
+        "fn leak() -> str {\n"
+        "  step m = Text(\"hel\" + \"lo\")\n"
+        "  match m {\n"
+        "    Text(s) => s,\n"
+        "    Silent => \"none\",\n"
+        "  }\n"
+        "}\n"
+        "fn main() -> i32 { 0 }\n"
+    )
+    with pytest.raises(CompileError, match="borrow of local binding 's'"):
+        compile_to_ir(src)
+
+
+def test_escape_param_field_return_fine(tmp_path):
+    # Returning a Field read of a PARAM is safe — caller owns the
+    # param's bytes, the returned borrow aliases into caller
+    # storage.
+    src = (
+        "tablet Row { label: str }\n"
+        "fn get_label(r: Row) -> str { r.label }\n"
+        "fn main() -> i32 {\n"
+        "  step r = Row { label: \"hel\" + \"lo\" }\n"
+        "  println(get_label(r))\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello\n"
+
+
+def test_escape_copy_opt_out(tmp_path):
+    # `copy r.label` produces a fresh-owned rvalue; not a borrow,
+    # safe to return.
+    src = (
+        "tablet Row { label: str }\n"
+        "fn build() -> str {\n"
+        "  step r: Row = Row { label: \"hel\" + \"lo\" }\n"
+        "  copy r.label\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  step s = build()\n"
+        "  println(s)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello\n"
+
+
+def test_escape_ident_chain_transfer_still_works(tmp_path):
+    # Returning an Ident that chains through step-borrows to an
+    # owning local is fine — codegen transfers ownership on tail.
+    # The escape rule shouldn't reject this common pattern.
+    src = (
+        "fn build() -> str {\n"
+        "  mut y: str = \"Ur\" + \"uk\"\n"
+        "  step w = y\n"
+        "  step v = w\n"
+        "  v\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  step msg = build()\n"
+        "  println(msg)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"Uruk\n"
+
+
+def test_escape_yield_field_rejected(tmp_path):
+    # Same rule applied to yield.
+    src = (
+        "tablet Row { label: str }\n"
+        "fn build(flag: bool) -> str {\n"
+        "  step r: Row = Row { label: \"hel\" + \"lo\" }\n"
+        "  if flag { yield r.label }\n"
+        "  \"fallback\"\n"
+        "}\n"
+        "fn main() -> i32 { 0 }\n"
+    )
+    with pytest.raises(CompileError, match="borrow of local binding 'r'"):
+        compile_to_ir(src)
+
+
 def test_seal_pure_enum_no_release_fn(tmp_path):
     # A seal with only nullary / scalar-payload variants should NOT
     # get a release fn — _seal_needs_cleanup returns False and no IR

@@ -388,6 +388,20 @@ class Checker:
         # borrow is rejected with a suggestion to `copy`.
         self._borrow_sources: list[dict[str, str]] = [{}]
         self._invalidated: set[str] = set()
+        # Persistent borrow registry for the current fn body —
+        # parallels `_borrow_sources` but doesn't get popped at scope
+        # exit. Needed for escape analysis: the match-arm escape
+        # check runs AFTER the arm scopes have been popped, so it
+        # needs a record of which bindings were borrows of what.
+        self._all_borrow_sources: dict[str, str] = {}
+        # Borrows whose chain passes through a Field / Index read
+        # (directly or transitively) or through a match pattern
+        # binder. These CAN'T be returned as an Ident and have
+        # ownership transferred — the source is inside a container /
+        # seal payload, not its own slot. Returning them is an
+        # escape even if the ultimate root looks local-safe via
+        # transfer-on-tail.
+        self._field_borrows: set[str] = set()
 
     def _warn(self, message: str, line: int = 0, col: int = 0) -> None:
         self.warnings.append(CompileWarning(message=message, line=line, col=col))
@@ -846,6 +860,11 @@ class Checker:
         self.scopes = [{}]
         self._local_tablets = set()
         self._tainted = {}
+        self._fn_params = {p.name for p in fn.params}
+        self._borrow_sources = [{}]
+        self._all_borrow_sources = {}
+        self._field_borrows = set()
+        self._invalidated = set()
         # Type params are in scope while we check the body so local
         # bindings with annotations like `mut cur: wedge Node<T>` work.
         saved = self._active_type_vars
@@ -882,6 +901,22 @@ class Checker:
                 f"instead.",
                 fn.line, fn.col,
             )
+        # Escape analysis: a borrow-valued fn body tail that aliases
+        # a binding local to this fn would dangle at return. Reject
+        # with a `copy` suggestion. (Wedges go through the separate
+        # `_expr_escapes` path above; this rule covers str / struct /
+        # tablets / seal returns.)
+        if not isinstance(expected, (TyUnit, TyDiverge)):
+            leak = self._return_borrow_escape(fn.body)
+            if leak is not None:
+                raise CheckError(
+                    f"in fn {fn.name!r}: returning a borrow of local "
+                    f"binding {leak!r} — its bytes are freed at fn "
+                    f"exit. Return `copy {leak}` to hand the caller "
+                    f"independently-owned bytes, or restructure to "
+                    f"produce a fresh value.",
+                    fn.line, fn.col,
+                )
 
     # --- type resolution --------------------------------------------
 
@@ -1009,11 +1044,88 @@ class Checker:
         for name in dropped:
             self._invalidated.discard(name)
 
+    def _return_borrow_escape(self, e: A.Expr) -> str | None:
+        """Return the name of a local binding whose storage would be
+        freed at fn exit but which appears as (part of) the fn's
+        return value via borrowing. Returns None if the expression is
+        safe to return — either fresh-owned or rooted at a parameter.
+
+        Recurses through block tails, if-arms, match-arms so the
+        escape check covers every reachable tail expression. Only
+        borrow-shaped expressions (Ident naming a borrow, Field,
+        Index) can escape; fresh-owner expressions (Call, Copy,
+        StructLit, etc.) cannot."""
+        if isinstance(e, A.Ident):
+            # Owning local returned as Ident = ownership transfer
+            # (codegen calls _transfer_ownership_out). Safe.
+            if e.name not in self._all_borrow_sources:
+                return None
+            # Pure Ident-chain borrow of a local owning binding:
+            # codegen transfers ownership through the chain. Safe.
+            # Only Field / Index / match-binder origins (tracked in
+            # `_field_borrows`) truly can't transfer — they alias
+            # inside a container / payload.
+            if e.name not in self._field_borrows:
+                return None
+            # Field-origin borrow: root must be a param to be safe.
+            root = self._all_borrow_sources.get(e.name, e.name)
+            while root in self._all_borrow_sources:
+                root = self._all_borrow_sources[root]
+            if root in self._fn_params:
+                return None
+            return e.name
+        if isinstance(e, (A.Field, A.Index)):
+            # Walk through Field/Index chain to the root ident,
+            # following the persistent borrow chain if the root is
+            # itself a borrow binding.
+            cur: A.Expr = e
+            while isinstance(cur, (A.Field, A.Index)):
+                cur = cur.target
+            if not isinstance(cur, A.Ident):
+                return None
+            root = cur.name
+            while root in self._all_borrow_sources:
+                root = self._all_borrow_sources[root]
+            if root in self._fn_params:
+                return None
+            return cur.name
+        if isinstance(e, A.Block):
+            return self._return_borrow_escape(e.tail) if e.tail else None
+        if isinstance(e, A.IfExpr):
+            then_leak = (
+                self._return_borrow_escape(e.then.tail)
+                if isinstance(e.then, A.Block) and e.then.tail
+                else None
+            )
+            if then_leak is not None:
+                return then_leak
+            if e.else_ is None:
+                return None
+            if isinstance(e.else_, A.IfExpr):
+                return self._return_borrow_escape(e.else_)
+            if isinstance(e.else_, A.Block):
+                return (
+                    self._return_borrow_escape(e.else_.tail)
+                    if e.else_.tail else None
+                )
+            return None
+        if isinstance(e, A.MatchExpr):
+            for arm in e.arms:
+                leak = self._return_borrow_escape(arm.body)
+                if leak is not None:
+                    return leak
+            return None
+        # Call / Copy / StructLit / TabletsLit / Unary / Binary /
+        # Cast / literals: fresh-owned. Can't escape a local binding
+        # they don't alias.
+        return None
+
     def _register_borrow(self, name: str, root: str) -> None:
         """Mark `name` as a borrow whose heap bytes are rooted in
         `root` (the outermost owning Ident). Used by `_tc_binding` for
         Ident/Field/Index initializers and by match-pattern binders."""
         self._borrow_sources[-1][name] = root
+        self._all_borrow_sources[name] = root
         self._invalidated.discard(name)
 
     def _is_borrow_binding(self, name: str) -> bool:
@@ -1181,6 +1293,15 @@ class Checker:
             root = self._borrow_source_root(b.init)
             if root is not None:
                 self._register_borrow(b.name, root)
+                # Track field-origin-ness for escape analysis. An
+                # Ident init inherits the source's status (a chain of
+                # Ident borrows stays ident-only). Field / Index init
+                # always marks the binding as field-origin.
+                if isinstance(b.init, (A.Field, A.Index)):
+                    self._field_borrows.add(b.name)
+                elif isinstance(b.init, A.Ident):
+                    if b.init.name in self._field_borrows:
+                        self._field_borrows.add(b.name)
         # Wedge bindings alias into the arena they point at. The most
         # common source is `store.push(x)` — register the handle as a
         # borrow rooted at `store` so a later `store[i] = v` or
@@ -1355,6 +1476,19 @@ class Checker:
                 f"the handle. Take the tablets as a parameter instead.",
                 y.line, y.col,
             )
+        # Escape analysis for cleanup-bearing yields — mirror the
+        # body-tail check. A yielded borrow of a local binding would
+        # dangle at caller.
+        if not isinstance(expected, (TyUnit, TyDiverge)):
+            leak = self._return_borrow_escape(y.value)
+            if leak is not None:
+                raise CheckError(
+                    f"yield: returning a borrow of local binding "
+                    f"{leak!r} — its bytes are freed at fn exit. "
+                    f"Yield `copy {leak}` for an independent copy, "
+                    f"or restructure to produce a fresh value.",
+                    y.line, y.col,
+                )
 
     def _expr_escapes(self, e: A.Expr) -> bool:
         """Would returning `e` hand the caller a handle into a tablets
@@ -2636,7 +2770,10 @@ class Checker:
                     # payload — register each as a borrow rooted at
                     # the scrutinee expression's root. Any mut-reach
                     # to that root during the arm body invalidates
-                    # the binder.
+                    # the binder. Binders are field-origin for escape
+                    # analysis (can't be returned as Ident with
+                    # transfer — the payload is inside the seal, not
+                    # its own slot).
                     scrut_root = self._borrow_source_root(e.scrutinee)
                     for binder, fty in zip(arm.pattern.binders, vfs):
                         if binder is None:
@@ -2648,6 +2785,7 @@ class Checker:
                             and self._needs_borrow_tracking(concrete)
                         ):
                             self._register_borrow(binder, scrut_root)
+                            self._field_borrows.add(binder)
                 else:
                     raise CheckError(
                         f"unsupported pattern: {type(arm.pattern).__name__}",
