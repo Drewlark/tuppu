@@ -1284,15 +1284,28 @@ class Checker:
         """At each Ident read, enforce the freeze-while-borrow rule:
         the borrow hasn't been invalidated by a mut-reach to its root
         since it was bound. The fix the user needs is `step n = copy
-        name` at the binding site."""
-        if name in self._invalidated:
-            raise CheckError(
-                f"use of borrow {name!r} after its source may have "
-                f"been mutated — bind a fresh copy at the borrow "
-                f"site with `step n = copy {name}` and use `n` after "
-                f"the mutation instead",
-                line, col,
-            )
+        name` at the binding site.
+
+        Reads of non-heap-bearing types (wedges, scalars, fn pointers)
+        skip the check: the binding holds a value that doesn't point
+        at any freeable heap, so reading it after a mut-reach is
+        always safe. Field/Index accesses off such a binding will
+        trigger their own type-driven checks at the access point."""
+        if name not in self._invalidated:
+            return
+        for scope in reversed(self.scopes):
+            if name in scope:
+                ty = scope[name]
+                if not self._needs_borrow_tracking(ty):
+                    return
+                break
+        raise CheckError(
+            f"use of borrow {name!r} after its source may have "
+            f"been mutated — bind a fresh copy at the borrow "
+            f"site with `step n = copy {name}` and use `n` after "
+            f"the mutation instead",
+            line, col,
+        )
 
     def _bind(self, name: str, ty: Ty, line: int, col: int) -> None:
         if name in self.scopes[-1]:
