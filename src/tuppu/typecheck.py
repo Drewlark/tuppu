@@ -1430,20 +1430,41 @@ class Checker:
             return self._root_for(e.name) if e.name != self._root_for(e.name) else None
         return None
 
-    def _needs_borrow_tracking(self, ty: Ty) -> bool:
-        """Which types are susceptible to borrow invalidation? Any
-        cleanup-bearing type — str, user struct, tablets, or seal with
-        cleanup-bearing payload. Scalars, wedges, and fn pointers don't
-        carry heap state so can't UAF from mutation."""
+    def _needs_borrow_tracking(self, ty: Ty, _seen: set | None = None) -> bool:
+        """Which types are susceptible to borrow invalidation? A type
+        is tracked iff it (transitively) holds heap bytes that a write
+        could free: str, tablets, a struct with at least one
+        cleanup-bearing field, or a seal with at least one cleanup-
+        bearing payload field. Structs / seals of only scalars / wedges
+        return False — overwriting a slot of such a type doesn't free
+        any heap, so the freeze rule shouldn't flag borrows rooted at
+        the container."""
+        if _seen is None:
+            _seen = set()
         str_ty = self.structs.get("str")
         if str_ty is not None and ty == str_ty:
             return True
-        if isinstance(ty, TyStruct):
-            return True
         if isinstance(ty, TyTablets):
             return True
+        if isinstance(ty, TyStruct):
+            key = ("struct", ty.name, ty.args)
+            if key in _seen:
+                return False   # break cycles; assume non-heap
+            _seen.add(key)
+            for _, fty in self.struct_fields.get(ty.name, ()):
+                if self._needs_borrow_tracking(fty, _seen):
+                    return True
+            return False
         if isinstance(ty, TySeal):
-            return True
+            key = ("seal", ty.name, ty.args)
+            if key in _seen:
+                return False
+            _seen.add(key)
+            for _, variant_fields in self.seal_variants.get(ty.name, ()):
+                for fty in variant_fields:
+                    if self._needs_borrow_tracking(fty, _seen):
+                        return True
+            return False
         return False
 
     def _tc_assign(self, a: A.Assign) -> None:

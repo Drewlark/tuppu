@@ -660,6 +660,27 @@ def test_borrow_rejected_after_index_assign(tmp_path):
         compile_to_ir(src)
 
 
+def test_scalar_index_assign_does_not_invalidate_wedge(tmp_path):
+    # `store[i] = N { val: ... }` where N has only scalar fields
+    # doesn't free any heap. Wedges into store stay valid — the
+    # rule shouldn't force `copy` to reset analyzer state. (The
+    # cleanup-bearing counterpart DOES still invalidate; that's
+    # tested in test_wedge_field_extract_rejected_after_index_overwrite.)
+    src = (
+        "tablet N { val: i64 }\n"
+        "fn main() -> i32 {\n"
+        "  mut store: tablets[8]N\n"
+        "  step head = store.push(N { val: 1 })\n"
+        "  store[1] = N { val: 99 }\n"
+        "  println(head.val)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"1\n"
+
+
 def test_scalar_field_assign_does_not_invalidate_borrow(tmp_path):
     # `b.next = a` where `.next` is a wedge (scalar) doesn't free
     # any heap bytes. Borrows into b / store stay valid.
