@@ -1396,6 +1396,13 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 inbounds=True,
             )
             val = self.builder.load(field_ptr)
+            # Match binders alias into the scrutinee's payload — the
+            # scrutinee owns the heap bytes. Neuter cleanup markers
+            # (cap=0 for str, recursively for struct fields) so
+            # copying the binder doesn't create a second owner that
+            # would double-free against the seal release. Mirrors the
+            # read-borrow we already apply at Field/Index reads.
+            val = self._read_borrow(val)
             self._bind(binder, Variable(
                 is_mut=False, ir_ref=val, value_ty=val.type,
             ))

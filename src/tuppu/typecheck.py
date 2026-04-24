@@ -1154,6 +1154,28 @@ class Checker:
             root = self._borrow_source_root(b.init)
             if root is not None:
                 self._register_borrow(b.name, root)
+        # Wedge bindings alias into the arena they point at. The most
+        # common source is `store.push(x)` — register the handle as a
+        # borrow rooted at `store` so a later `store[i] = v` or
+        # `store.push(...)` invalidates it.
+        if isinstance(final_ty, TyHandle):
+            arena_root = self._wedge_arena_root(b.init)
+            if arena_root is not None:
+                self._register_borrow(b.name, arena_root)
+
+    def _wedge_arena_root(self, e: A.Expr) -> str | None:
+        """Find the arena (tablets) root that a wedge-valued expression
+        points into. Currently handles the common case:
+        `store.push(...)` → `store`. Other sources (field reads of
+        wedge type, fn returns of wedge type) are unknown at this
+        analysis's granularity and return None."""
+        if isinstance(e, A.Call) and isinstance(e.callee, A.Field):
+            if e.callee.name == "push":
+                return self._assign_target_root(e.callee.target)
+        if isinstance(e, A.Ident):
+            # Transitive: wedge-bound to another wedge binding.
+            return self._root_for(e.name) if e.name != self._root_for(e.name) else None
+        return None
 
     def _needs_borrow_tracking(self, ty: Ty) -> bool:
         """Which types are susceptible to borrow invalidation? Any
@@ -1189,13 +1211,15 @@ class Checker:
         if isinstance(target_ty, TyHandle) and isinstance(a.target, A.Ident):
             if self._expr_escapes(a.value):
                 self._tainted[a.target.name] = True
-        # Freeze-while-borrow: assignment to a path invalidates every
-        # live borrow rooted at the path's base. Covers `s.field = x`,
-        # `arr[i] = x`, and `r = x` — all paths whose mutation could
-        # free or overwrite the bytes a borrow aliases into.
-        root = self._assign_target_root(a.target)
-        if root is not None:
-            self._invalidate_root(root)
+        # Freeze-while-borrow: assignment to a cleanup-bearing path
+        # invalidates every live borrow rooted at the path's base —
+        # the old heap contents get freed. Scalar / wedge / fn-pointer
+        # assignments (like `b.next = a` where `.next` is a wedge) do
+        # NOT free anything, so existing borrows stay valid.
+        if self._needs_borrow_tracking(target_ty):
+            root = self._assign_target_root(a.target)
+            if root is not None:
+                self._invalidate_root(root)
 
     def _invalidate_mut_call_args(
         self, fn_ty: "TyFn", args: list[A.Expr],
@@ -2037,13 +2061,14 @@ class Checker:
                         f"element type is {recv_ty.element}",
                         e.line, e.col,
                     )
-                # Freeze-while-borrow: `a.push(x)` mut-reaches `a`.
-                # Invalidate every live borrow rooted there — a push
-                # may reallocate or append into the same chunk a
-                # borrow aliases.
-                recv_root = self._assign_target_root(e.callee.target)
-                if recv_root is not None:
-                    self._invalidate_root(recv_root)
+                # Freeze-while-borrow: `a.push(x)` does NOT invalidate
+                # existing borrows into `a`. Tuppu's tablets is a
+                # chunk-chain — push appends (allocating a new chunk
+                # if needed) but never relocates existing slots, so
+                # wedges and element borrows into earlier slots stay
+                # valid. Writes via `a[i] = x` (handled in _tc_assign)
+                # ARE mut-reaches since they can free a slot's old
+                # contents.
                 # push returns a handle to the newly-pushed element —
                 # discarded automatically in statement position.
                 return TyHandle(element=recv_ty.element)

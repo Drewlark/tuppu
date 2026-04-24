@@ -624,9 +624,10 @@ def test_variant_ctor_call_result_is_single_malloc(tmp_path):
 
 # --- freeze-while-borrow rule ----------------------------------------
 
-def test_borrow_step_from_index_rejected_after_mut_call(tmp_path):
-    # `step p = a[0]; a.push(x); use(p)` — the push mut-reaches a
-    # and may grow/invalidate a's chunks, dangling p. Rule rejects.
+def test_borrow_step_from_index_push_is_not_mut_reach(tmp_path):
+    # `step p = a[0]; a.push(x); use(p)` — push appends without
+    # relocating existing slots, so p still aliases slot 0's bytes.
+    # Rule correctly allows it.
     src = (
         "fn main() -> i32 {\n"
         "  mut a: tablets[4]str\n"
@@ -637,8 +638,94 @@ def test_borrow_step_from_index_rejected_after_mut_call(tmp_path):
         "  0\n"
         "}\n"
     )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hi!\n"
+
+
+def test_borrow_rejected_after_index_assign(tmp_path):
+    # `a[0] = new` DOES free slot 0's old contents (it's cleanup-
+    # bearing). A live borrow into a gets invalidated.
+    src = (
+        "fn main() -> i32 {\n"
+        "  mut a: tablets[4]str\n"
+        "  step _x = a.push(\"hi\" + \"!\")\n"
+        "  step p = a[0]\n"
+        "  a[0] = \"new\" + \"!\"\n"
+        "  println(p)\n"
+        "  0\n"
+        "}\n"
+    )
     with pytest.raises(CompileError, match="use of borrow 'p'"):
         compile_to_ir(src)
+
+
+def test_scalar_field_assign_does_not_invalidate_borrow(tmp_path):
+    # `b.next = a` where `.next` is a wedge (scalar) doesn't free
+    # any heap bytes. Borrows into b / store stay valid.
+    src = (
+        "tablet N { next: wedge N, val: i64 }\n"
+        "fn main() -> i32 {\n"
+        "  mut store: tablets[8]N\n"
+        "  mut a: wedge N = store.push(N { next: lost, val: 1 })\n"
+        "  mut b: wedge N = store.push(N { next: lost, val: 2 })\n"
+        "  b.next = a\n"
+        "  println(b.next.val)\n"
+        "  println(b.val)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"1\n2\n"
+
+
+def test_wedge_field_extract_rejected_after_index_overwrite(tmp_path):
+    # Community repro: `step h = store.push(x); step b = h.buf;
+    # store[0] = new_x; use(b)`. Freeze catches via:
+    # - h registered as borrow of store (wedge arena tracking).
+    # - b registered as borrow of store (via h's root).
+    # - a[0] = x invalidates borrows rooted at store.
+    # - use(b) rejects.
+    src = (
+        "tablet N { buf: str }\n"
+        "fn main() -> i32 {\n"
+        "  mut store: tablets[4]N\n"
+        "  step h = store.push(N { buf: \"hel\" + \"lo\" })\n"
+        "  step b = h.buf\n"
+        "  store[0] = N { buf: \"over\" + \"written\" }\n"
+        "  println(b)\n"
+        "  0\n"
+        "}\n"
+    )
+    with pytest.raises(CompileError, match="use of borrow 'b'"):
+        compile_to_ir(src)
+
+
+def test_match_binder_returned_no_double_free(tmp_path):
+    # Community repro: `match m { Text(s) => s }` returns s through
+    # the fn. The match binder was cap>0 (inherited from the payload),
+    # so caller's cleanup double-freed against the scrutinee's own
+    # seal release. Fix: match binders are read-borrows (cap=0)
+    # mirroring Field/Index reads.
+    src = (
+        "seal M { Text(str), Silent }\n"
+        "fn unwrap(m: M) -> str {\n"
+        "  match m {\n"
+        "    Text(s) => s,\n"
+        "    Silent => \"none\",\n"
+        "  }\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  step m = Text(\"hel\" + \"lo\")\n"
+        "  step result = unwrap(m)\n"
+        "  println(result)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello\n"
 
 
 def test_borrow_step_from_field_rejected_after_mut_assign(tmp_path):
