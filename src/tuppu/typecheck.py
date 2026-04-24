@@ -410,6 +410,13 @@ class Checker:
         # escape even if the ultimate root looks local-safe via
         # transfer-on-tail.
         self._field_borrows: set[str] = set()
+        # Maps a borrow binding's name → its originating Binding AST
+        # node, so a later invalidated read can retroactively wrap
+        # the init in Copy (Phase A implicit-copy + warning). When a
+        # borrow is registered without a Binding node (match binders,
+        # wedge handle pseudo-borrows), it's absent here and a
+        # rejection can't auto-fix — those paths keep the hard error.
+        self._borrow_binding_nodes: dict[str, A.Binding] = {}
 
     def _warn(self, message: str, line: int = 0, col: int = 0) -> None:
         self.warnings.append(CompileWarning(message=message, line=line, col=col))
@@ -874,6 +881,7 @@ class Checker:
         self._all_borrow_sources = {}
         self._field_borrows = set()
         self._invalidated = set()
+        self._borrow_binding_nodes = {}
         # Type params are in scope while we check the body so local
         # bindings with annotations like `mut cur: wedge Node<T>` work.
         saved = self._active_type_vars
@@ -911,21 +919,14 @@ class Checker:
                 fn.line, fn.col,
             )
         # Escape analysis: a borrow-valued fn body tail that aliases
-        # a binding local to this fn would dangle at return. Reject
-        # with a `copy` suggestion. (Wedges go through the separate
+        # a binding local to this fn would dangle at return. Rewrite
+        # the escape leaves to `copy <leaf>` and emit an implicit-
+        # copy warning at each site. (Wedges go through the separate
         # `_expr_escapes` path above; this rule covers str / struct /
         # tablets / seal returns.)
         if not isinstance(expected, (TyUnit, TyDiverge)):
-            leak = self._return_borrow_escape(fn.body)
-            if leak is not None:
-                raise CheckError(
-                    f"in fn {fn.name!r}: returning a borrow of local "
-                    f"binding {leak!r} — its bytes are freed at fn "
-                    f"exit. Return `copy {leak}` to hand the caller "
-                    f"independently-owned bytes, or restructure to "
-                    f"produce a fresh value.",
-                    fn.line, fn.col,
-                )
+            if self._return_borrow_escape(fn.body) is not None:
+                self._wrap_escape_sites(fn.body)
         # Return-aliases-param inference. If the tail / any yielded
         # value aliases a parameter, record which param index for
         # call-site borrow tracking. Stops callers from treating the
@@ -1199,13 +1200,67 @@ class Checker:
         # they don't alias.
         return None
 
-    def _register_borrow(self, name: str, root: str) -> None:
+    def _wrap_escape_sites(self, e: A.Expr) -> A.Expr:
+        """Walk a return-valued expression, wrapping every escape
+        leaf (an Ident/Field/Index that would dangle at caller) in a
+        synthetic `A.Copy(...)` and emitting an implicit-copy warning
+        at each wrap site. Returns the (possibly rewrapped) outer
+        expression. For container expressions (Block / If / Match)
+        we recurse into the tails / arms and reassign the child
+        slots in place; the top-level node is returned unchanged
+        only if it's a container, or wrapped only if it's a leaf.
+
+        Paired with the escape detection above: if
+        `_return_borrow_escape(e)` previously returned a name, this
+        rewrite visits every tail position and wraps the problematic
+        leaves so codegen sees `copy <leaf>` instead of the bare
+        borrow."""
+        if isinstance(e, (A.Ident, A.Field, A.Index)):
+            if self._return_borrow_escape(e) is None:
+                return e
+            line, col = getattr(e, "line", 0), getattr(e, "col", 0)
+            self._warn(
+                f"in fn {self.current_fn!r}: implicit copy inserted "
+                f"on return value — its bytes would otherwise dangle "
+                f"once the fn's locals are freed. Wrap the returned "
+                f"expression in `copy` to silence this warning.",
+                line, col,
+            )
+            return A.Copy(value=e, line=line, col=col)
+        if isinstance(e, A.Block):
+            if e.tail is not None:
+                e.tail = self._wrap_escape_sites(e.tail)
+            return e
+        if isinstance(e, A.IfExpr):
+            if isinstance(e.then, A.Block) and e.then.tail is not None:
+                e.then.tail = self._wrap_escape_sites(e.then.tail)
+            if e.else_ is not None:
+                if isinstance(e.else_, A.IfExpr):
+                    e.else_ = self._wrap_escape_sites(e.else_)
+                elif isinstance(e.else_, A.Block) and e.else_.tail is not None:
+                    e.else_.tail = self._wrap_escape_sites(e.else_.tail)
+            return e
+        if isinstance(e, A.MatchExpr):
+            for arm in e.arms:
+                arm.body = self._wrap_escape_sites(arm.body)
+            return e
+        return e
+
+    def _register_borrow(
+        self, name: str, root: str,
+        binding_node: A.Binding | None = None,
+    ) -> None:
         """Mark `name` as a borrow whose heap bytes are rooted in
         `root` (the outermost owning Ident). Used by `_tc_binding` for
-        Ident/Field/Index initializers and by match-pattern binders."""
+        Ident/Field/Index initializers and by match-pattern binders.
+        When `binding_node` is provided, record it so a later
+        invalidated read can retroactively wrap `init` in Copy as
+        part of the implicit-copy + warning path."""
         self._borrow_sources[-1][name] = root
         self._all_borrow_sources[name] = root
         self._invalidated.discard(name)
+        if binding_node is not None:
+            self._borrow_binding_nodes[name] = binding_node
 
     def _is_borrow_binding(self, name: str) -> bool:
         """Is `name` currently registered as a borrow in any live
@@ -1283,14 +1338,21 @@ class Checker:
     ) -> None:
         """At each Ident read, enforce the freeze-while-borrow rule:
         the borrow hasn't been invalidated by a mut-reach to its root
-        since it was bound. The fix the user needs is `step n = copy
-        name` at the binding site.
+        since it was bound.
 
         Reads of non-heap-bearing types (wedges, scalars, fn pointers)
         skip the check: the binding holds a value that doesn't point
         at any freeable heap, so reading it after a mut-reach is
         always safe. Field/Index accesses off such a binding will
-        trigger their own type-driven checks at the access point."""
+        trigger their own type-driven checks at the access point.
+
+        When the binding that introduced the borrow is reachable via
+        `_borrow_binding_nodes`, rewrite its `init` in place as
+        `copy <init>` and emit a CompileWarning. The binding becomes
+        owning; subsequent reads are unaffected by further mut-reaches
+        on the former source. If we can't locate the originating
+        Binding (match binders, wedge handle pseudo-borrows), fall
+        back to the hard error with the old `copy` hint."""
         if name not in self._invalidated:
             return
         for scope in reversed(self.scopes):
@@ -1299,6 +1361,30 @@ class Checker:
                 if not self._needs_borrow_tracking(ty):
                     return
                 break
+        binding = self._borrow_binding_nodes.get(name)
+        if binding is not None and binding.init is not None \
+                and not isinstance(binding.init, A.Copy):
+            init = binding.init
+            binding.init = A.Copy(
+                value=init,
+                line=getattr(init, "line", binding.line),
+                col=getattr(init, "col", binding.col),
+            )
+            self._invalidated.discard(name)
+            for scope in self._borrow_sources:
+                scope.pop(name, None)
+            self._all_borrow_sources.pop(name, None)
+            self._field_borrows.discard(name)
+            self._borrow_binding_nodes.pop(name, None)
+            self._warn(
+                f"implicit copy inserted at binding {name!r}: source "
+                f"was mutated before this read; deep-cloning init to "
+                f"preserve the value. Wrap the initializer in `copy` "
+                f"explicitly to silence this warning, or restructure "
+                f"to read before the mutation.",
+                binding.line, binding.col,
+            )
+            return
         raise CheckError(
             f"use of borrow {name!r} after its source may have "
             f"been mutated — bind a fresh copy at the borrow "
@@ -1391,7 +1477,7 @@ class Checker:
         if self._needs_borrow_tracking(final_ty):
             root = self._borrow_source_root(b.init)
             if root is not None:
-                self._register_borrow(b.name, root)
+                self._register_borrow(b.name, root, binding_node=b)
                 # Track field-origin-ness for escape analysis. An
                 # Ident init inherits the source's status (a chain of
                 # Ident borrows stays ident-only). Field / Index init
@@ -1617,17 +1703,11 @@ class Checker:
             )
         # Escape analysis for cleanup-bearing yields — mirror the
         # body-tail check. A yielded borrow of a local binding would
-        # dangle at caller.
+        # dangle at caller. Rewrite leaves to `copy <leaf>` with an
+        # implicit-copy warning.
         if not isinstance(expected, (TyUnit, TyDiverge)):
-            leak = self._return_borrow_escape(y.value)
-            if leak is not None:
-                raise CheckError(
-                    f"yield: returning a borrow of local binding "
-                    f"{leak!r} — its bytes are freed at fn exit. "
-                    f"Yield `copy {leak}` for an independent copy, "
-                    f"or restructure to produce a fresh value.",
-                    y.line, y.col,
-                )
+            if self._return_borrow_escape(y.value) is not None:
+                y.value = self._wrap_escape_sites(y.value)
 
     def _expr_escapes(self, e: A.Expr) -> bool:
         """Would returning `e` hand the caller a handle into a tablets

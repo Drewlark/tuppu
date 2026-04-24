@@ -643,9 +643,11 @@ def test_borrow_step_from_index_push_is_not_mut_reach(tmp_path):
     assert out == b"hi!\n"
 
 
-def test_borrow_rejected_after_index_assign(tmp_path):
+def test_borrow_rejected_after_index_assign(tmp_path, capsys):
     # `a[0] = new` DOES free slot 0's old contents (it's cleanup-
-    # bearing). A live borrow into a gets invalidated.
+    # bearing). The borrow into a is invalidated — Phase A rewrites
+    # the binding's init to `copy a[0]` and warns, so the program
+    # compiles and prints the original value.
     src = (
         "fn main() -> i32 {\n"
         "  mut a: tablets[4]str\n"
@@ -656,8 +658,11 @@ def test_borrow_rejected_after_index_assign(tmp_path):
         "  0\n"
         "}\n"
     )
-    with pytest.raises(CompileError, match="use of borrow 'p'"):
-        compile_to_ir(src)
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hi!\n"
+    err = capsys.readouterr().err
+    assert "implicit copy inserted at binding 'p'" in err
 
 
 def test_push_is_append_only_for_wedge_borrows(tmp_path):
@@ -746,13 +751,14 @@ def test_scalar_field_assign_does_not_invalidate_borrow(tmp_path):
     assert out == b"1\n2\n"
 
 
-def test_wedge_field_extract_rejected_after_index_overwrite(tmp_path):
+def test_wedge_field_extract_implicit_copy_after_index_overwrite(tmp_path, capsys):
     # Community repro: `step h = store.push(x); step b = h.buf;
     # store[0] = new_x; use(b)`. Freeze catches via:
     # - h registered as borrow of store (wedge arena tracking).
     # - b registered as borrow of store (via h's root).
     # - a[0] = x invalidates borrows rooted at store.
-    # - use(b) rejects.
+    # Phase A: we emit a warning and rewrite `step b = h.buf` to
+    # `step b = copy h.buf`, so the program preserves the original.
     src = (
         "tablet N { buf: str }\n"
         "fn main() -> i32 {\n"
@@ -764,8 +770,11 @@ def test_wedge_field_extract_rejected_after_index_overwrite(tmp_path):
         "  0\n"
         "}\n"
     )
-    with pytest.raises(CompileError, match="use of borrow 'b'"):
-        compile_to_ir(src)
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello\n"
+    err = capsys.readouterr().err
+    assert "implicit copy inserted at binding 'b'" in err
 
 
 def test_match_binder_returned_no_double_free(tmp_path):
@@ -794,9 +803,11 @@ def test_match_binder_returned_no_double_free(tmp_path):
     assert out == b"hello\n"
 
 
-def test_borrow_step_from_field_rejected_after_mut_assign(tmp_path):
+def test_borrow_step_from_field_implicit_copy_after_mut_assign(tmp_path, capsys):
     # `step s = r.label; r.label = x; use(s)` — the assignment to
-    # r.label releases the old heap bytes, dangling s.
+    # r.label frees old bytes. Phase A rewrites the binding init to
+    # `copy r.label` and warns; the program prints the original
+    # value.
     src = (
         "tablet Row { label: str }\n"
         "fn main() -> i32 {\n"
@@ -807,8 +818,11 @@ def test_borrow_step_from_field_rejected_after_mut_assign(tmp_path):
         "  0\n"
         "}\n"
     )
-    with pytest.raises(CompileError, match="use of borrow 's'"):
-        compile_to_ir(src)
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"first!\n"
+    err = capsys.readouterr().err
+    assert "implicit copy inserted at binding 's'" in err
 
 
 def test_borrow_used_before_mut_call_fine(tmp_path):
@@ -914,16 +928,15 @@ def test_accumulator_pattern_no_false_positive(tmp_path):
     assert out == b"xxx\n"
 
 
-def test_mut_binding_borrow_chain_rejected(tmp_path):
+def test_mut_binding_borrow_chain_implicit_copy(tmp_path, capsys):
     # Community-reported gap: `mut l: Lex = p.lex` makes l a borrow
-    # of p's bytes. `advance(l)` (mut param) mutates l, which writes
-    # THROUGH to p's bytes. Then `p.lex = l` reads l on the RHS
-    # while l's ultimate root has been mut-reached — the write-back
-    # alias pattern that silently corrupted heap strings.
+    # of p's bytes. `advance(l)` (mut param) mutates l, which would
+    # write THROUGH to p's bytes. Then `p.lex = l` reads l on the
+    # RHS while l's ultimate root has been mut-reached.
     #
-    # Freeze rule catches it once `_invalidate_root` walks the borrow
-    # chain to the ultimate owner. A 3-line fix inside the existing
-    # rule — not a per-case patch.
+    # Phase A: rewrite `mut l: Lex = p.lex` → `mut l: Lex = copy
+    # p.lex` and warn. Now l owns independent bytes; `advance(l)`
+    # mutates the copy; `p.lex = l` is a safe assignment.
     src = (
         "tablet Lex { buf: str, pos: i64 }\n"
         "tablet Parser { lex: Lex, depth: i64 }\n"
@@ -936,11 +949,16 @@ def test_mut_binding_borrow_chain_rejected(tmp_path):
         "  mut l: Lex = p.lex\n"
         "  advance(l)\n"
         "  p.lex = l\n"
+        "  println(p.lex.buf)\n"
+        "  println(p.lex.pos)\n"
         "  0\n"
         "}\n"
     )
-    with pytest.raises(CompileError, match="use of borrow 'l'"):
-        compile_to_ir(src)
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello\n1\n"
+    err = capsys.readouterr().err
+    assert "implicit copy inserted at binding 'l'" in err
 
 
 def test_mut_binding_copy_opt_out(tmp_path):
@@ -970,19 +988,26 @@ def test_mut_binding_copy_opt_out(tmp_path):
 
 # --- escape analysis -----------------------------------------------
 
-def test_escape_field_return_rejected(tmp_path):
-    # Returning a Field read of a local struct — the struct dies at
-    # fn exit, caller would read freed memory.
+def test_escape_field_return_implicit_copy(tmp_path, capsys):
+    # Returning a Field read of a local struct — struct dies at
+    # fn exit, so a bare borrow would dangle. Phase A rewrites the
+    # tail to `copy r.label` and warns.
     src = (
         "tablet Row { label: str }\n"
         "fn leak() -> str {\n"
         "  step r: Row = Row { label: \"hel\" + \"lo\" }\n"
         "  r.label\n"
         "}\n"
-        "fn main() -> i32 { 0 }\n"
+        "fn main() -> i32 {\n"
+        "  println(leak())\n"
+        "  0\n"
+        "}\n"
     )
-    with pytest.raises(CompileError, match="borrow of local binding 'r'"):
-        compile_to_ir(src)
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello\n"
+    err = capsys.readouterr().err
+    assert "implicit copy inserted on return value" in err
 
 
 def test_match_binder_returned_fresh_copy(tmp_path):
@@ -1070,8 +1095,79 @@ def test_escape_ident_chain_transfer_still_works(tmp_path):
     assert out == b"Uruk\n"
 
 
-def test_escape_yield_field_rejected(tmp_path):
-    # Same rule applied to yield.
+def test_implicit_copy_binding_once_per_binding(tmp_path, capsys):
+    # A binding whose init gets rewritten in place should warn
+    # exactly once, even if the binding is read multiple times
+    # after the mut-reach. Later reads see the already-wrapped
+    # init (an A.Copy) and don't rewrap.
+    src = (
+        "tablet Row { label: str }\n"
+        "fn main() -> i32 {\n"
+        "  mut r: Row = Row { label: \"abc\" + \"!\" }\n"
+        "  step s = r.label\n"
+        "  r.label = \"new\" + \"!\"\n"
+        "  println(s)\n"
+        "  println(s)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"abc!\nabc!\n"
+    err = capsys.readouterr().err
+    assert err.count("implicit copy inserted at binding 's'") == 1
+
+
+def test_implicit_copy_escape_from_match_arm(tmp_path, capsys):
+    # Escape rewrite reaches into match arms: one arm's tail is a
+    # local Field read that would otherwise dangle. The rewriter
+    # wraps just that arm in `copy`.
+    src = (
+        "seal Pick { First, Second }\n"
+        "tablet Row { label: str }\n"
+        "fn pick(p: Pick) -> str {\n"
+        "  step r: Row = Row { label: \"hel\" + \"lo\" }\n"
+        "  match p {\n"
+        "    First => r.label,\n"
+        "    Second => \"other\",\n"
+        "  }\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  println(pick(First))\n"
+        "  println(pick(Second))\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello\nother\n"
+    err = capsys.readouterr().err
+    assert "implicit copy inserted on return value" in err
+
+
+def test_explicit_copy_suppresses_warning(tmp_path, capsys):
+    # When the user writes `copy` explicitly, no warning fires —
+    # the cost is already visible in source.
+    src = (
+        "tablet Row { label: str }\n"
+        "fn main() -> i32 {\n"
+        "  mut r: Row = Row { label: \"first\" + \"!\" }\n"
+        "  step s = copy r.label\n"
+        "  r.label = \"second\" + \"!\"\n"
+        "  println(s)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"first!\n"
+    err = capsys.readouterr().err
+    assert "implicit copy" not in err
+
+
+def test_escape_yield_field_implicit_copy(tmp_path, capsys):
+    # Same rule applied to yield — the yielded leaf is rewritten
+    # to `copy r.label` with a warning.
     src = (
         "tablet Row { label: str }\n"
         "fn build(flag: bool) -> str {\n"
@@ -1079,10 +1175,17 @@ def test_escape_yield_field_rejected(tmp_path):
         "  if flag { yield r.label }\n"
         "  \"fallback\"\n"
         "}\n"
-        "fn main() -> i32 { 0 }\n"
+        "fn main() -> i32 {\n"
+        "  println(build(true))\n"
+        "  println(build(false))\n"
+        "  0\n"
+        "}\n"
     )
-    with pytest.raises(CompileError, match="borrow of local binding 'r'"):
-        compile_to_ir(src)
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello\nfallback\n"
+    err = capsys.readouterr().err
+    assert "implicit copy inserted on return value" in err
 
 
 def test_seal_pure_enum_no_release_fn(tmp_path):
