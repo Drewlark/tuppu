@@ -2514,10 +2514,12 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         `transfer_on_tail` chains so borrow bindings redirect to their
         true owners. Returns True if a transfer happened.
 
-        After this runs the caller can still read `name` (its SSA
-        value is unchanged); only the scope-exit release is suppressed,
-        so the container can safely free the bytes without risking a
-        double-free against the caller's frame."""
+        Zero-inits the source alloca after a successful transfer so a
+        later reassignment's old-slot release, an explicit `release`,
+        or any other release path is a no-op. Without this, the source
+        slot still points at the transferred heap bytes and a second
+        release on the same buffer would double-free (caught by the
+        reassign-after-push shape)."""
         if not self._cleanup_frames:
             return False
         try:
@@ -2533,9 +2535,23 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         for frame in self._cleanup_frames:
             for i, (_fn, _ptr, fname) in enumerate(frame):
                 if fname == entry_name:
+                    slot = _ptr
                     frame.pop(i)
+                    self._zero_transferred_slot(slot)
                     return True
         return False
+
+    def _zero_transferred_slot(self, slot: ir.Value) -> None:
+        """Write a zero-initialized value to a transferred alloca so any
+        subsequent release walk (explicit or auto) is a no-op on it.
+        Safe because the container now holds the real pointers; the
+        source slot's value is semantically "moved-from" and users
+        shouldn't rely on reading it back."""
+        assert self.builder is not None
+        if not isinstance(slot.type, ir.PointerType):
+            return
+        slot_ty = slot.type.pointee
+        self.builder.store(ir.Constant(slot_ty, None), slot)
 
     def _transfer_ownership_out(self, name: str) -> None:
         """Remove the cleanup entry that owns the value flowing out via
