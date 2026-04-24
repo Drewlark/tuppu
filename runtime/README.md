@@ -96,14 +96,48 @@ current shape is "simplest thing that works."
 
 ## Migration state
 
+### Stage 1 — runtime wired in (LANDED)
+
 - [x] Runtime compiled & linked via driver.
 - [x] Baseline captured in BENCH_BASELINE.md.
+
+### Stage 2 — GC on, analyzer still correctness
+
+Everything is allocated via GC. Analyzer still runs and still
+enforces UAF-prevention. Worst-case perf — every alloc goes
+through the GC, every cleanup-bearing local is on the shadow
+stack. This stage is deliberately unoptimized so we can measure
+"pure GC cost" vs. baseline and then measure what Stage 3
+recovers.
+
 - [ ] Codegen: emit type descriptors for str.
 - [ ] Codegen: emit push_root / pop_roots at fn entry / exit.
 - [ ] Codegen: replace malloc for str bytes with __tuppu_gc_alloc_bytes.
 - [ ] Codegen: stop emitting free in str_release.
 - [ ] Codegen: type descriptors + alloc calls for tablets chunks.
 - [ ] Codegen: type descriptors for user structs / seals.
-- [ ] Typecheck: delete freeze/escape machinery.
-- [ ] Delete `copy` keyword surface.
-- [ ] Re-run BENCH_BASELINE comparisons.
+- [ ] Stage-2 benchmark pass.
+
+### Stage 2.5 — delete correctness analyzer
+
+Analyzer's role shifts from "catch UAFs" to "enable optimizations."
+GC is now the safety net. `copy` keyword goes away; cleanup frames
+go away; transfer-or-clone storage-site discipline goes away.
+
+- [ ] Typecheck: delete freeze/escape correctness rules.
+- [ ] Delete `copy` keyword, lexer/parser/ast/codegen paths.
+- [ ] Delete cleanup-frame machinery in codegen.
+- [ ] Delete transfer-or-clone at storage sites.
+- [ ] Delete cap-sentinel branches in str_release.
+
+### Stage 3 — re-layer analyzer as optimization
+
+Existing machinery repurposed. Same code paths, different
+consumers — instead of raising CheckError, they emit codegen
+hints.
+
+- [ ] `_return_borrow_escape` / escape detection → stack-alloc hint.
+- [ ] Phase B effect analysis → "does this fn allocate?" summary.
+- [ ] Caller-side root elision for provably-pure callees.
+- [ ] Region allocation for non-escaping `mut` tablets.
+- [ ] Stage-3 benchmark pass; compare all three stages side by side.
