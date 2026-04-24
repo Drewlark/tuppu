@@ -581,7 +581,10 @@ def test_helpers_emitted():
     )
     assert "__tuppu_tbls_" in ir
     assert "push" in ir
-    assert "malloc" in ir
+    # Post-GC migration: allocations go through the GC allocator,
+    # not libc malloc. Tablets chunks use the typed path so the
+    # collector can trace their elements.
+    assert "__tuppu_gc_alloc" in ir
 
 
 def test_monomorphization_per_elem_type():

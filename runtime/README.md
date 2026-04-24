@@ -103,7 +103,36 @@ current shape is "simplest thing that works."
 
 ### Stage 2 — GC on, analyzer still correctness
 
-**Progress so far (all LANDED, still gated behind libc malloc):**
+**Status: PARTIALLY LANDED.** GC is now live — all heap allocations
+(str bytes + tablets chunks) route through `__tuppu_gc_alloc_bytes`
+or `__tuppu_gc_alloc` (typed, for chunks so tracing works). Tablets
+chunks get a per-(N, elem_ty) type descriptor with static ptr-offset
+tables; the tablets value itself gets [head, tail] offsets. All 667
+tests pass in normal mode.
+
+**Stress-mode reveals 62 gaps** (TUPPU_GC_STRESS=1 on the existing
+suite). These are SSA-held cleanup-bearing values that live across
+an allocation but aren't on the shadow stack — stress mode forces a
+collect at every alloc, so these cases now crash fast instead of
+passing silently. Categorized by failure site:
+
+- 38 test_ownership.py — struct lit / variant ctor with heap fields
+- 12 test_tablets.py — tablets-of-struct patterns (field builds with
+  int_to_str / concat result used directly in a struct lit field)
+- 6  test_effects.py — writeback UAF repros under GC stress
+- 3  test_sum.py — variant ctor from rvalue, match binders
+- 2  test_examples.py — unclear; needs per-test triage
+- 1  test_string.py — bytes_to_str_spans_chunks (tablets-of-u8
+  + bytes_to_str)
+
+The common root cause across all 62: an intermediate value from an
+allocating call (int_to_str, str_concat, struct lit field) sits in
+an SSA register while a subsequent call allocates, triggers GC, and
+the SSA value isn't on the shadow stack. Fix is mechanical: spill +
+root at each production site, OR spill + root on consumption in the
+struct-lit / variant-ctor / tablets-push paths.
+
+**Historic progress summary (pre-stress):**
 - GC runtime (`tuppu_gc.c`) with magic-guarded mark-sweep + shadow
   stack. `TUPPU_GC_DEBUG=1` opt-in trace.
 - Codegen helpers: `_get_gc_alloc_bytes`, `_get_gc_push_root`,

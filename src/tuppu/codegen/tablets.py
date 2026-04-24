@@ -218,12 +218,19 @@ class TabletsMixin:
         is_full = b.icmp_signed("==", used_existing, ir.Constant(I64, N))
         b.cbranch(is_full, need_new, do_insert)
 
-        # need.new: allocate via malloc, initialize, link into chain.
+        # need.new: allocate a GC-tracked chunk + link into chain.
+        # Chunks go through __tuppu_gc_alloc(size, &chunk_desc) so the
+        # collector can trace through each slot's pointer fields and
+        # the chunk's `next` via the descriptor's ptr_offsets table.
         b.position_at_end(need_new)
         # sizeof(node_ty) via GEP-from-null trick.
         size_ptr = b.gep(null_node, [ONE_I32], inbounds=False)
         node_size = b.ptrtoint(size_ptr, I64)
-        raw = b.call(self._get_malloc(), [node_size])
+        chunk_desc = self._get_chunk_type_desc(N, elem_ty, node_ty)
+        raw = b.call(
+            self._get_gc_alloc_typed(),
+            [node_size, b.bitcast(chunk_desc, I8.as_pointer())],
+        )
         new_node = b.bitcast(raw, node_ty.as_pointer())
         b.store(ir.Constant(I64, 0), b.gep(new_node, [ZERO_I32, ONE_I32], inbounds=True))
         b.store(null_node, b.gep(new_node, [ZERO_I32, TWO_I32], inbounds=True))

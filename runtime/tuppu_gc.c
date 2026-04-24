@@ -34,12 +34,34 @@
 
 /* Public interface — kept in sync with the LLVM externs in codegen. */
 
+/* A type descriptor tells the GC how to trace inside an object of
+ * this type. Two shapes are supported:
+ *
+ * (1) Flat pointer-offset table. For types whose layout is a fixed
+ *     set of pointer fields at known byte offsets (str, most user
+ *     structs), populate `n_ptrs` + `ptr_offsets` and leave `trace`
+ *     NULL. The GC iterates offsets and marks each ptr.
+ *
+ * (2) Custom trace function. For types whose layout isn't a flat
+ *     array of fields — tablets with their chunk-chain traversal is
+ *     the leading example — populate `trace` (pointer to a fn that
+ *     takes the object's start address and calls back into the GC's
+ *     mark_ptr for each reachable ptr) and leave ptr_offsets empty.
+ *
+ * A descriptor may supply both if a type wants cheap fast-path
+ * offsets plus a slower custom walk; runtime prefers `trace` when
+ * present. */
+typedef void (*tuppu_trace_fn)(char* obj);
+
 typedef struct tuppu_type {
-    const char* name;          /* debug only */
-    size_t      size;          /* object size in bytes (0 for byte buffers) */
-    size_t      n_ptrs;        /* pointer-field count */
-    const size_t* ptr_offsets; /* byte offsets of pointer fields within object */
+    const char*    name;        /* debug only */
+    size_t         size;        /* object size in bytes (0 for byte buffers) */
+    size_t         n_ptrs;      /* pointer-field count */
+    const size_t*  ptr_offsets; /* byte offsets of pointer fields */
+    tuppu_trace_fn trace;       /* NULL = use ptr_offsets */
 } tuppu_type_t;
+
+void __tuppu_gc_mark_ptr(void* p);
 
 void* __tuppu_gc_alloc(size_t obj_size, const tuppu_type_t* type);
 void* __tuppu_gc_alloc_bytes(size_t n);
@@ -121,11 +143,26 @@ static int gc_stress = 0;
 static void mark_ptr(void* p);
 
 static void trace_struct(char* obj, const tuppu_type_t* type) {
-    if (!type || !type->ptr_offsets) return;
+    if (!type) return;
+    if (type->trace) {
+        /* Custom walker — e.g. tablets following a chunk chain.
+         * Delegates back to __tuppu_gc_mark_ptr for each ptr it
+         * finds, so the fn can be emitted by codegen without
+         * needing to know GC internals. */
+        type->trace(obj);
+        return;
+    }
+    if (!type->ptr_offsets) return;
     for (size_t i = 0; i < type->n_ptrs; i++) {
         void* p = *(void**)(obj + type->ptr_offsets[i]);
         mark_ptr(p);
     }
+}
+
+/* Public entry for codegen-emitted trace fns. Same semantics as the
+ * internal mark_ptr. */
+void __tuppu_gc_mark_ptr(void* p) {
+    mark_ptr(p);
 }
 
 static void mark_ptr(void* p) {

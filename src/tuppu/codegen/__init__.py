@@ -155,9 +155,14 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         # value type — one LLVM global per distinct type.
         self._type_descs: dict[str, ir.GlobalVariable] = {}
         # LLVM type for tuppu_type_t (see runtime/tuppu_gc.c):
-        # { i8* name; i64 size; i64 n_ptrs; i64* ptr_offsets }.
+        # { i8* name; i64 size; i64 n_ptrs; i64* ptr_offsets;
+        #   void(i8*)* trace }.
+        self._trace_fn_ty = ir.FunctionType(
+            ir.VoidType(), [I8.as_pointer()],
+        )
         self._type_desc_ty = ir.LiteralStructType([
             I8.as_pointer(), I64, I64, I64.as_pointer(),
+            self._trace_fn_ty.as_pointer(),
         ])
         # Colophon decls by Tuppu-level name, for call-site marshaling.
         self._colophon_decls: dict[str, A.ColophonDecl] = {}
@@ -186,24 +191,36 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         return ir.Function(self.module, fn_type, name=name)
 
     def _get_malloc(self) -> ir.Function:
-        """Heap allocator for Tuppu-emitted code. Currently libc
-        malloc. The Stage 2 migration will swap this to
-        `__tuppu_gc_alloc_bytes`, but that requires every allocation
-        site that takes part in the GC reachability graph to also
-        have a type descriptor — tablets chunks in particular need a
-        custom trace fn to walk the chunk chain. Until that landing,
-        we stay on libc malloc and only the Tuppu-side GC helpers
-        (root push/pop, type descs) are wired in preparation."""
-        if self._malloc is None:
-            self._malloc = self._get_or_declare_libc(
-                "malloc", ir.FunctionType(I8.as_pointer(), [I64]),
-            )
-        return self._malloc
+        """Heap allocator for Tuppu-emitted code. Routes through the
+        GC's raw-bytes allocator — used for str contents, where the
+        buffer is a byte leaf with no internal pointers to trace.
+        Tablets chunks deliberately do NOT go through here; they
+        allocate via `_get_gc_alloc_typed` with a chunk descriptor
+        so GC can trace their elements and next-pointer."""
+        return self._get_gc_alloc_bytes()
+
+    def _get_gc_alloc_typed(self) -> ir.Function:
+        """`__tuppu_gc_alloc(size, *type_desc) -> i8*` — typed GC
+        allocation used for objects whose internal layout the GC
+        needs to trace (tablets chunks, composite heap objects)."""
+        existing = self.module.globals.get("__tuppu_gc_alloc")
+        if existing is not None:
+            return existing
+        fn_type = ir.FunctionType(
+            I8.as_pointer(), [I64, I8.as_pointer()],
+        )
+        return ir.Function(self.module, fn_type, name="__tuppu_gc_alloc")
 
     def _get_free(self) -> ir.Function:
+        """Free path for code that still emits explicit free() calls
+        (tablets release, etc.). Routes to a no-op in the runtime so
+        GC-owned buffers aren't corrupted by a bogus libc free during
+        the migration. Once Stage 2.5 removes the free-call sites,
+        this can go away entirely."""
         if self._free is None:
             self._free = self._get_or_declare_libc(
-                "free", ir.FunctionType(ir.VoidType(), [I8.as_pointer()]),
+                "__tuppu_gc_noop_free",
+                ir.FunctionType(ir.VoidType(), [I8.as_pointer()]),
             )
         return self._free
 
@@ -249,34 +266,106 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         (scalars, pointers, fn values)."""
         if self._is_str_value(value_ty):
             return "__tuppu_str"
+        info = self._tablets_info_for(value_ty)
+        if info is not None:
+            return f"__tuppu_tbls_{info.elem_ty}_{info.N}".replace(" ", "_")
         if isinstance(value_ty, ir.IdentifiedStructType):
             return f"__tuppu_struct_{value_ty.name}"
         return None
 
     def _type_ptr_offsets(self, value_ty: ir.Type) -> list[int]:
         """Return byte offsets of pointer fields inside `value_ty`
-        that the GC needs to trace. For Tuppu's str ({ptr, len, cap})
-        that's offset 0 only. For user structs: walk fields and pick
-        up offsets of any str / ptr / cleanup-bearing fields."""
-        # str = { i8* ptr, i64 len, i64 cap }. ptr is at offset 0.
+        that the GC needs to trace.
+
+        - str `{i8* ptr, i64 len, i64 cap}` — ptr at offset 0.
+        - tablets `{*Node head, *Node tail, i64 len}` — head at 0,
+          tail at 8. Marking both also reaches the chunk chain since
+          each chunk's own descriptor lists its `next` ptr.
+        - User struct: walk fields, pick up offsets of any
+          str / tablets / nested-struct-with-ptrs fields. Composition
+          is recursive — a struct containing a struct containing a
+          str produces the final nested offset.
+        - Chunk (Node_...): built separately via
+          `_chunk_ptr_offsets` since it has a fixed layout derived
+          from (N, elem_ty).
+        """
         if self._is_str_value(value_ty):
             return [0]
-        # Generic struct: for now only trace str-typed fields. Other
-        # cleanup-bearing fields (tablets chunks, nested user structs)
-        # will be added as their migrations land.
+        info = self._tablets_info_for(value_ty)
+        if info is not None:
+            return [0, 8]   # head, tail ptrs
         if isinstance(value_ty, ir.IdentifiedStructType):
             offsets: list[int] = []
-            # Sum up offsets field-by-field. LLVM uses natural
-            # alignment; we assume 8-byte alignment for ptrs / i64.
             offset = 0
             for fty in value_ty.elements:
-                if self._is_str_value(fty):
-                    # str's ptr is at offset 0 within the struct,
-                    # so the absolute offset is just `offset`.
-                    offsets.append(offset)
+                for inner_off in self._type_ptr_offsets(fty):
+                    offsets.append(offset + inner_off)
                 offset += self._size_of_ty(fty)
             return offsets
         return []
+
+    def _chunk_ptr_offsets(
+        self, N: int, elem_ty: ir.Type,
+    ) -> list[int]:
+        """Byte offsets of pointer fields inside a tablets chunk.
+        Chunk layout: `[elem[0]..elem[N-1], used: i64, next: *Node]`.
+        Each slot contributes offsets per its own type; `next` adds
+        one at `N * sizeof(elem) + sizeof(used)`."""
+        elem_size = self._size_of_ty(elem_ty)
+        inner = self._type_ptr_offsets(elem_ty)
+        offsets: list[int] = []
+        for i in range(N):
+            base = i * elem_size
+            for inner_off in inner:
+                offsets.append(base + inner_off)
+        # After the items array come `used: i64` (8 bytes) then
+        # `next: *Node` (8 bytes).
+        offsets.append(N * elem_size + 8)
+        return offsets
+
+    def _get_chunk_type_desc(
+        self, N: int, elem_ty: ir.Type, node_ty: ir.IdentifiedStructType,
+    ) -> ir.GlobalVariable:
+        """Emit (or return cached) `tuppu_type_t` for a tablets chunk.
+        Chunks allocate via `__tuppu_gc_alloc(size, &chunk_desc)` so
+        GC marks through them using these static ptr_offsets."""
+        key = f"__tuppu_chunk_{elem_ty}_{N}".replace(" ", "_")
+        cached = self._type_descs.get(key)
+        if cached is not None:
+            return cached
+        offsets = self._chunk_ptr_offsets(N, elem_ty)
+        size = N * self._size_of_ty(elem_ty) + 16
+        offsets_arr_ty = ir.ArrayType(I64, len(offsets))
+        offsets_arr = ir.GlobalVariable(
+            self.module, offsets_arr_ty, f"{key}_offsets",
+        )
+        offsets_arr.linkage = "internal"
+        offsets_arr.global_constant = True
+        offsets_arr.initializer = ir.Constant(
+            offsets_arr_ty, [ir.Constant(I64, o) for o in offsets],
+        )
+        name_bytes = (key + "\0").encode("utf-8")
+        name_arr_ty = ir.ArrayType(I8, len(name_bytes))
+        name_arr = ir.GlobalVariable(
+            self.module, name_arr_ty, f"{key}_name",
+        )
+        name_arr.linkage = "internal"
+        name_arr.global_constant = True
+        name_arr.initializer = ir.Constant(
+            name_arr_ty, bytearray(name_bytes),
+        )
+        desc = ir.GlobalVariable(self.module, self._type_desc_ty, key)
+        desc.linkage = "internal"
+        desc.global_constant = True
+        desc.initializer = ir.Constant(self._type_desc_ty, [
+            name_arr.bitcast(I8.as_pointer()),
+            ir.Constant(I64, size),
+            ir.Constant(I64, len(offsets)),
+            offsets_arr.bitcast(I64.as_pointer()),
+            ir.Constant(self._trace_fn_ty.as_pointer(), None),
+        ])
+        self._type_descs[key] = desc
+        return desc
 
     def _size_of_ty(self, ty: ir.Type) -> int:
         """Conservative byte size used for laying out type
@@ -332,7 +421,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         name_arr.initializer = ir.Constant(
             name_arr_ty, bytearray(name_bytes),
         )
-        # Descriptor struct.
+        # Descriptor struct. No custom trace fn for flat-offset types.
         desc = ir.GlobalVariable(self.module, self._type_desc_ty, key)
         desc.linkage = "internal"
         desc.global_constant = True
@@ -341,6 +430,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             ir.Constant(I64, self._size_of_ty(value_ty)),
             ir.Constant(I64, len(offsets)),
             offsets_arr.bitcast(I64.as_pointer()),
+            ir.Constant(self._trace_fn_ty.as_pointer(), None),
         ])
         self._type_descs[key] = desc
         return desc
@@ -4091,10 +4181,14 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         self.builder.store(ir.Constant(info.tablets_ty, None), slot)
         # Register cleanup BEFORE pushing so a push-then-error path
         # still frees what was already allocated. Anonymous entry.
+        # GC root push so tablets chunks (head/tail ptrs inside the
+        # tablets value) stay reachable when the fields being stored
+        # trigger collections mid-build.
         if self._cleanup_frames:
             self._cleanup_frames[-1].append(
                 (info.release, slot, ".tbls.lit"),
             )
+            self._register_gc_root(slot, info.tablets_ty)
         for fexpr in e.fields:
             v = self._gen_expr(fexpr)
             if v is None:
