@@ -360,21 +360,39 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
     ) -> ir.GlobalVariable:
         """Emit (or return cached) `tuppu_type_t` for a tablets chunk.
         Chunks allocate via `__tuppu_gc_alloc(size, &chunk_desc)` so
-        GC marks through them using these static ptr_offsets."""
+        GC marks through them. Element types that recursively hold a
+        seal field (whose payload layout is tag-dispatched) get a
+        per-chunk trace fn that walks each slot via the same
+        alignment-aware composition as the struct trace fns. Plain
+        elements stick to a flat ptr_offsets table."""
         key = f"__tuppu_chunk_{elem_ty}_{N}".replace(" ", "_")
         cached = self._type_descs.get(key)
         if cached is not None:
             return cached
-        offsets = self._chunk_ptr_offsets(N, elem_ty)
         size = N * self._size_of(elem_ty) + 16
-        offsets_arr_ty = ir.ArrayType(I64, len(offsets))
+        # If the element type's layout includes any seal-with-cleanup
+        # field (directly or nested), the flat ptr-offsets approach
+        # can't see the variant-dependent payload ptrs. Emit a chunk
+        # trace fn that loops over slots and recurses through the
+        # element's full tracing logic.
+        needs_trace = self._contains_seal_anywhere(elem_ty)
+        if needs_trace:
+            offsets: list[int] = []
+            trace_fn: ir.Function | None = self._get_chunk_trace_fn(
+                key, N, elem_ty, node_ty,
+            )
+        else:
+            offsets = self._chunk_ptr_offsets(N, elem_ty)
+            trace_fn = None
+        offsets_arr_ty = ir.ArrayType(I64, max(len(offsets), 1))
         offsets_arr = ir.GlobalVariable(
             self.module, offsets_arr_ty, f"{key}_offsets",
         )
         offsets_arr.linkage = "internal"
         offsets_arr.global_constant = True
         offsets_arr.initializer = ir.Constant(
-            offsets_arr_ty, [ir.Constant(I64, o) for o in offsets],
+            offsets_arr_ty,
+            [ir.Constant(I64, o) for o in offsets] or [ir.Constant(I64, 0)],
         )
         name_bytes = (key + "\0").encode("utf-8")
         name_arr_ty = ir.ArrayType(I8, len(name_bytes))
@@ -386,6 +404,10 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         name_arr.initializer = ir.Constant(
             name_arr_ty, bytearray(name_bytes),
         )
+        trace_init: ir.Constant | ir.Function = (
+            trace_fn if trace_fn is not None
+            else ir.Constant(self._trace_fn_ty.as_pointer(), None)
+        )
         desc = ir.GlobalVariable(self.module, self._type_desc_ty, key)
         desc.linkage = "internal"
         desc.global_constant = True
@@ -394,10 +416,44 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             ir.Constant(I64, size),
             ir.Constant(I64, len(offsets)),
             offsets_arr.bitcast(I64.as_pointer()),
-            ir.Constant(self._trace_fn_ty.as_pointer(), None),
+            trace_init,
         ])
         self._type_descs[key] = desc
         return desc
+
+    def _get_chunk_trace_fn(
+        self, key: str, N: int, elem_ty: ir.Type,
+        node_ty: ir.IdentifiedStructType,
+    ) -> ir.Function:
+        """Per-chunk trace fn for chunks whose element layout includes
+        a seal (or anything else flat ptr_offsets can't express).
+        Walks all N slots — the chunk header's `used` field tells the
+        runtime how many to mind, but unused slots are calloc-zero, so
+        marking them is a safe no-op via mark_ptr's null check. Also
+        marks the `next` chunk pointer."""
+        fn_name = f"{key}_trace"
+        cached = self.module.globals.get(fn_name)
+        if isinstance(cached, ir.Function):
+            return cached
+        fn = ir.Function(self.module, self._trace_fn_ty, fn_name)
+        fn.linkage = "internal"
+        entry = fn.append_basic_block("entry")
+        b = ir.IRBuilder(entry)
+        base = fn.args[0]  # i8* to chunk start
+        elem_size = self._size_of(elem_ty)
+        for i in range(N):
+            self._emit_trace_mark_calls(b, base, i * elem_size, elem_ty)
+        # Mark the `next` chunk pointer at offset N*elem_size + 8
+        # (alignment-padded past `used: i64`).
+        items_end = N * elem_size
+        used_off = (items_end + 7) & ~7
+        next_off = used_off + 8
+        next_i8 = b.gep(base, [ir.Constant(I64, next_off)], inbounds=True)
+        next_pp = b.bitcast(next_i8, I8.as_pointer().as_pointer())
+        next_p = b.load(next_pp)
+        b.call(self._get_gc_mark_ptr(), [next_p])
+        b.ret_void()
+        return fn
 
     def _get_type_desc(self, value_ty: ir.Type) -> ir.GlobalVariable | None:
         """Fetch or emit a `tuppu_type_t` global for `value_ty`. Returns
