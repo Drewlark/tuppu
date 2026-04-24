@@ -22,7 +22,15 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 from . import ast as A
+from .effects import EffectAnalyzer, ParamEffects
 from .errors import CompileError, CompileWarning
+
+
+def _paths_overlap(a: tuple[str, ...], b: tuple[str, ...]) -> bool:
+    """Two field paths overlap if one is a prefix of the other — a
+    write at `a` reaches, or is reached by, a borrow at `b`."""
+    n = min(len(a), len(b))
+    return a[:n] == b[:n]
 
 
 def _suggest(name: str, candidates: Iterable[str]) -> str:
@@ -417,6 +425,16 @@ class Checker:
         # wedge handle pseudo-borrows), it's absent here and a
         # rejection can't auto-fix — those paths keep the hard error.
         self._borrow_binding_nodes: dict[str, A.Binding] = {}
+        # Effect analysis summaries. Populated after fn signatures
+        # are known; consumed at call-site invalidation to skip
+        # borrows whose paths don't overlap a callee's write set.
+        # Keyed by fn name; each value is a list aligned with the
+        # fn's parameter positions.
+        self.fn_effects: dict[str, list[ParamEffects]] = {}
+        # Path from each borrow's root to the borrowed bytes. Empty
+        # tuple means the whole root. Used together with fn_effects
+        # to rule out bogus invalidations.
+        self._borrow_paths: dict[str, tuple[str, ...]] = {}
 
     def _warn(self, message: str, line: int = 0, col: int = 0) -> None:
         self.warnings.append(CompileWarning(message=message, line=line, col=col))
@@ -451,11 +469,20 @@ class Checker:
         for d in self.prog.decls:
             if isinstance(d, A.TableDecl):
                 self._register_table(d)
+        # Phase 1b: effect analysis over user fn bodies. The call-site
+        # freeze rule consults these summaries to skip invalidation of
+        # borrows whose paths don't overlap the callee's write set.
+        self._compute_fn_effects()
         for d in self.prog.decls:
             if isinstance(d, A.FnDecl):
                 self._check_fn_body(d)
             elif isinstance(d, A.GlossDecl):
                 self._check_gloss_body(d)
+
+    def _compute_fn_effects(self) -> None:
+        fn_decls = [d for d in self.prog.decls if isinstance(d, A.FnDecl)]
+        analyzer = EffectAnalyzer(fn_decls, set(self.colophons))
+        self.fn_effects = analyzer.run()
 
     # --- registration ------------------------------------------------
 
@@ -882,6 +909,7 @@ class Checker:
         self._field_borrows = set()
         self._invalidated = set()
         self._borrow_binding_nodes = {}
+        self._borrow_paths = {}
         # Type params are in scope while we check the body so local
         # bindings with annotations like `mut cur: wedge Node<T>` work.
         saved = self._active_type_vars
@@ -1248,16 +1276,19 @@ class Checker:
 
     def _register_borrow(
         self, name: str, root: str,
+        path: tuple[str, ...] = (),
         binding_node: A.Binding | None = None,
     ) -> None:
         """Mark `name` as a borrow whose heap bytes are rooted in
-        `root` (the outermost owning Ident). Used by `_tc_binding` for
-        Ident/Field/Index initializers and by match-pattern binders.
-        When `binding_node` is provided, record it so a later
-        invalidated read can retroactively wrap `init` in Copy as
-        part of the implicit-copy + warning path."""
+        `root` (the outermost owning Ident). `path` is the field /
+        index chain from `root` down to the borrowed bytes — used by
+        effect-aware invalidation to rule out writes on disjoint
+        siblings. When `binding_node` is provided, record it so a
+        later invalidated read can retroactively wrap `init` in
+        Copy as part of the implicit-copy + warning path."""
         self._borrow_sources[-1][name] = root
         self._all_borrow_sources[name] = root
+        self._borrow_paths[name] = path
         self._invalidated.discard(name)
         if binding_node is not None:
             self._borrow_binding_nodes[name] = binding_node
@@ -1306,6 +1337,23 @@ class Checker:
                 return self._borrow_source_root(e.args[alias_idx])
         return None
 
+    def _borrow_source_path(self, e: A.Expr) -> tuple[str, ...]:
+        """Mirror of `_borrow_source_root`, returning the path from
+        the root to the borrowed bytes. An Ident chain inherits the
+        source's path; Field/Index accumulate their accessor. Calls
+        that return-alias a param project through the aliased arg."""
+        if isinstance(e, A.Ident):
+            return self._borrow_paths.get(e.name, ())
+        if isinstance(e, A.Field):
+            return self._borrow_source_path(e.target) + (e.name,)
+        if isinstance(e, A.Index):
+            return self._borrow_source_path(e.target) + ("__index__",)
+        if isinstance(e, A.Call) and isinstance(e.callee, A.Ident):
+            alias_idx = self.fn_return_alias.get(e.callee.name)
+            if alias_idx is not None and alias_idx < len(e.args):
+                return self._borrow_source_path(e.args[alias_idx])
+        return ()
+
     def _root_for(self, name: str) -> str:
         """If `name` is itself a borrow, return the root its chain
         points at. Otherwise `name` IS the root."""
@@ -1314,11 +1362,20 @@ class Checker:
                 return scope[name]
         return name
 
-    def _invalidate_root(self, root: str) -> None:
-        """Flag every live borrow rooted at `root` as invalidated. A
-        subsequent read of any such binding will error out. Called when
-        `root` (or a path through `root`) is mut-reached by a call or
-        by a direct assignment.
+    def _invalidate_root(
+        self, root: str,
+        effects: ParamEffects | None = None,
+        write_path: tuple[str, ...] = (),
+    ) -> None:
+        """Flag live borrows rooted at `root` as invalidated.
+
+        When `effects` is None (the conservative path), every borrow
+        rooted at the ultimate owner is flagged — preserves the old
+        freeze semantics for calls we can't reason about. When
+        `effects` is provided, only borrows whose own path conflicts
+        with the effect set are flagged. `write_path` shifts the
+        effect's paths — `writes through arg.field_x` are the
+        callee's effect paths prefixed by `(field_x,)`.
 
         Walks up the borrow chain first: if `root` is itself a borrow
         binding (e.g. `mut l: Lex = p.lex` makes `l` a borrow of `p`),
@@ -1326,12 +1383,27 @@ class Checker:
         write through `l` reaches `p`'s bytes. Without this,
         `advance(l); p.lex = l` wouldn't flag the latent UAF."""
         ultimate = self._root_for(root)
-        # Also invalidate the mut-reached binding itself (in case it's
-        # a borrow) and every borrow rooted at the ultimate owner.
+        root_path = self._borrow_paths.get(root, ())
+        # A write through `root` at `write_path` reaches the ultimate
+        # owner at `root_path + write_path` (the root's own position
+        # inside its chain, then the write's inner offset).
+        effective_write = root_path + write_path
         for scope in self._borrow_sources:
             for name, src in scope.items():
-                if src == ultimate or name == root:
+                if src != ultimate and name != root:
+                    continue
+                if effects is None:
                     self._invalidated.add(name)
+                    continue
+                borrow_path = self._borrow_paths.get(name, ())
+                if effects.full:
+                    if _paths_overlap(effective_write, borrow_path):
+                        self._invalidated.add(name)
+                    continue
+                for wp in effects.paths:
+                    if _paths_overlap(effective_write + wp, borrow_path):
+                        self._invalidated.add(name)
+                        break
 
     def _check_use_not_invalidated(
         self, name: str, line: int, col: int,
@@ -1477,7 +1549,10 @@ class Checker:
         if self._needs_borrow_tracking(final_ty):
             root = self._borrow_source_root(b.init)
             if root is not None:
-                self._register_borrow(b.name, root, binding_node=b)
+                path = self._borrow_source_path(b.init)
+                self._register_borrow(
+                    b.name, root, path=path, binding_node=b,
+                )
                 # Track field-origin-ness for escape analysis. An
                 # Ident init inherits the source's status (a chain of
                 # Ident borrows stays ident-only). Field / Index init
@@ -1509,11 +1584,17 @@ class Checker:
         # Wedge bindings alias into the arena they point at. The most
         # common source is `store.push(x)` — register the handle as a
         # borrow rooted at `store` so a later `store[i] = v` or
-        # `store.push(...)` invalidates it.
+        # `store.push(...)` invalidates it. The path through the
+        # arena is opaque (we don't track which slot) — represent it
+        # as `("__index__",)` so effect-aware writes on specific
+        # slots and on nested fields of slot contents both invalidate
+        # borrows through the handle.
         if isinstance(final_ty, TyHandle):
             arena_root = self._wedge_arena_root(b.init)
             if arena_root is not None:
-                self._register_borrow(b.name, arena_root)
+                self._register_borrow(
+                    b.name, arena_root, path=("__index__",),
+                )
 
     def _wedge_arena_root(self, e: A.Expr) -> str | None:
         """Find the arena (tablets) root that a wedge-valued expression
@@ -1606,16 +1687,50 @@ class Checker:
         if self._needs_borrow_tracking(target_ty) and not target_was_borrow:
             root = self._assign_target_root(a.target)
             if root is not None:
-                self._invalidate_root(root)
+                # We know exactly which path is written — use
+                # effects-style invalidation so sibling borrows on
+                # disjoint fields aren't flagged.
+                target_path = self._expr_access_path(a.target)
+                single_write = ParamEffects(
+                    full=False, paths=frozenset({target_path}) if target_path else frozenset(),
+                )
+                if not target_path:
+                    # Whole-binding reassignment: invalidate every
+                    # borrow rooted here (legacy conservative path).
+                    self._invalidate_root(root)
+                else:
+                    self._invalidate_root(
+                        root, effects=single_write, write_path=(),
+                    )
         if target_is_ident and self._needs_borrow_tracking(target_ty):
             self._rebind_borrow(a.target.name, a.value)
 
     def _invalidate_mut_call_args(
         self, fn_ty: "TyFn", args: list[A.Expr],
+        fn_name: str | None = None,
     ) -> None:
-        """For each call argument passed as `mut`, invalidate every
-        live borrow rooted at that arg's base. Used by both direct fn
-        calls and first-class fn-value calls."""
+        """For each call argument, invalidate borrows rooted at the
+        arg whose paths overlap what the callee actually writes. When
+        effect summaries are available for `fn_name`, only conflicting
+        borrows are flagged; otherwise fall back to the conservative
+        "invalidate all mut args" path for signatures we can't reason
+        about (fn-value calls, pre-analysis callers, generics)."""
+        summaries = (
+            self.fn_effects.get(fn_name) if fn_name is not None else None
+        )
+        if summaries is not None:
+            for arg_idx, arg in enumerate(args):
+                if arg_idx >= len(summaries):
+                    continue
+                pe = summaries[arg_idx]
+                if pe.is_pure():
+                    continue
+                root = self._assign_target_root(arg)
+                if root is None:
+                    continue
+                arg_path = self._expr_access_path(arg)
+                self._invalidate_root(root, effects=pe, write_path=arg_path)
+            return
         if not fn_ty.param_muts:
             return
         for is_mut, arg in zip(fn_ty.param_muts, args):
@@ -1624,6 +1739,16 @@ class Checker:
             root = self._assign_target_root(arg)
             if root is not None:
                 self._invalidate_root(root)
+
+    def _expr_access_path(self, e: A.Expr) -> tuple[str, ...]:
+        """Path from an Ident root down through Field/Index accessors
+        of `e`. `r.a.b` → `("a", "b")`; `r[i]` → `("__index__",)`;
+        bare Ident → `()`."""
+        if isinstance(e, A.Field):
+            return self._expr_access_path(e.target) + (e.name,)
+        if isinstance(e, A.Index):
+            return self._expr_access_path(e.target) + ("__index__",)
+        return ()
 
     def _assign_target_root(self, target: A.Expr) -> str | None:
         """Root of an assignment lvalue. `r.field.field2 = x` roots at
@@ -2268,11 +2393,11 @@ class Checker:
                 h if not self._has_open_tyvar(h, inst_names) else None
             )
         arg_tys = [self._tc_expr(a, expected=h) for a, h in zip(e.args, arg_hints)]
-        # Freeze-while-borrow: each mut-annotated param invalidates
-        # every live borrow rooted at the root of its arg expression.
-        # The callee can write through the mut param, which may free
-        # or overwrite whatever a borrow aliases.
-        self._invalidate_mut_call_args(fn, e.args)
+        # Freeze-while-borrow: callee's effect summary (if known)
+        # drives precise invalidation; otherwise fall back to the
+        # pessimistic rule of "every mut-annotated arg invalidates
+        # every live borrow rooted at that arg".
+        self._invalidate_mut_call_args(fn, e.args, fn_name=name)
         for i, (at, pty) in enumerate(zip(arg_tys, fn.params)):
             freshened = self._substitute(pty, inst_subst)
             try:

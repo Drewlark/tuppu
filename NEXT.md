@@ -941,78 +941,46 @@ Rough list of things we've discussed but haven't designed in
 detail. Ordered by gut priority — sanity-check against user
 pressure before committing to one.
 
-### Ownership / borrow-check evolution (planning)
+### Ownership / borrow-check evolution
 
-The freeze + escape rules catch UAFs statically at zero runtime
-cost, but sometimes reject programs whose only fix is `copy x` at
-the offending site. That's the same allocation the compiler would
-insert automatically — the rejection just moves the cost decision
-to the user. Two pieces can close the ergonomic gap without
-losing soundness:
+**Phase A (landed):** implicit copy + warning. A freeze/escape
+rejection that would otherwise demand the user type `copy` is
+rewritten in place — `_check_use_not_invalidated` wraps the
+originating Binding's `init` in `A.Copy(...)`; `_wrap_escape_sites`
+wraps any Ident/Field/Index escape leaves in body tails / match
+arms / yield values. Each wrap emits a `tuppu: warning: line:col:
+implicit copy inserted ...` line. Sound: we insert exactly the clone
+the user would have written. Hard errors remain only for borrow
+sources we can't rewrite (match binders — already auto-copied,
+wedge arena pseudo-borrows — always scalar-typed reads).
 
-**A. Implicit copy + warning instead of hard rejection.** When
-the freeze / escape rule would reject, and the only way the user
-could fix it is to add `copy`, just insert the copy and emit a
-`tuppu: warning: line:col: implicit copy inserted; ...` message.
+**Phase B (landed):** effect analysis. `src/tuppu/effects.py`
+computes a `ParamEffects(full, paths)` summary per (fn, param) via
+fixed-point iteration. `_invalidate_mut_call_args` consults the
+summary and invalidates only borrows whose path overlaps an actual
+write path. `_tc_assign`'s field-target path is also threaded
+through — writing `l.pos` no longer invalidates borrows of `l.src`.
+Recursive and mutually-recursive fns converge (paths grow
+monotonically); extern/colophon and unresolved callees fall back to
+conservative full-write. Wedge pseudo-borrows now carry a
+`("__index__",)` path so effect-aware index writes still invalidate
+through-handle reads.
 
-- Rationale: the rejection doesn't unlock a better architectural
-  solution the way Rust's borrowck does (restructure lifetimes).
-  Tuppu has no references-as-values, so the only resolution is a
-  clone. Auto-inserting the inevitable is honest about what's
-  happening.
-- Soundness: unchanged — we insert exactly the clone the user
-  would have written.
-- Cost visibility: warnings are machine-readable; users filter
-  their build output to find hot clones. A `--deny-implicit-copy`
-  flag turns warnings into errors for perf-conscious builds.
-- Scope: `mut l: T = p.field` style read-then-writeback, borrow
-  crossings of mut-reaches, struct-field borrows stored in mut
-  slots. Match binders already auto-copy as of the ergonomic
-  pass — this extends the same pragma to other sites.
-- Impl: `_tc_binding` detects the would-be rejection, inserts a
-  synthetic `A.Copy` wrapping the init expr, emits a
-  `CompileWarning`. Caller typecheck continues as if user wrote
-  `copy`. Maybe 100-150 lines.
+**Phase C (queued):** `--deny-implicit-copy`. A CLI flag that
+promotes Phase A warnings to errors. For libraries that want to
+ship with no unseen allocations and for CI perf gates. Pure driver
+plumbing: turn the existing warning list into a list of errors when
+the flag is set.
 
-**B. Effect analysis to prove most copies unnecessary.**
-Per-fn summary: which fields of which params does this fn (or
-its transitive callees) write to? Callers use the summary to skip
-pessimistic invalidation.
-
-- Concrete win: `fn next_token(mut l: Lex) -> Token` only ever
-  mutates `l.pos` (a scalar). An effect summary captures that.
-  At call site `next_token(l)`, the freeze rule sees l.pos is
-  the only write path — heap fields untouched — and doesn't
-  invalidate borrows through `l.src`. The community's parser
-  stops paying O(src_len) deep-clones per `p_bump`.
-- Summary shape: `dict[fn_name, dict[param_idx, set[FieldPath]]]`.
-  A `FieldPath` is a tuple of field accessors (`("src",)`,
-  `("pos",)`). Plus flags: `release`, `push_elem`, `assign_slot`
-  per param for container-shaped mutations.
-- Fixed-point: walk each fn body, record direct writes; iterate
-  resolving call-site summaries until stable. Recursive fns stay
-  unknown (conservative: assume anything).
-- Scope: intraprocedural collection, interprocedural propagation.
-  Cycle detection via standard SCC / worklist. Terminates.
-- Escape hatches:
-  - An `extern` / colophon fn has unknown effects → conservative
-    (invalidates everything).
-  - A user annotation like `fn next_token(mut l: Lex) [writes
-    l.pos]` could be a future override to skip analysis.
-- Impl: new pass `src/tuppu/effects.py` runs after typecheck,
-  before borrow analysis. ~300-400 lines. Non-trivial but
-  mechanical.
-
-**Phasing:** do (A) first — small, immediate ergonomic relief.
-Then (B) — targeted perf recovery for users pushing real
-workloads. They compose: (B) eliminates the need for most (A)
-warnings, but (A) catches cases (B) can't prove.
-
-**Strict mode:** `--deny-implicit-copy` (or similar) promotes the
-A-warnings to errors. Useful for libraries that want to ship
-without unseen allocations, and for CI perf gates. Paid in
-ergonomic friction at dev time, recovered in predictable
-performance at release.
+**Future refinements:**
+- A user annotation override (`fn next_token(mut l: Lex) [writes
+  l.pos]`) so extern/generic/fn-value callees can still be
+  precise. Skip analysis when annotation present.
+- Generic fn effect analysis: instantiation-site specialization
+  of summaries so generic callers still get precision.
+- Tighter path language: `("__index__", N)` for statically-known
+  index writes; currently all index writes conflate to
+  `("__index__",)`.
 
 ### High-leverage, small-medium effort
 
