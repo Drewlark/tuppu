@@ -703,11 +703,11 @@ def test_wedge_field_extract_rejected_after_index_overwrite(tmp_path):
 
 
 def test_match_binder_returned_no_double_free(tmp_path):
-    # Community repro: `match m { Text(s) => s }` returns s through
-    # the fn. The match binder was cap>0 (inherited from the payload),
-    # so caller's cleanup double-freed against the scrutinee's own
-    # seal release. Fix: match binders are read-borrows (cap=0)
-    # mirroring Field/Index reads.
+    # `match m { Text(s) => s }` returns s through the fn. Because
+    # match binders are implicit-copied to owning clones, the return
+    # moves the clone out via transfer-on-tail. Caller's cleanup on
+    # the result and the scrutinee's seal release don't contend —
+    # they own separate bytes.
     src = (
         "seal M { Text(str), Silent }\n"
         "fn unwrap(m: M) -> str {\n"
@@ -919,22 +919,29 @@ def test_escape_field_return_rejected(tmp_path):
         compile_to_ir(src)
 
 
-def test_escape_match_binder_return_rejected(tmp_path):
-    # Returning a match binder — aliases scrutinee's seal payload,
-    # which dies with the local scrutinee.
+def test_match_binder_returned_fresh_copy(tmp_path):
+    # Match binders are implicit-copied, so returning one moves the
+    # owning clone out via transfer-on-tail. No escape, no double-
+    # free. The caller can freely drop the scrutinee while holding
+    # the returned value.
     src = (
         "seal M { Text(str), Silent }\n"
-        "fn leak() -> str {\n"
-        "  step m = Text(\"hel\" + \"lo\")\n"
+        "fn unwrap(m: M) -> str {\n"
         "  match m {\n"
         "    Text(s) => s,\n"
         "    Silent => \"none\",\n"
         "  }\n"
         "}\n"
-        "fn main() -> i32 { 0 }\n"
+        "fn main() -> i32 {\n"
+        "  step m = Text(\"hel\" + \"lo\")\n"
+        "  step result = unwrap(m)\n"
+        "  println(result)\n"
+        "  0\n"
+        "}\n"
     )
-    with pytest.raises(CompileError, match="borrow of local binding 's'"):
-        compile_to_ir(src)
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello\n"
 
 
 def test_escape_param_field_return_fine(tmp_path):

@@ -1322,6 +1322,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 end_bb = self.builder.block
                 diverged = end_bb.is_terminated
                 if not diverged:
+                    val = self._finalize_arm_tail(arm.body, val)
                     self._emit_frame_cleanups(self._cleanup_frames[-1])
                     results.append((val, self.builder.block))
                     self.builder.branch(merge_bb)
@@ -1339,6 +1340,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 end_bb = self.builder.block
                 diverged = end_bb.is_terminated
                 if not diverged:
+                    val = self._finalize_arm_tail(wildcard_arm.body, val)
                     self._emit_frame_cleanups(self._cleanup_frames[-1])
                     results.append((val, self.builder.block))
                     self.builder.branch(merge_bb)
@@ -1372,6 +1374,26 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             phi.add_incoming(val, bb)
         return phi
 
+    def _finalize_arm_tail(self, body: "A.Expr", val: ir.Value | None) -> ir.Value | None:
+        """Apply block-tail ownership-flow to a direct match arm body.
+        `_gen_block` already handles Block tails internally; arm bodies
+        that ARE a direct Ident / Field / Index don't go through that
+        path, so we mirror the same logic here so cleanups fire
+        correctly for returned borrows / owned values."""
+        if val is None:
+            return None
+        if isinstance(body, A.Ident):
+            # Owning Ident: transfer cleanup out so the arm's scope-
+            # exit release doesn't free bytes the match result is
+            # about to carry.
+            self._transfer_ownership_out(body.name)
+        elif isinstance(body, (A.Field, A.Index)):
+            # Field/Index tail: the aliased bytes live in some
+            # container; clone so the returned match value is
+            # independently owned and safe after scope-exit releases.
+            val = self._deep_clone_if_cleanup_bearing(val)
+        return val
+
     def _bind_variant_pattern(
         self,
         pattern: "A.VariantPattern",
@@ -1396,13 +1418,20 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 inbounds=True,
             )
             val = self.builder.load(field_ptr)
-            # Match binders alias into the scrutinee's payload — the
-            # scrutinee owns the heap bytes. Neuter cleanup markers
-            # (cap=0 for str, recursively for struct fields) so
-            # copying the binder doesn't create a second owner that
-            # would double-free against the seal release. Mirrors the
-            # read-borrow we already apply at Field/Index reads.
-            val = self._read_borrow(val)
+            # Match binders on cleanup-bearing payloads are implicit-
+            # copied so the arm body can freely mutate the scrutinee's
+            # source without dangling the binder. Deep-cloned binder
+            # becomes a regular owning step binding — transfer-on-tail
+            # moves it out on return, scope-exit releases it
+            # otherwise. The alternative was requiring users to write
+            # `step n = copy name` at the top of every arm that
+            # touches the scrutinee, which turned out to be the
+            # majority of match arms in real parsers.
+            if self._is_cleanup_bearing_ty(val.type):
+                val = self._deep_clone_if_cleanup_bearing(val)
+                slot = self._alloca_entry(val.type, f"{binder}.cleanup")
+                self.builder.store(val, slot)
+                self._maybe_register_cleanup(binder, val.type, slot)
             self._bind(binder, Variable(
                 is_mut=False, ir_ref=val, value_ty=val.type,
             ))

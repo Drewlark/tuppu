@@ -380,6 +380,14 @@ class Checker:
         # storage). Anything else in scope is locally declared and
         # cannot escape via return without an explicit `copy`.
         self._fn_params: set[str] = set()
+        # Per-fn inference: if `foo`'s body tail aliases parameter N,
+        # `fn_return_alias["foo"] = N`. Call sites consult this to
+        # register the call result as a borrow of args[N]'s root.
+        # None / missing means the return is fresh-owned.
+        self.fn_return_alias: dict[str, int] = {}
+        # Parameter index order for each fn, so `_tc_call` can map
+        # alias indices back to arg expressions.
+        self.fn_param_names: dict[str, tuple[str, ...]] = {}
         # Freeze-while-borrow state. Per-scope, `_borrow_sources` maps
         # a borrow binding's name → its source root (the outermost
         # owning Ident whose mutation would invalidate the borrow).
@@ -586,6 +594,7 @@ class Checker:
             params=params, ret=ret, is_variadic=is_variadic,
             param_muts=tuple(p.is_mut for p in fn.params),
         )
+        self.fn_param_names[fn.name] = tuple(p.name for p in fn.params)
         # Did-you-mean warning: users who write `fn add(a: Vec, b: Vec)
         # -> Vec` on user types probably meant `gloss add`. Warn but
         # don't reject — the regular fn may be intentional.
@@ -917,6 +926,76 @@ class Checker:
                     f"produce a fresh value.",
                     fn.line, fn.col,
                 )
+        # Return-aliases-param inference. If the tail / any yielded
+        # value aliases a parameter, record which param index for
+        # call-site borrow tracking. Stops callers from treating the
+        # return as fresh-owned when it's actually a pass-through
+        # borrow.
+        if self._needs_borrow_tracking(expected):
+            idx = self._infer_return_alias(fn.body)
+            if idx is not None:
+                self.fn_return_alias[fn.name] = idx
+
+    def _infer_return_alias(self, e: A.Expr) -> int | None:
+        """Walk reachable tail expressions. If any tail resolves to a
+        parameter (by Ident-chain or through Field/Index), return that
+        param's index. Conservatively picks the first param found —
+        callers treat the whole return as a borrow of that arg."""
+        if isinstance(e, A.Ident):
+            param_names = self.fn_param_names.get(self.current_fn, ())
+            if e.name in param_names:
+                return param_names.index(e.name)
+            # Transitively chase borrow chains. A `step w = y; w` at
+            # tail resolves to y; if y is a param, aliased.
+            if e.name in self._all_borrow_sources:
+                root = self._all_borrow_sources[e.name]
+                while root in self._all_borrow_sources:
+                    root = self._all_borrow_sources[root]
+                if root in param_names:
+                    return param_names.index(root)
+            return None
+        if isinstance(e, (A.Field, A.Index)):
+            cur: A.Expr = e
+            while isinstance(cur, (A.Field, A.Index)):
+                cur = cur.target
+            if isinstance(cur, A.Ident):
+                return self._infer_return_alias(cur)
+            return None
+        if isinstance(e, A.Block):
+            return self._infer_return_alias(e.tail) if e.tail else None
+        if isinstance(e, A.IfExpr):
+            t = (
+                self._infer_return_alias(e.then.tail)
+                if isinstance(e.then, A.Block) and e.then.tail
+                else None
+            )
+            if t is not None:
+                return t
+            if e.else_ is None:
+                return None
+            if isinstance(e.else_, A.IfExpr):
+                return self._infer_return_alias(e.else_)
+            if isinstance(e.else_, A.Block):
+                return (
+                    self._infer_return_alias(e.else_.tail)
+                    if e.else_.tail else None
+                )
+            return None
+        if isinstance(e, A.MatchExpr):
+            for arm in e.arms:
+                idx = self._infer_return_alias(arm.body)
+                if idx is not None:
+                    return idx
+            return None
+        if isinstance(e, A.Call) and isinstance(e.callee, A.Ident):
+            # Transitive: calling a fn that itself return-aliases its
+            # own param N passes through to whichever of OUR args
+            # gets passed there.
+            callee_alias = self.fn_return_alias.get(e.callee.name)
+            if callee_alias is not None and callee_alias < len(e.args):
+                return self._infer_return_alias(e.args[callee_alias])
+            return None
+        return None
 
     # --- type resolution --------------------------------------------
 
@@ -1152,8 +1231,9 @@ class Checker:
 
     def _borrow_source_root(self, e: A.Expr) -> str | None:
         """Walk a borrow-source expression to its root Ident. Returns
-        None for expressions that produce fresh ownership (Call,
-        Copy, literals), which don't establish aliasing relationships."""
+        None for expressions that produce fresh ownership (Copy,
+        literals). Calls to fns whose return aliases a param are
+        treated as borrow sources rooted at the aliased arg."""
         if isinstance(e, A.Ident):
             # Follow the borrow chain: `step q = p; step r = q` — r's
             # root is whatever p's root was (or p itself if p is an
@@ -1163,6 +1243,12 @@ class Checker:
             return self._borrow_source_root(e.target)
         if isinstance(e, A.Index):
             return self._borrow_source_root(e.target)
+        if isinstance(e, A.Call) and isinstance(e.callee, A.Ident):
+            # A fn whose return aliases its Nth param: the call
+            # result aliases whatever arg N does. Inherit that root.
+            alias_idx = self.fn_return_alias.get(e.callee.name)
+            if alias_idx is not None and alias_idx < len(e.args):
+                return self._borrow_source_root(e.args[alias_idx])
         return None
 
     def _root_for(self, name: str) -> str:
@@ -1296,12 +1382,31 @@ class Checker:
                 # Track field-origin-ness for escape analysis. An
                 # Ident init inherits the source's status (a chain of
                 # Ident borrows stays ident-only). Field / Index init
-                # always marks the binding as field-origin.
+                # always marks the binding as field-origin. A Call
+                # that return-aliases a param inherits the
+                # field-origin-ness of that arg.
                 if isinstance(b.init, (A.Field, A.Index)):
                     self._field_borrows.add(b.name)
                 elif isinstance(b.init, A.Ident):
                     if b.init.name in self._field_borrows:
                         self._field_borrows.add(b.name)
+                elif (
+                    isinstance(b.init, A.Call)
+                    and isinstance(b.init.callee, A.Ident)
+                ):
+                    alias_idx = self.fn_return_alias.get(
+                        b.init.callee.name,
+                    )
+                    if (
+                        alias_idx is not None
+                        and alias_idx < len(b.init.args)
+                    ):
+                        arg = b.init.args[alias_idx]
+                        if isinstance(arg, (A.Field, A.Index)) or (
+                            isinstance(arg, A.Ident)
+                            and arg.name in self._field_borrows
+                        ):
+                            self._field_borrows.add(b.name)
         # Wedge bindings alias into the arena they point at. The most
         # common source is `store.push(x)` — register the handle as a
         # borrow rooted at `store` so a later `store[i] = v` or
@@ -2766,26 +2871,20 @@ class Checker:
                             f"variant has {len(vfs)} field(s)",
                             arm.line, arm.col,
                         )
-                    # Match binders alias into the scrutinee's
-                    # payload — register each as a borrow rooted at
-                    # the scrutinee expression's root. Any mut-reach
-                    # to that root during the arm body invalidates
-                    # the binder. Binders are field-origin for escape
-                    # analysis (can't be returned as Ident with
-                    # transfer — the payload is inside the seal, not
-                    # its own slot).
-                    scrut_root = self._borrow_source_root(e.scrutinee)
+                    # Match binders on cleanup-bearing payloads are
+                    # implicit-copied at codegen (see
+                    # `_bind_variant_pattern`), so each binder is an
+                    # owning step — not a borrow. No freeze
+                    # registration, no field-origin tag, no escape
+                    # restriction on returning a binder. The
+                    # ergonomic cost of requiring explicit `copy` at
+                    # every parser-style arm outweighed the one
+                    # extra clone per matched payload.
                     for binder, fty in zip(arm.pattern.binders, vfs):
                         if binder is None:
                             continue
                         concrete = self._substitute(fty, subst)
                         self._bind(binder, concrete, arm.line, arm.col)
-                        if (
-                            scrut_root is not None
-                            and self._needs_borrow_tracking(concrete)
-                        ):
-                            self._register_borrow(binder, scrut_root)
-                            self._field_borrows.add(binder)
                 else:
                     raise CheckError(
                         f"unsupported pattern: {type(arm.pattern).__name__}",

@@ -314,12 +314,13 @@ def test_match_stmt_arm_with_void_call_tail(tmp_path):
     assert out == b"42\n42\n"
 
 
-def test_match_binder_rejected_when_scrutinee_mutated(tmp_path):
-    # Freeze-while-borrow: a match binder aliases the scrutinee's
-    # payload. If the arm body calls anything that mut-reaches the
-    # scrutinee's source (here `p_bump(p)` reassigns `p.cur`), the
-    # binder would dangle. The checker rejects at compile time with
-    # a suggestion to use `copy` at the binder site.
+def test_match_binder_survives_scrutinee_mutation_via_implicit_copy(tmp_path):
+    # Match binders on cleanup-bearing payloads are implicit-copied
+    # at codegen — so the parser idiom `match p.cur { TkIdent(name)
+    # => { p_bump(p); use(name) } }` Just Works. The arm body can
+    # mutate the scrutinee's source without dangling the binder.
+    # The alternative — rejecting and forcing `step n = copy name`
+    # at every arm — was ergonomically dead in real parser code.
     src = (
         "seal Tok { Ident(str), EOF }\n"
         "tablet Parser { cur: Tok }\n"
@@ -332,33 +333,6 @@ def test_match_binder_rejected_when_scrutinee_mutated(tmp_path):
         "    Ident(name) => {\n"
         "      p_bump(p)\n"
         "      println(name)\n"
-        "    },\n"
-        "    EOF => println(\"eof\"),\n"
-        "  }\n"
-        "  0\n"
-        "}\n"
-    )
-    with pytest.raises(CompileError, match="use of borrow 'name'"):
-        compile_to_ir(src)
-
-
-def test_match_binder_copy_opt_out(tmp_path):
-    # With `copy` the binder's bytes are independently owned, so
-    # mut-reaching the scrutinee doesn't invalidate. Same program,
-    # one-line change.
-    src = (
-        "seal Tok { Ident(str), EOF }\n"
-        "tablet Parser { cur: Tok }\n"
-        "fn p_bump(mut p: Parser) {\n"
-        "  p.cur = EOF\n"
-        "}\n"
-        "fn main() -> i32 {\n"
-        "  mut p: Parser = Parser { cur: Ident(\"hel\" + \"lo\") }\n"
-        "  match p.cur {\n"
-        "    Ident(name) => {\n"
-        "      step n = copy name\n"
-        "      p_bump(p)\n"
-        "      println(n)\n"
         "    },\n"
         "    EOF => println(\"eof\"),\n"
         "  }\n"
