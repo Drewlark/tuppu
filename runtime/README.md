@@ -110,13 +110,52 @@ stack. This stage is deliberately unoptimized so we can measure
 "pure GC cost" vs. baseline and then measure what Stage 3
 recovers.
 
-- [ ] Codegen: emit type descriptors for str.
-- [ ] Codegen: emit push_root / pop_roots at fn entry / exit.
-- [ ] Codegen: replace malloc for str bytes with __tuppu_gc_alloc_bytes.
-- [ ] Codegen: stop emitting free in str_release.
-- [ ] Codegen: type descriptors + alloc calls for tablets chunks.
-- [ ] Codegen: type descriptors for user structs / seals.
-- [ ] Stage-2 benchmark pass.
+**Must migrate atomically.** A half-migrated state crashes: if
+any allocation path still calls malloc while the matching release
+path calls __tuppu_gc_alloc_bytes (or vice versa), `free()` on a
+GC-owned buffer corrupts the libc heap. No partial-migration
+intermediate state is safe.
+
+Migration checklist (all in one commit or one tight sequence):
+
+- [x] Codegen: GC-extern helpers + type descriptor emitter.
+      (commit abc028b)
+- [ ] Codegen: type descriptor for str (one ptr field at offset 0,
+      24-byte size). Call via `_get_type_desc`.
+- [ ] Codegen: type descriptors for user structs (transitively
+      cleanup-bearing). Walk fields, pick up str-field offsets;
+      extend later to nested struct / seal fields.
+- [ ] Codegen: type descriptor for tablets — CUSTOM TRACE needed.
+      Tablets chunks are a linked-list of blocks; a simple
+      ptr_offsets array can't express walk-the-chain. Add a
+      `trace_fn` field to `tuppu_type_t`, emit a per-tablets-type
+      trace fn that walks chunks and calls `mark_ptr` on each
+      element's ptr field. Runtime change: if `trace != NULL`,
+      call `trace(obj)` instead of iterating `ptr_offsets`.
+- [ ] Codegen: replace `_get_malloc()` with `_get_gc_alloc_bytes()`
+      at every str / tablets allocation site — there are ~12 total
+      across codegen/__init__.py, codegen/strs.py, codegen/tablets.py.
+      Consider just changing `_get_malloc` itself to return the GC
+      allocator; then every caller transparently moves.
+- [ ] Codegen: remove `free()` calls in str_release, tablets
+      release, cstr-to-str cleanup. Make these paths no-ops (GC
+      reclaims). Alternatively route `_get_free` to a no-op.
+- [ ] Codegen: at `_maybe_register_cleanup`, also emit
+      `_emit_gc_push_root(slot, value_ty)`. Track the count per
+      cleanup frame.
+- [ ] Codegen: at `_emit_frame_cleanups`, after the existing
+      release walks, emit `_emit_gc_pop_roots(count)`.
+- [ ] Runtime: add `trace_fn` field + call site in tuppu_gc.c.
+- [ ] Run full test suite — expect some adjustments for the
+      changed malloc ↔ GC boundary.
+- [ ] Capture Stage-2 benchmark pass.
+
+**Crucial correctness invariant** (when stage 2 lands): every live
+cleanup-bearing local must be on the shadow stack between any two
+allocation sites. An allocation can trigger a GC, which will
+reclaim anything not rooted. The conservative rule — push a root
+at every alloca, pop at every return — is unconditionally safe.
+Optimization (stage 3) loosens this.
 
 ### Stage 2.5 — delete correctness analyzer
 
