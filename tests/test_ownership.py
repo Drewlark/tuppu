@@ -671,6 +671,7 @@ def test_scalar_index_assign_does_not_invalidate_wedge(tmp_path):
         "fn main() -> i32 {\n"
         "  mut store: tablets[8]N\n"
         "  step head = store.push(N { val: 1 })\n"
+        "  step other = store.push(N { val: 2 })\n"
         "  store[1] = N { val: 99 }\n"
         "  println(head.val)\n"
         "  0\n"
