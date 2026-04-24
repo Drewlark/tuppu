@@ -966,13 +966,29 @@ conservative full-write. Wedge pseudo-borrows now carry a
 `("__index__",)` path so effect-aware index writes still invalidate
 through-handle reads.
 
+**What Phase B does NOT fix** (Tupsarru correction, 2026-04-24):
+the warning at step (1) of the writeback pattern
+```
+mut l: Lex = p.lex          // (1) l aliases p.lex's storage
+p.cur = next_token(l)       // (2) mutates l (and thus p.lex)
+p.lex = l                   // (3) self-assign through alias
+```
+is a STRUCTURAL hazard of drop-then-write assignment, not a
+callee-effect mis-inference. Step (3) drops old p.lex (frees
+p.lex.src) and then copies l's fields in — but l.src aliased the
+just-freed heap. Phase B refines (2); the warning lives at (1)+(3)
+and is correct. The auto-clone at (1) is the right fix. Options we
+ruled out: flip assignment to write-then-drop (hard, changes a core
+semantic); ban the pattern (ergonomic regression). Users either
+accept the informational warning or write `copy p.lex` explicitly.
+
 **Phase C (queued):** `--deny-implicit-copy`. A CLI flag that
 promotes Phase A warnings to errors. For libraries that want to
 ship with no unseen allocations and for CI perf gates. Pure driver
 plumbing: turn the existing warning list into a list of errors when
 the flag is set.
 
-**Future refinements:**
+**Future refinements (cheap precision wins):**
 - A user annotation override (`fn next_token(mut l: Lex) [writes
   l.pos]`) so extern/generic/fn-value callees can still be
   precise. Skip analysis when annotation present.
@@ -981,6 +997,13 @@ the flag is set.
 - Tighter path language: `("__index__", N)` for statically-known
   index writes; currently all index writes conflate to
   `("__index__",)`.
+
+**Future refinement (structural — probe before committing):**
+- Self-assign elision for `p.field = l` where `l` is provably a
+  borrow of `p.field` and hasn't been rebound. That specific shape
+  is a semantic no-op (the mutation already landed through
+  aliasing) and could be compiled away, removing the warning. Doesn't
+  generalize to other drop-then-write hazards.
 
 ### High-leverage, small-medium effort
 
