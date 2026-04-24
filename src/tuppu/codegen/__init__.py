@@ -263,14 +263,26 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
     def _type_desc_key(self, value_ty: ir.Type) -> str | None:
         """Stable string key identifying a type for descriptor
         caching. Returns None for types that don't need GC tracing
-        (scalars, pointers, fn values)."""
+        (scalars, pointers, fn values, seals with only scalar
+        payloads)."""
         if self._is_str_value(value_ty):
             return "__tuppu_str"
         info = self._tablets_info_for(value_ty)
         if info is not None:
             return f"__tuppu_tbls_{info.elem_ty}_{info.N}".replace(" ", "_")
         if isinstance(value_ty, ir.IdentifiedStructType):
-            return f"__tuppu_struct_{value_ty.name}"
+            if self._seal_key_for_ty(value_ty) is not None:
+                if not self._seal_needs_cleanup(value_ty):
+                    return None
+                return f"__tuppu_seal_{value_ty.name}"
+            # Plain structs: only produce a desc when there's something
+            # to trace. `_get_type_desc` and the chokepoint both key off
+            # this, so keeping them agreed prevents push/pop counter
+            # drift (alloca a rooted slot but skip the push, vs. pop
+            # expecting a push that never happened).
+            if self._struct_needs_cleanup(value_ty):
+                return f"__tuppu_struct_{value_ty.name}"
+            return None
         return None
 
     def _type_ptr_offsets(self, value_ty: ir.Type) -> list[int]:
@@ -281,10 +293,13 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         - tablets `{*Node head, *Node tail, i64 len}` — head at 0,
           tail at 8. Marking both also reaches the chunk chain since
           each chunk's own descriptor lists its `next` ptr.
-        - User struct: walk fields, pick up offsets of any
-          str / tablets / nested-struct-with-ptrs fields. Composition
-          is recursive — a struct containing a struct containing a
-          str produces the final nested offset.
+        - Struct (identified or literal): walk fields, composing
+          each field's offsets at the field's *aligned* start.
+          Alignment-aware — a `{i8, str}` variant payload keeps the
+          str at offset 8, not 1.
+        - Array: fan out offsets across N elements. Covers buffers
+          or struct fields that happen to be arrays of cleanup-
+          bearing elements.
         - Chunk (Node_...): built separately via
           `_chunk_ptr_offsets` since it has a fixed layout derived
           from (N, elem_ty).
@@ -294,13 +309,26 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         info = self._tablets_info_for(value_ty)
         if info is not None:
             return [0, 8]   # head, tail ptrs
-        if isinstance(value_ty, ir.IdentifiedStructType):
+        if isinstance(value_ty, (ir.IdentifiedStructType, ir.LiteralStructType)):
             offsets: list[int] = []
             offset = 0
             for fty in value_ty.elements:
+                align = self._align_of(fty)
+                offset = (offset + align - 1) // align * align
                 for inner_off in self._type_ptr_offsets(fty):
                     offsets.append(offset + inner_off)
-                offset += self._size_of_ty(fty)
+                offset += self._size_of(fty)
+            return offsets
+        if isinstance(value_ty, ir.ArrayType):
+            inner = self._type_ptr_offsets(value_ty.element)
+            if not inner:
+                return []
+            elem_size = self._size_of(value_ty.element)
+            offsets = []
+            for i in range(value_ty.count):
+                base = i * elem_size
+                for off in inner:
+                    offsets.append(base + off)
             return offsets
         return []
 
@@ -309,18 +337,22 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
     ) -> list[int]:
         """Byte offsets of pointer fields inside a tablets chunk.
         Chunk layout: `[elem[0]..elem[N-1], used: i64, next: *Node]`.
-        Each slot contributes offsets per its own type; `next` adds
-        one at `N * sizeof(elem) + sizeof(used)`."""
-        elem_size = self._size_of_ty(elem_ty)
+        Each slot contributes offsets per its own type; `next` sits
+        at the first 8-aligned offset after the items array plus the
+        8-byte `used` field. Uses alignment-aware `_size_of` so
+        mixed-align element types (e.g. a variant payload `{i8, str}`)
+        stride correctly."""
+        elem_size = self._size_of(elem_ty)
         inner = self._type_ptr_offsets(elem_ty)
         offsets: list[int] = []
         for i in range(N):
             base = i * elem_size
             for inner_off in inner:
                 offsets.append(base + inner_off)
-        # After the items array come `used: i64` (8 bytes) then
-        # `next: *Node` (8 bytes).
-        offsets.append(N * elem_size + 8)
+        items_end = N * elem_size
+        used_off = (items_end + 7) & ~7   # align to i64 for used
+        next_off = used_off + 8
+        offsets.append(next_off)
         return offsets
 
     def _get_chunk_type_desc(
@@ -397,18 +429,38 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         cached = self._type_descs.get(key)
         if cached is not None:
             return cached
-        offsets = self._type_ptr_offsets(value_ty)
-        if not offsets:
-            return None
-        # Offsets table as an LLVM global.
-        offsets_arr_ty = ir.ArrayType(I64, len(offsets))
+        # Seals dispatch tracing via a per-seal fn because a flat
+        # ptr_offsets table can't express the tag-dependent payload
+        # layout. Structs that transitively contain a seal field need
+        # the same escape hatch so GC can recurse into the seal's
+        # trace fn. Everything else gets a flat ptr_offsets table.
+        is_seal = (
+            isinstance(value_ty, ir.IdentifiedStructType)
+            and self._seal_key_for_ty(value_ty) is not None
+        )
+        trace_fn: ir.Function | None = None
+        offsets: list[int] = []
+        if is_seal:
+            trace_fn = self._get_seal_trace_fn(value_ty)
+        elif (
+            isinstance(value_ty, ir.IdentifiedStructType)
+            and self._struct_contains_seal(value_ty)
+        ):
+            trace_fn = self._get_struct_trace_fn(value_ty)
+        else:
+            offsets = self._type_ptr_offsets(value_ty)
+            if not offsets:
+                return None
+        # Offsets table as an LLVM global (possibly empty for seals).
+        offsets_arr_ty = ir.ArrayType(I64, max(len(offsets), 1))
         offsets_arr = ir.GlobalVariable(
             self.module, offsets_arr_ty, f"{key}_offsets",
         )
         offsets_arr.linkage = "internal"
         offsets_arr.global_constant = True
         offsets_arr.initializer = ir.Constant(
-            offsets_arr_ty, [ir.Constant(I64, o) for o in offsets],
+            offsets_arr_ty,
+            [ir.Constant(I64, o) for o in offsets] or [ir.Constant(I64, 0)],
         )
         # Name string as a global.
         name_bytes = (key + "\0").encode("utf-8")
@@ -421,7 +473,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         name_arr.initializer = ir.Constant(
             name_arr_ty, bytearray(name_bytes),
         )
-        # Descriptor struct. No custom trace fn for flat-offset types.
+        trace_init: ir.Constant | ir.Function
+        if trace_fn is None:
+            trace_init = ir.Constant(self._trace_fn_ty.as_pointer(), None)
+        else:
+            trace_init = trace_fn
         desc = ir.GlobalVariable(self.module, self._type_desc_ty, key)
         desc.linkage = "internal"
         desc.global_constant = True
@@ -430,10 +486,185 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             ir.Constant(I64, self._size_of_ty(value_ty)),
             ir.Constant(I64, len(offsets)),
             offsets_arr.bitcast(I64.as_pointer()),
-            ir.Constant(self._trace_fn_ty.as_pointer(), None),
+            trace_init,
         ])
         self._type_descs[key] = desc
         return desc
+
+    def _get_seal_trace_fn(self, seal_ty: ir.Type) -> ir.Function:
+        """Emit (or return cached) a per-seal trace function that
+        dispatches on the tag byte and marks each variant's cleanup-
+        bearing payload fields. The GC runtime calls this via the
+        `trace` field on tuppu_type_t.
+
+        The fn takes an `i8*` pointing at the seal's start address.
+        It bitcasts to the seal type, loads the tag, and switches
+        to variant-specific blocks. Each arm walks the variant's
+        payload fields — plain str / tablets contribute mark_ptr
+        calls at their offsets; nested seals recurse via the inner
+        seal's own trace fn; nested structs compose into flat ptr
+        offsets."""
+        assert isinstance(seal_ty, ir.IdentifiedStructType)
+        seal_key = self._seal_key_for_ty(seal_ty)
+        assert seal_key is not None
+        fn_name = f"__tuppu_seal_{seal_ty.name}_trace"
+        cached = self.module.globals.get(fn_name)
+        if isinstance(cached, ir.Function):
+            return cached
+        fn = ir.Function(self.module, self._trace_fn_ty, fn_name)
+        fn.linkage = "internal"
+        entry = fn.append_basic_block("entry")
+        b = ir.IRBuilder(entry)
+        seal_ptr = b.bitcast(fn.args[0], seal_ty.as_pointer())
+        tag_ptr = b.gep(
+            seal_ptr, [ir.Constant(I32, 0), ir.Constant(I32, 0)], inbounds=True,
+        )
+        tag = b.load(tag_ptr)
+        payload_raw_ptr = b.gep(
+            seal_ptr, [ir.Constant(I32, 0), ir.Constant(I32, 1)],
+            inbounds=True,
+        )
+        payload_base = b.bitcast(payload_raw_ptr, I8.as_pointer())
+        merge_bb = fn.append_basic_block("trace.done")
+        variants = self._seal_variants.get(seal_key, [])
+        if not variants:
+            b.branch(merge_bb)
+        else:
+            switch = b.switch(tag, merge_bb)
+            for idx, (vname, payload_ty) in enumerate(variants):
+                arm = fn.append_basic_block(f"trace.{vname}")
+                switch.add_case(ir.Constant(I8, idx), arm)
+                b.position_at_end(arm)
+                fld_off = 0
+                for fty in payload_ty.elements:
+                    align = self._align_of(fty)
+                    fld_off = (fld_off + align - 1) // align * align
+                    self._emit_trace_mark_calls(b, payload_base, fld_off, fty)
+                    fld_off += self._size_of(fty)
+                b.branch(merge_bb)
+        b.position_at_end(merge_bb)
+        b.ret_void()
+        return fn
+
+    def _emit_trace_mark_calls(
+        self,
+        b: ir.IRBuilder,
+        base: ir.Value,
+        offset: int,
+        field_ty: ir.Type,
+    ) -> None:
+        """Emit the IR that marks every GC-reachable pointer inside
+        `field_ty` at `base + offset`. Nested seals dispatch into
+        their own trace fn; structs that (transitively) contain a
+        seal also dispatch via a struct trace fn so the tag-based
+        recursion chains through. Everything else falls back to a
+        flat ptr_offsets walk. Scalars are no-ops."""
+        if isinstance(field_ty, ir.IdentifiedStructType):
+            seal_key = self._seal_key_for_ty(field_ty)
+            if seal_key is not None:
+                if self._seal_needs_cleanup(field_ty):
+                    inner_fn = self._get_seal_trace_fn(field_ty)
+                    sub_ptr = b.gep(
+                        base, [ir.Constant(I64, offset)], inbounds=True,
+                    )
+                    b.call(inner_fn, [sub_ptr])
+                return
+            if self._struct_contains_seal(field_ty):
+                inner_fn = self._get_struct_trace_fn(field_ty)
+                sub_ptr = b.gep(
+                    base, [ir.Constant(I64, offset)], inbounds=True,
+                )
+                b.call(inner_fn, [sub_ptr])
+                return
+        # Literal struct (e.g. variant payload tuple) that contains a
+        # seal field still needs recursion — walk fields one by one
+        # so nested seal fields re-enter the dispatch.
+        if isinstance(field_ty, ir.LiteralStructType):
+            if any(self._contains_seal_anywhere(el) for el in field_ty.elements):
+                inner_off = 0
+                for el in field_ty.elements:
+                    align = self._align_of(el)
+                    inner_off = (inner_off + align - 1) // align * align
+                    self._emit_trace_mark_calls(b, base, offset + inner_off, el)
+                    inner_off += self._size_of(el)
+                return
+        offsets = self._type_ptr_offsets(field_ty)
+        if not offsets:
+            return
+        mark_fn = self._get_gc_mark_ptr()
+        for inner in offsets:
+            total = offset + inner
+            field_i8 = b.gep(
+                base, [ir.Constant(I64, total)], inbounds=True,
+            )
+            field_ptr_ptr = b.bitcast(field_i8, I8.as_pointer().as_pointer())
+            field_ptr = b.load(field_ptr_ptr)
+            b.call(mark_fn, [field_ptr])
+
+    def _contains_seal_anywhere(self, ty: ir.Type) -> bool:
+        """Does `ty` anywhere in its layout hold a cleanup-bearing
+        seal? Used to decide whether a composite field's trace needs
+        the full field-by-field recursion or can use flat offsets."""
+        if isinstance(ty, ir.IdentifiedStructType):
+            if self._seal_key_for_ty(ty) is not None:
+                return self._seal_needs_cleanup(ty)
+            if self._struct_contains_seal(ty):
+                return True
+        if isinstance(ty, ir.LiteralStructType):
+            return any(self._contains_seal_anywhere(el) for el in ty.elements)
+        return False
+
+    def _struct_contains_seal(self, struct_ty: ir.Type) -> bool:
+        """Does this struct transitively contain a cleanup-bearing
+        seal field? Those fields need tag-dispatch tracing, which
+        a flat ptr_offsets table can't express."""
+        if not isinstance(struct_ty, ir.IdentifiedStructType):
+            return False
+        if self._seal_key_for_ty(struct_ty) is not None:
+            return self._seal_needs_cleanup(struct_ty)
+        fields = self._struct_fields_for(struct_ty)
+        if fields is None:
+            return False
+        for _name, fty in fields:
+            if self._struct_contains_seal(fty):
+                return True
+        return False
+
+    def _get_struct_trace_fn(self, struct_ty: ir.Type) -> ir.Function:
+        """Emit (or return cached) a trace fn for a struct whose
+        layout can't be expressed as a flat ptr_offsets table —
+        today, structs that transitively hold a seal-with-cleanup
+        field. The fn walks each field and recurses via
+        `_emit_trace_mark_calls`, which handles seals by calling
+        their own trace fn in turn."""
+        assert isinstance(struct_ty, ir.IdentifiedStructType)
+        fn_name = f"__tuppu_struct_{struct_ty.name}_trace"
+        cached = self.module.globals.get(fn_name)
+        if isinstance(cached, ir.Function):
+            return cached
+        fn = ir.Function(self.module, self._trace_fn_ty, fn_name)
+        fn.linkage = "internal"
+        entry = fn.append_basic_block("entry")
+        b = ir.IRBuilder(entry)
+        base = fn.args[0]
+        fields = self._struct_fields_for(struct_ty) or []
+        offset = 0
+        for _name, fty in fields:
+            align = self._align_of(fty)
+            offset = (offset + align - 1) // align * align
+            self._emit_trace_mark_calls(b, base, offset, fty)
+            offset += self._size_of(fty)
+        b.ret_void()
+        return fn
+
+    def _get_gc_mark_ptr(self) -> ir.Function:
+        """`__tuppu_gc_mark_ptr(ptr)` — runtime callback for trace fns
+        to mark a discovered pointer as reachable."""
+        cached = self.module.globals.get("__tuppu_gc_mark_ptr")
+        if isinstance(cached, ir.Function):
+            return cached
+        fty = ir.FunctionType(ir.VoidType(), [I8.as_pointer()])
+        return ir.Function(self.module, fty, "__tuppu_gc_mark_ptr")
 
     def _emit_gc_push_root(self, slot: ir.Value, value_ty: ir.Type) -> bool:
         """Emit a `__tuppu_gc_push_root(slot, type_desc)` call if the
@@ -1008,13 +1239,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                     )
                 expected = self._lower_type(fn.return_type)
                 coerced = self._coerce(value, expected)
-                # Tail-return borrow neutering: if the body's tail is
-                # a Field or Index (reading from a struct / container
-                # the callee doesn't own), hand the caller a cap=0
-                # borrow so its scope-exit cleanup won't double-free.
-                tail_expr = self._block_tail_expr(fn.body)
-                if tail_expr is not None:
-                    coerced = self._neuter_return_if_borrow(coerced, tail_expr)
+                # Block-level codegen already clones Field/Index tails
+                # so the caller gets independently-owned bytes
+                # (see `_gen_block`). No second neuter here; cloning
+                # twice would leave the first clone's heap bytes
+                # unrooted across the second clone's allocation.
                 self._emit_frame_cleanups(self._cleanup_frames[-1])
                 self._emit_all_gc_root_pops_for_early_return()
                 self.builder.ret(coerced)
@@ -2076,9 +2305,24 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         self.builder.branch(header)
 
         self.builder.position_at_end(header)
+        # Any chokepoint roots the cond expression pushes are scoped
+        # to this iteration's cond evaluation — they shouldn't leak
+        # into the body/exit paths since each iteration re-runs the
+        # header. Snapshot the counter, pop the delta before the
+        # cbranch so cond-eval roots balance per iteration.
+        cond_before = (
+            self._gc_root_counts[-1] if self._gc_root_counts else 0
+        )
         cond = self._gen_expr(w.cond)
         if cond is None or cond.type != I1:
             raise CodegenError("while condition must be a bool expression")
+        cond_delta = (
+            (self._gc_root_counts[-1] - cond_before)
+            if self._gc_root_counts else 0
+        )
+        if cond_delta > 0:
+            self._emit_gc_pop_roots(cond_delta)
+            self._gc_root_counts[-1] = cond_before
         self.builder.cbranch(cond, body, exit_)
 
         self.builder.position_at_end(body)
@@ -2210,32 +2454,40 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         """Deep-clone `val` if it's a cleanup-bearing type — str, a
         user struct whose fields recursively require cloning, a
         tablets value, or a seal carrying cleanup-bearing payload.
-        Scalars pass through unchanged."""
+        Scalars pass through unchanged. When a clone actually
+        happens, the fresh heap bytes are routed through the same
+        chokepoint as Call results — spilled to a rooted slot so a
+        subsequent allocating op can't reclaim them before the
+        consumer stores or transfers the value."""
         assert self.builder is not None
         if self._is_str_value(val.type):
-            return self.builder.call(self._get_str_clone(), [val])
+            cloned = self.builder.call(self._get_str_clone(), [val])
+            return self._force_root_cleanup_value(cloned)
         if (
             self._struct_fields_for(val.type) is not None
             and self._struct_needs_cleanup(val.type)
         ):
-            return self.builder.call(
+            cloned = self.builder.call(
                 self._get_struct_clone(val.type), [val],
             )
+            return self._force_root_cleanup_value(cloned)
         info = self._tablets_info_for(val.type)
         if info is not None:
             # Tablets clone takes a pointer; spill the SSA to a temp.
             src_slot = self._alloca_entry(val.type, ".tbls.clone.src")
             self.builder.store(val, src_slot)
-            return self.builder.call(
+            cloned = self.builder.call(
                 self._get_tablets_clone(info), [src_slot],
             )
+            return self._force_root_cleanup_value(cloned)
         if (
             self._seal_key_for_ty(val.type) is not None
             and self._seal_needs_cleanup(val.type)
         ):
-            return self.builder.call(
+            cloned = self.builder.call(
                 self._get_seal_clone(val.type), [val],
             )
+            return self._force_root_cleanup_value(cloned)
         return val
 
     def _emit_all_cleanups_for_early_return(self) -> None:
@@ -2385,6 +2637,12 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             self._cleanup_frames[-1].append(
                 (self._get_struct_release(value_ty), slot, name),
             )
+            # Struct/seal bindings need shadow-stack rooting too —
+            # without it, any heap the struct transitively holds
+            # (e.g. a tablets field's chunks) becomes unreachable
+            # between the binding's own allocations. Under stress
+            # mode the chunks get collected mid-function.
+            self._register_gc_root(slot, value_ty)
             return
         if (
             self._seal_key_for_ty(value_ty) is not None
@@ -2393,6 +2651,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             self._cleanup_frames[-1].append(
                 (self._get_seal_release(value_ty), slot, name),
             )
+            self._register_gc_root(slot, value_ty)
 
     def _struct_needs_cleanup(self, struct_ty: ir.Type) -> bool:
         """Does this user struct (transitively) hold any cleanup-bearing
@@ -2586,50 +2845,74 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         entry = fn.append_basic_block("entry")
         b = ir.IRBuilder(entry)
         src = fn.args[0]
-        result: ir.Value = ir.Constant(struct_ty, ir.Undefined)
+        # Same isolation dance as seal_clone / tablets_clone: don't leak
+        # cleanup entries or root counts into the caller's frames, root
+        # the dst slot so accumulated field clones stay reachable, emit
+        # the paired pop before ret.
+        saved_frames = self._cleanup_frames
+        saved_counts = self._gc_root_counts
+        saved_helper = getattr(self, "_in_helper_emission", False)
+        saved_builder = self.builder
+        self._cleanup_frames = [[]]
+        self._gc_root_counts = [0]
+        self._in_helper_emission = True
+        self.builder = b
+        dst_slot = b.alloca(struct_ty, name="dst")
+        b.store(ir.Constant(struct_ty, None), dst_slot)
+        dst_desc = self._get_type_desc(struct_ty)
+        dst_pushed = False
+        if dst_desc is not None:
+            b.call(
+                self._get_gc_push_root(),
+                [
+                    b.bitcast(dst_slot, I8.as_pointer()),
+                    b.bitcast(dst_desc, I8.as_pointer()),
+                ],
+            )
+            dst_pushed = True
         fields = self._struct_fields_for(struct_ty) or []
         for i, (_fname, fty) in enumerate(fields):
             field_val = b.extract_value(src, i)
+            dst_field_ptr = b.gep(
+                dst_slot, [ir.Constant(I32, 0), ir.Constant(I32, i)],
+                inbounds=True,
+            )
             if self._is_str_value(fty):
                 cloned = b.call(self._get_str_clone(), [field_val])
-                result = b.insert_value(result, cloned, i)
+                b.store(cloned, dst_field_ptr)
                 continue
             info = self._tablets_info_for(fty)
             if info is not None:
-                # Tablets clone takes a pointer — spill the extracted
-                # SSA field value into a local slot first.
                 src_slot = b.alloca(fty, name=".tbls.field.src")
                 b.store(field_val, src_slot)
-                # Save/restore self.builder so the clone builder (which
-                # may recursively call into struct/tablets helpers and
-                # uses self.builder internally) sees this context.
-                saved = self.builder
-                self.builder = b
-                try:
-                    cloned = b.call(
-                        self._get_tablets_clone(info), [src_slot],
-                    )
-                finally:
-                    self.builder = saved
-                result = b.insert_value(result, cloned, i)
+                cloned = b.call(
+                    self._get_tablets_clone(info), [src_slot],
+                )
+                b.store(cloned, dst_field_ptr)
                 continue
             if (
                 self._struct_fields_for(fty) is not None
                 and self._struct_needs_cleanup(fty)
             ):
                 cloned = b.call(self._get_struct_clone(fty), [field_val])
-                result = b.insert_value(result, cloned, i)
+                b.store(cloned, dst_field_ptr)
                 continue
             if (
                 self._seal_key_for_ty(fty) is not None
                 and self._seal_needs_cleanup(fty)
             ):
                 cloned = b.call(self._get_seal_clone(fty), [field_val])
-                result = b.insert_value(result, cloned, i)
+                b.store(cloned, dst_field_ptr)
                 continue
             # Scalars, pointers, wedges: copy by value.
-            result = b.insert_value(result, field_val, i)
-        b.ret(result)
+            b.store(field_val, dst_field_ptr)
+        if dst_pushed:
+            b.call(self._get_gc_pop_roots(), [ir.Constant(I64, 1)])
+        b.ret(b.load(dst_slot))
+        self._cleanup_frames = saved_frames
+        self._gc_root_counts = saved_counts
+        self._in_helper_emission = saved_helper
+        self.builder = saved_builder
         return fn
 
     def _get_seal_release(self, seal_ty: ir.Type) -> ir.Function:
@@ -2748,6 +3031,30 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         # Start with a scalar copy — covers the tag + any scalar payload
         # bytes. Deep-cloned fields overwrite on top.
         b.store(src_arg, dst_slot)
+        # Root dst so cleanup-bearing fields stay reachable across any
+        # GC that fires during subsequent field clones. One root, one
+        # pop at the single merge ret. Helper-fn body emission suppresses
+        # the deep_clone chokepoint (see `_in_helper_emission`) so no
+        # extra pushes leak through branch-divergent paths.
+        saved_frames = self._cleanup_frames
+        saved_counts = self._gc_root_counts
+        saved_helper = getattr(self, "_in_helper_emission", False)
+        saved_builder = self.builder
+        self._cleanup_frames = [[]]
+        self._gc_root_counts = [0]
+        self._in_helper_emission = True
+        self.builder = b
+        dst_desc = self._get_type_desc(seal_ty)
+        dst_pushed = False
+        if dst_desc is not None:
+            b.call(
+                self._get_gc_push_root(),
+                [
+                    b.bitcast(dst_slot, I8.as_pointer()),
+                    b.bitcast(dst_desc, I8.as_pointer()),
+                ],
+            )
+            dst_pushed = True
 
         seal_key = self._seal_key_for_ty(seal_ty)
         variants = self._seal_variants[seal_key]
@@ -2805,7 +3112,13 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             b.branch(merge)
 
         b.position_at_end(merge)
+        if dst_pushed:
+            b.call(self._get_gc_pop_roots(), [ir.Constant(I64, 1)])
         b.ret(b.load(dst_slot))
+        self._cleanup_frames = saved_frames
+        self._gc_root_counts = saved_counts
+        self._in_helper_emission = saved_helper
+        self.builder = saved_builder
         return fn
 
     def _field_needs_cleanup(self, fty: ir.Type) -> bool:
@@ -2867,29 +3180,25 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         )
         self._register_gc_root(slot, val.type)
 
-    def _root_rvalue_for_gc(self, val: ir.Value, src: A.Expr) -> None:
-        """Generalization of `_register_str_rvalue_cleanup` to ANY
-        cleanup-bearing rvalue. Spills the SSA value to a stack slot
-        and pushes it onto the GC shadow stack so subsequent
-        allocations in the enclosing expression can't reclaim it.
+    def _force_root_cleanup_value(self, val: ir.Value) -> ir.Value:
+        """Chokepoint primitive. Unconditionally spill+root a
+        cleanup-bearing rvalue — used at PRODUCTION sites (Call /
+        Binary str-concat / Copy) so consumers don't need to re-root.
+        Returns `val` unchanged (the spill slot is a side channel
+        for the collector; the SSA register still feeds consumers).
 
-        Idents / Fields / Indexes / StringLits are intentionally
-        skipped — those read an alias into storage someone else
-        owns, and that owner's root (or the source struct's trace)
-        covers reachability. Only fresh-rvalue producers (Call,
-        Binary, StructLit, TabletsLit, variant Call, Copy, etc.)
-        need the spill.
-
-        Release-cleanup is also registered, mirroring the str path,
-        so the normal scope-exit release runs (no-op under GC, but
-        preserved for the transitional window when some paths may
-        still be libc-backed)."""
+        Scalars and non-traceable types pass through untouched —
+        there's nothing for the collector to trace. Helper-fn body
+        emission (clone/release/trace) sets `_in_helper_emission`
+        so clone results don't pollute the outer caller's cleanup
+        frame — the helper roots its own dst slot at entry to keep
+        sequential field clones alive across reallocs."""
+        if getattr(self, "_in_helper_emission", False):
+            return val
         if not self._cleanup_frames:
-            return
-        if isinstance(src, (A.Ident, A.Field, A.Index, A.StringLit)):
-            return
+            return val
         if self._type_desc_key(val.type) is None:
-            return
+            return val
         assert self.builder is not None
         slot = self._alloca_entry(val.type, ".rvalue.root")
         self.builder.store(val, slot)
@@ -2919,6 +3228,18 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 (release, slot, ".rvalue.root"),
             )
         self._register_gc_root(slot, val.type)
+        return val
+
+    def _root_rvalue_for_gc(self, val: ir.Value, src: A.Expr) -> None:
+        """DEPRECATED — consumer-site rooting. Delegates to the
+        chokepoint primitive, skipping aliased sources (Idents,
+        Fields, Indexes, StringLits) whose owners already provide
+        reachability. New code should call `_force_root_cleanup_value`
+        directly at producer sites; this shim is kept only while the
+        existing consumer-site call sites are being unwound."""
+        if isinstance(src, (A.Ident, A.Field, A.Index, A.StringLit)):
+            return
+        self._force_root_cleanup_value(val)
 
     def _gen_assign(self, a: A.Assign) -> None:
         assert self.builder is not None
@@ -3088,11 +3409,18 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
     def _gen_expr(self, e: A.Expr) -> ir.Value | None:
         """Generate code for an expression. Returns None if the expression
         diverges (e.g. a block where all paths yield) or has no value (e.g.
-        an `if` without `else`, which produces unit)."""
+        an `if` without `else`, which produces unit).
+
+        Every cleanup-bearing result is funneled through the chokepoint
+        at the bottom — one site covers Call, Binary, Copy, Index, Field
+        reads, Cast, and anything else that might yield a GC-tracked
+        value. The chokepoint no-ops on scalars / pointers / types
+        without a descriptor, so over-rooting is cheap."""
         line = getattr(e, "line", 0)
         col = getattr(e, "col", 0)
         if line:
             self._current_loc = (line, col)
+        val: ir.Value | None
         if isinstance(e, A.IntLit):
             return ir.Constant(I64, e.value)
         if isinstance(e, A.CharLit):
@@ -3100,47 +3428,48 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         if isinstance(e, A.BoolLit):
             return ir.Constant(I1, 1 if e.value else 0)
         if isinstance(e, A.LostLit):
-            # Lowered as a typed-but-generic null — an `i8*` null that
-            # `_coerce` bitcasts to the actual `tablet T` pointer type
-            # at every use site.
             return ir.Constant(I8.as_pointer(), None)
         if isinstance(e, A.StringLit):
             return self._gen_string_lit(e.value)
         if isinstance(e, A.SexLit):
             return self._gen_sex_lit(e)
         if isinstance(e, A.StructLit):
-            return self._gen_struct_lit(e)
-        if isinstance(e, A.TabletsLit):
-            return self._gen_tablets_lit(e)
-        if isinstance(e, A.Field):
-            return self._gen_field(e)
-        if isinstance(e, A.Index):
-            return self._gen_index(e)
-        if isinstance(e, A.Slice):
-            return self._gen_slice(e)
-        if isinstance(e, A.Ident):
-            return self._gen_ident(e)
-        if isinstance(e, A.Block):
-            return self._gen_block(e)
-        if isinstance(e, A.IfExpr):
-            return self._gen_if_expr(e)
-        if isinstance(e, A.Unary):
-            return self._gen_unary(e)
-        if isinstance(e, A.Binary):
-            return self._gen_binary(e)
-        if isinstance(e, A.Call):
-            return self._gen_call(e)
-        if isinstance(e, A.Cast):
+            val = self._gen_struct_lit(e)
+        elif isinstance(e, A.TabletsLit):
+            val = self._gen_tablets_lit(e)
+        elif isinstance(e, A.Field):
+            val = self._gen_field(e)
+        elif isinstance(e, A.Index):
+            val = self._gen_index(e)
+        elif isinstance(e, A.Slice):
+            val = self._gen_slice(e)
+        elif isinstance(e, A.Ident):
+            val = self._gen_ident(e)
+        elif isinstance(e, A.Block):
+            val = self._gen_block(e)
+        elif isinstance(e, A.IfExpr):
+            val = self._gen_if_expr(e)
+        elif isinstance(e, A.Unary):
+            val = self._gen_unary(e)
+        elif isinstance(e, A.Binary):
+            val = self._gen_binary(e)
+        elif isinstance(e, A.Call):
+            val = self._gen_call(e)
+        elif isinstance(e, A.Cast):
             value = self._gen_expr(e.value)
             if value is None:
                 raise CodegenError("cannot cast a diverging expression")
             target = self._lower_type(e.type)
-            return self._coerce(value, target)
-        if isinstance(e, A.Copy):
-            return self._gen_copy(e)
-        if isinstance(e, A.MatchExpr):
-            return self._gen_match(e)
-        raise CodegenError(f"expression not supported yet: {type(e).__name__}")
+            val = self._coerce(value, target)
+        elif isinstance(e, A.Copy):
+            val = self._gen_copy(e)
+        elif isinstance(e, A.MatchExpr):
+            val = self._gen_match(e)
+        else:
+            raise CodegenError(f"expression not supported yet: {type(e).__name__}")
+        if val is not None:
+            self._force_root_cleanup_value(val)
+        return val
 
     def _gen_copy(self, e: A.Copy) -> ir.Value | None:
         """`copy x` → deep-clone of x. Scalars and handles pass through
@@ -3180,21 +3509,49 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         else_bb = fn.append_basic_block("if.else")
         self.builder.cbranch(cond, then_bb, else_bb)
 
+        # Counter snapshot so arm-internal chokepoint pushes land the
+        # same delta on both paths. Without this, then+else compile-
+        # time counters both add to the outer frame, but runtime runs
+        # one arm — pop at merge would underflow. We emit a balancing
+        # pop before each arm's branch to merge and re-push once
+        # after the phi so the outer counter advances by exactly one
+        # regardless of which arm executes.
+        counter_before = (
+            self._gc_root_counts[-1] if self._gc_root_counts else 0
+        )
+
         self.builder.position_at_end(then_bb)
         then_val = self._gen_expr(e.then)
         then_end = self.builder.block
-        # Snapshot whether the arm diverged BEFORE we insert the fall-through
-        # branch to merge (which itself is a terminator).
         then_diverged = then_end.is_terminated
         if not then_diverged:
+            then_delta = (
+                (self._gc_root_counts[-1] - counter_before)
+                if self._gc_root_counts else 0
+            )
+            if then_delta > 0:
+                self._emit_gc_pop_roots(then_delta)
             self.builder.branch(merge_bb)
+        # Reset the Python counter so the else arm starts at the same
+        # baseline as the then arm did. Otherwise else_val's chokepoint
+        # would stack on top of then's accumulated push count.
+        if self._gc_root_counts:
+            self._gc_root_counts[-1] = counter_before
 
         self.builder.position_at_end(else_bb)
         else_val = self._gen_expr(e.else_)
         else_end = self.builder.block
         else_diverged = else_end.is_terminated
         if not else_diverged:
+            else_delta = (
+                (self._gc_root_counts[-1] - counter_before)
+                if self._gc_root_counts else 0
+            )
+            if else_delta > 0:
+                self._emit_gc_pop_roots(else_delta)
             self.builder.branch(merge_bb)
+        if self._gc_root_counts:
+            self._gc_root_counts[-1] = counter_before
 
         self.builder.position_at_end(merge_bb)
 
@@ -3347,19 +3704,22 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             return True
         return False
 
-    def _transfer_cleanup_into_container(self, name: str) -> bool:
+    def _transfer_cleanup_into_container(
+        self, name: str, *, defer_zero: bool = False,
+    ) -> "ir.Value | bool":
         """Remove the cleanup entry owning `name` — its value is
         flowing into a long-lived container (tablets push, struct-lit
         field bound for push, etc.) which takes over ownership. Walks
         `transfer_on_tail` chains so borrow bindings redirect to their
-        true owners. Returns True if a transfer happened.
+        true owners.
 
-        Zero-inits the source alloca after a successful transfer so a
-        later reassignment's old-slot release, an explicit `release`,
-        or any other release path is a no-op. Without this, the source
-        slot still points at the transferred heap bytes and a second
-        release on the same buffer would double-free (caught by the
-        reassign-after-push shape)."""
+        Default: zero-inits the source alloca and returns True. With
+        `defer_zero=True`, returns the source slot without zeroing
+        so the caller can zero AFTER an intermediate op that must
+        still see live chunks (e.g. tablets.push allocates a chunk
+        before storing the value; zeroing first would strand the
+        chunks from GC reachability through the shadow stack).
+        Returns False if no cleanup entry was found."""
         if not self._cleanup_frames:
             return False
         try:
@@ -3369,14 +3729,17 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         entry_name = (
             var.transfer_on_tail if var.transfer_on_tail else name
         )
-        # Search all frames — the owning binding may live in an
-        # outer scope (e.g. closed-over Idents that aren't in the
-        # innermost frame).
-        for frame in self._cleanup_frames:
+        # Innermost-first: with variable shadowing (inner scope
+        # re-binds `x`), `_lookup` returns the inner, so cleanup
+        # eviction should also target the inner frame's entry.
+        # Matches `_gen_release`'s walk order.
+        for frame in reversed(self._cleanup_frames):
             for i, (_fn, _ptr, fname) in enumerate(frame):
                 if fname == entry_name:
                     slot = _ptr
                     frame.pop(i)
+                    if defer_zero:
+                        return slot
                     self._zero_transferred_slot(slot)
                     return True
         return False

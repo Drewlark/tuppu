@@ -36,21 +36,26 @@ class TabletsMixin:
             # source — Field/Index/StringLit, or an Ident naming a
             # borrow binding). The three-way split keeps
             # push(fresh_call()) as a single malloc.
+            deferred_slot: ir.Value | None = None
             if self._is_cleanup_bearing_ty(info.elem_ty):
                 if isinstance(arg_expr, A.Ident):
-                    transferred = self._transfer_cleanup_into_container(
-                        arg_expr.name,
+                    # Defer zero so the source slot still reaches the
+                    # element chunks through GC during push's chunk
+                    # allocation. We zero after push returns.
+                    res = self._transfer_cleanup_into_container(
+                        arg_expr.name, defer_zero=True,
                     )
-                    if not transferred:
-                        # Ident with no transferable cleanup = borrow.
+                    if res is False:
                         val = self._deep_clone_if_cleanup_bearing(val)
+                    else:
+                        deferred_slot = res  # type: ignore[assignment]
                 elif self._is_borrow_source_expr(arg_expr):
                     val = self._deep_clone_if_cleanup_bearing(val)
                 # else: fresh-owned rvalue, transfer by default.
-            # Push returns a pointer to the just-written slot — this is
-            # the `tablet T` handle the user sees. Callers in statement
-            # position ignore it.
-            return self.builder.call(info.push, [ptr, val])
+            pushed = self.builder.call(info.push, [ptr, val])
+            if deferred_slot is not None:
+                self._zero_transferred_slot(deferred_slot)
+            return pushed
         raise CodegenError(f"tablets has no method {method!r}")
 
     def _gen_tablets_field(self, var: Variable, field_name: str) -> ir.Value:
@@ -501,6 +506,36 @@ class TabletsMixin:
         # this fn; we load-and-return it at the end.
         dest_slot = b.alloca(tablets_ty, name="dest")
         b.store(ir.Constant(tablets_ty, None), dest_slot)
+        # Per-iteration spill slot for the cloned element, hoisted
+        # to entry so the loop body reuses one alloca instead of
+        # growing the stack each iteration.
+        elem_desc = self._get_type_desc(elem_ty)
+        elem_spill: ir.Value | None = None
+        if elem_desc is not None:
+            elem_spill = b.alloca(elem_ty, name=".elem.spill")
+        # Helper-fn body emission: isolate from caller's cleanup state
+        # so deep_clone's chokepoint doesn't pollute the caller. Root
+        # dest_slot so accumulated element clones stay reachable if a
+        # later alloc triggers GC. Paired pop emitted at `done`.
+        saved_frames = self._cleanup_frames
+        saved_counts = self._gc_root_counts
+        saved_helper = getattr(self, "_in_helper_emission", False)
+        saved_builder = self.builder
+        self._cleanup_frames = [[]]
+        self._gc_root_counts = [0]
+        self._in_helper_emission = True
+        self.builder = b
+        dest_desc = self._get_type_desc(tablets_ty)
+        dest_pushed = False
+        if dest_desc is not None:
+            b.call(
+                self._get_gc_push_root(),
+                [
+                    b.bitcast(dest_slot, I8.as_pointer()),
+                    b.bitcast(dest_desc, I8.as_pointer()),
+                ],
+            )
+            dest_pushed = True
         head = b.load(b.gep(src_ptr, [ZERO_I32, ZERO_I32], inbounds=True))
         b.branch(chunks)
 
@@ -527,15 +562,30 @@ class TabletsMixin:
             cur_phi, [ZERO_I32, ZERO_I32, i_phi], inbounds=True,
         )
         elem = b.load(slot_ptr)
-        # Save builder so _deep_clone_if_cleanup_bearing sees this
-        # function's context while it emits the clone call.
         saved = self.builder
         self.builder = b
         try:
             cloned = self._deep_clone_if_cleanup_bearing(elem)
         finally:
             self.builder = saved
+        # Protect the cloned element across push's internal chunk
+        # allocation. Without this root, a stress-mode collect fired
+        # inside push would reclaim the freshly cloned bytes before
+        # the dest chunk holds them. Popped immediately after push
+        # returns so the loop-iteration push/pop pair balances.
+        if elem_spill is not None:
+            b.store(cloned, elem_spill)
+            b.call(
+                self._get_gc_push_root(),
+                [
+                    b.bitcast(elem_spill, I8.as_pointer()),
+                    b.bitcast(elem_desc, I8.as_pointer()),
+                ],
+            )
+            cloned = b.load(elem_spill)
         b.call(push, [dest_slot, cloned])
+        if elem_spill is not None:
+            b.call(self._get_gc_pop_roots(), [ir.Constant(I64, 1)])
         i_next = b.add(i_phi, ir.Constant(I64, 1))
         i_phi.add_incoming(i_next, b.block)
         b.branch(slots)
@@ -548,7 +598,13 @@ class TabletsMixin:
         b.branch(chunks)
 
         b.position_at_end(done)
+        if dest_pushed:
+            b.call(self._get_gc_pop_roots(), [ir.Constant(I64, 1)])
         b.ret(b.load(dest_slot))
+        self._cleanup_frames = saved_frames
+        self._gc_root_counts = saved_counts
+        self._in_helper_emission = saved_helper
+        self.builder = saved_builder
         return fn
 
     def _element_release_fn(self, elem_ty: ir.Type) -> "ir.Function | None":
