@@ -285,6 +285,61 @@ def test_match_scrutinee_must_be_seal(tmp_path):
         compile_to_ir(src)
 
 
+def test_variant_ctor_transfers_ownership_from_ident(tmp_path):
+    # `Ok(s)` where `s` is an owned str binding must take over s's
+    # cleanup — otherwise s's scope-exit release frees the bytes that
+    # now live in the seal payload, and the caller reads garbage.
+    # Surfaced by buffer_to_str flowing through two fn boundaries:
+    # build() -> str; wrap() wraps in Ok; main() matches + prints.
+    src = (
+        "seal Result { Ok(str), Err(str) }\n"
+        "fn build() -> str {\n"
+        "  mut buf: buffer[16]u8\n"
+        "  buf[0] = 104 as u8\n"
+        "  buf[1] = 105 as u8\n"
+        "  buffer_to_str(buf, 2)\n"
+        "}\n"
+        "fn wrap() -> Result {\n"
+        "  step s = build()\n"
+        "  Ok(s)\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  match wrap() {\n"
+        "    Ok(s) => println(s),\n"
+        "    Err(e) => println(e),\n"
+        "  }\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out, _ = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hi\n"
+
+
+def test_variant_ctor_deep_clones_borrow_str(tmp_path):
+    # `Ok(p)` where `p` borrows into a container must deep-clone so
+    # releasing the container doesn't dangle the seal's payload.
+    src = (
+        "seal Holder { Some(str) }\n"
+        "fn wrap(store: tablets[4]str) -> Holder {\n"
+        "  Some(store[0])\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  mut store: tablets[4]str\n"
+        "  step _x = store.push(\"ab\" + \"cd\")\n"
+        "  step h = wrap(store)\n"
+        "  release store\n"
+        "  match h {\n"
+        "    Some(s) => println(s),\n"
+        "  }\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out, _ = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"abcd\n"
+
+
 def test_recursive_seal_via_tablet_wrapper(tmp_path):
     src = (
         "tablet N { e: E }\n"

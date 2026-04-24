@@ -1210,12 +1210,27 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                     raise CodegenError(
                         f"variant {variant_name!r} arg {i} has no value"
                     )
+                coerced = self._coerce(v, expected_ty)
+                # Variant payload is a long-lived container — same
+                # transfer-or-clone discipline as push / struct-lit /
+                # assign. Without this, `Ok(owned_str)` stores the
+                # ptr but the Ident's scope-exit release fires at
+                # the enclosing fn, leaving the returned seal with
+                # a dangling payload.
+                if self._is_cleanup_bearing_ty(expected_ty):
+                    transferred = False
+                    if isinstance(arg, A.Ident):
+                        transferred = self._transfer_cleanup_into_container(
+                            arg.name,
+                        )
+                    if not transferred:
+                        coerced = self._deep_clone_if_cleanup_bearing(coerced)
                 field_ptr = self.builder.gep(
                     typed_ptr,
                     [ir.Constant(I32, 0), ir.Constant(I32, i)],
                     inbounds=True,
                 )
-                self.builder.store(self._coerce(v, expected_ty), field_ptr)
+                self.builder.store(coerced, field_ptr)
         return self.builder.load(slot)
 
     def _seal_payload_ptr(self, slot: ir.Value) -> ir.Value:
