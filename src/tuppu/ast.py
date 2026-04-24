@@ -235,6 +235,17 @@ class Cast:
     col:  int = _pos()
 
 @dataclass
+class Copy:
+    """`copy expr` — deep-clones a cleanup-bearing value into independent
+    ownership. Typechecks as `T -> T` on any cleanup-bearing type; lowers
+    to the same `_deep_clone_if_cleanup_bearing` the codegen already uses
+    for return/push/assign paths, with an rvalue cleanup registered at
+    the consumer site."""
+    value: "Expr"
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
 class StructLit:
     """A struct literal: `Point { x: 3, y: 4 }`. Fields are stored in parse
     order; the type checker reconciles them against the declaration."""
@@ -314,7 +325,7 @@ class MatchExpr:
 
 Expr = Union[
     IntLit, SexLit, StringLit, CharLit, BoolLit, LostLit, Ident,
-    Unary, Binary, Call, Index, Slice, Field, Cast, StructLit,
+    Unary, Binary, Call, Index, Slice, Field, Cast, Copy, StructLit,
     TabletsLit, Block, IfExpr, MatchExpr,
 ]
 

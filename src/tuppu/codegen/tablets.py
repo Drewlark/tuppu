@@ -30,18 +30,23 @@ class TabletsMixin:
             val = self._coerce(val, info.elem_ty)
             # Container ownership: a cleanup-bearing value going into
             # the container either transfers from its current owner
-            # (single-owner discipline; no clone) or gets deep-cloned
-            # (source is a borrow / rvalue-we-don't-own — the container
-            # needs fresh bytes so it can release safely without
-            # dangling when the source's lifetime ends).
+            # (owning Ident → remove cleanup), passes through as a
+            # fresh-owned rvalue (Call / Copy / StructLit — nobody
+            # else aliases it), or gets deep-cloned (any borrow
+            # source — Field/Index/StringLit, or an Ident naming a
+            # borrow binding). The three-way split keeps
+            # push(fresh_call()) as a single malloc.
             if self._is_cleanup_bearing_ty(info.elem_ty):
-                transferred = False
                 if isinstance(arg_expr, A.Ident):
                     transferred = self._transfer_cleanup_into_container(
                         arg_expr.name,
                     )
-                if not transferred:
+                    if not transferred:
+                        # Ident with no transferable cleanup = borrow.
+                        val = self._deep_clone_if_cleanup_bearing(val)
+                elif self._is_borrow_source_expr(arg_expr):
                     val = self._deep_clone_if_cleanup_bearing(val)
+                # else: fresh-owned rvalue, transfer by default.
             # Push returns a pointer to the just-written slot — this is
             # the `tablet T` handle the user sees. Callers in statement
             # position ignore it.

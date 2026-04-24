@@ -492,6 +492,133 @@ def test_seal_deep_clone_from_borrow(tmp_path):
     assert out == b"alice\n"
 
 
+# --- copy keyword -----------------------------------------------------
+
+def test_copy_breaks_borrow_aliasing(tmp_path):
+    # `copy name` on a match binder produces a freshly-owned str so
+    # later mutation of the scrutinee's source (p_bump) can't reach
+    # the cloned bytes. This is the intended use of `copy` under the
+    # freeze-while-borrow rule.
+    src = (
+        "seal Tok { Ident(str), EOF }\n"
+        "tablet Parser { cur: Tok }\n"
+        "fn p_bump(mut p: Parser) {\n"
+        "  p.cur = EOF\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  mut p: Parser = Parser { cur: Ident(\"hel\" + \"lo\") }\n"
+        "  match p.cur {\n"
+        "    Ident(name) => {\n"
+        "      step n = copy name\n"
+        "      p_bump(p)\n"
+        "      println(n)\n"
+        "    },\n"
+        "    EOF => println(\"eof\"),\n"
+        "  }\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello\n"
+
+
+def test_copy_scalar_is_noop(tmp_path):
+    # `copy` on a plain int is harmless — lowers through a no-op in
+    # _deep_clone_if_cleanup_bearing.
+    src = (
+        "fn main() -> i32 {\n"
+        "  step x: i64 = 42\n"
+        "  step y = copy x\n"
+        "  println(y)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"42\n"
+
+
+def test_copy_allows_safe_push_into_other_container(tmp_path):
+    # `copy` lets a borrow into one container be safely pushed into
+    # another. After release of the source, the destination still
+    # reads the cloned bytes.
+    src = (
+        "fn main() -> i32 {\n"
+        "  mut a: tablets[4]str\n"
+        "  mut b: tablets[4]str\n"
+        "  step _x = a.push(\"ab\" + \"cd\")\n"
+        "  step p = a[0]\n"
+        "  step _y = b.push(copy p)\n"
+        "  release a\n"
+        "  println(b[0])\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"abcd\n"
+
+
+# --- fresh-rvalue transfer optimization -------------------------------
+
+def test_push_call_result_is_single_malloc(tmp_path):
+    # `push(fn())` where fn returns a heap str should NOT double-
+    # clone — the Call result is a fresh-owned rvalue that transfers
+    # into the container. A missing optimization showed up as a 10x
+    # peak memory bump on loops of 100k pushes.
+    from tuppu.driver import compile_to_ir
+    src = (
+        "fn make() -> str { \"ab\" + \"cd\" }\n"
+        "fn main() -> i32 {\n"
+        "  mut t: tablets[4]str\n"
+        "  step _x = t.push(make())\n"
+        "  0\n"
+        "}\n"
+    )
+    ir = compile_to_ir(src)
+    # Exactly one str_concat (from the "ab" + "cd" inside make),
+    # zero str_clones in main — the Call result transfers directly.
+    main_start = ir.find("define i32 @\"main\"")
+    main_end = ir.find("define ", main_start + 1)
+    main_body = ir[main_start:main_end if main_end > 0 else len(ir)]
+    assert "str_clone" not in main_body, main_body
+
+
+def test_structlit_call_result_is_single_malloc(tmp_path):
+    # Same optimization at the struct-lit field init site.
+    from tuppu.driver import compile_to_ir
+    src = (
+        "fn make() -> str { \"ab\" + \"cd\" }\n"
+        "tablet Box { s: str }\n"
+        "fn main() -> i32 {\n"
+        "  step b = Box { s: make() }\n"
+        "  0\n"
+        "}\n"
+    )
+    ir = compile_to_ir(src)
+    main_start = ir.find("define i32 @\"main\"")
+    main_end = ir.find("define ", main_start + 1)
+    main_body = ir[main_start:main_end if main_end > 0 else len(ir)]
+    assert "str_clone" not in main_body, main_body
+
+
+def test_variant_ctor_call_result_is_single_malloc(tmp_path):
+    # Same at the variant-ctor payload site.
+    from tuppu.driver import compile_to_ir
+    src = (
+        "seal R { Ok(str), Err(str) }\n"
+        "fn make() -> str { \"ab\" + \"cd\" }\n"
+        "fn wrap() -> R { Ok(make()) }\n"
+        "fn main() -> i32 { 0 }\n"
+    )
+    ir = compile_to_ir(src)
+    wrap_start = ir.find("define %\"R\" @\"wrap\"")
+    wrap_end = ir.find("define ", wrap_start + 1)
+    wrap_body = ir[wrap_start:wrap_end if wrap_end > 0 else len(ir)]
+    assert "str_clone" not in wrap_body, wrap_body
+
+
 def test_seal_pure_enum_no_release_fn(tmp_path):
     # A seal with only nullary / scalar-payload variants should NOT
     # get a release fn — _seal_needs_cleanup returns False and no IR

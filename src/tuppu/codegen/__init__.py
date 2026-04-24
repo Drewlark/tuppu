@@ -1216,19 +1216,19 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                         f"variant {variant_name!r} arg {i} has no value"
                     )
                 coerced = self._coerce(v, expected_ty)
-                # Variant payload is a long-lived container — same
-                # transfer-or-clone discipline as push / struct-lit /
-                # assign. Without this, `Ok(owned_str)` stores the
-                # ptr but the Ident's scope-exit release fires at
-                # the enclosing fn, leaving the returned seal with
-                # a dangling payload.
+                # Variant payload is a long-lived container: same
+                # three-way split as push / struct-lit / assign.
+                # Owning Ident transfers; fresh-owned rvalue passes
+                # through; borrow (or Ident naming a borrow) gets
+                # deep-cloned.
                 if self._is_cleanup_bearing_ty(expected_ty):
-                    transferred = False
                     if isinstance(arg, A.Ident):
                         transferred = self._transfer_cleanup_into_container(
                             arg.name,
                         )
-                    if not transferred:
+                        if not transferred:
+                            coerced = self._deep_clone_if_cleanup_bearing(coerced)
+                    elif self._is_borrow_source_expr(arg):
                         coerced = self._deep_clone_if_cleanup_bearing(coerced)
                 field_ptr = self.builder.gep(
                     typed_ptr,
@@ -2497,17 +2497,19 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 self.builder.call(
                     self._get_seal_release(slot_ty), [slot_ptr],
                 )
-        # Ownership into the slot: transfer from an owning Ident or
-        # deep-clone a borrow so the slot's release doesn't double-
-        # free against the source. Matches push / struct-lit shape.
+        # Ownership into the slot: three-way split matching push /
+        # struct-lit. Owning Ident transfers its cleanup; a fresh-
+        # owned rvalue passes through unchanged (no wasted clone);
+        # borrow source (or Ident naming a borrow) gets a deep-clone.
         coerced = self._coerce(value, slot_ty)
         if self._is_cleanup_bearing_ty(slot_ty):
-            transferred = False
             if isinstance(a.value, A.Ident):
                 transferred = self._transfer_cleanup_into_container(
                     a.value.name,
                 )
-            if not transferred:
+                if not transferred:
+                    coerced = self._deep_clone_if_cleanup_bearing(coerced)
+            elif self._is_borrow_source_expr(a.value):
                 coerced = self._deep_clone_if_cleanup_bearing(coerced)
         self.builder.store(coerced, slot_ptr)
 
@@ -2677,9 +2679,24 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 raise CodegenError("cannot cast a diverging expression")
             target = self._lower_type(e.type)
             return self._coerce(value, target)
+        if isinstance(e, A.Copy):
+            return self._gen_copy(e)
         if isinstance(e, A.MatchExpr):
             return self._gen_match(e)
         raise CodegenError(f"expression not supported yet: {type(e).__name__}")
+
+    def _gen_copy(self, e: A.Copy) -> ir.Value | None:
+        """`copy x` → deep-clone of x. Scalars and handles pass through
+        unchanged (no-op). The result is a freshly-owned rvalue; its
+        cleanup is managed by the consumer — `step n = copy x` gets
+        cleanup on the binding slot, `container.push(copy x)` transfers
+        into the container, and so on. This matches how other fresh-
+        rvalue paths (Call results, str concat, etc.) flow through the
+        consumer-registers-cleanup discipline."""
+        val = self._gen_expr(e.value)
+        if val is None:
+            raise CodegenError("cannot copy a diverging expression")
+        return self._deep_clone_if_cleanup_bearing(val)
 
     def _gen_if_expr(self, e: A.IfExpr) -> ir.Value | None:
         assert self.builder is not None
@@ -2841,6 +2858,16 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         finally:
             self.scopes.pop()
             self._cleanup_frames.pop()
+
+    def _is_borrow_source_expr(self, expr: "A.Expr") -> bool:
+        """Does this AST expression read through to bytes someone else
+        owns? Ident (may be a borrow binding), Field, Index, match
+        pattern binders (bound as Ident), and StringLit all alias into
+        existing storage. Everything else — Call, Binary(str+), Copy,
+        StructLit, TabletsLit, variant construction via Call, Slice,
+        Cast — produces a fresh-owned rvalue that storage sites can
+        take over directly without cloning."""
+        return isinstance(expr, (A.Ident, A.Field, A.Index, A.StringLit))
 
     def _is_cleanup_bearing_ty(self, ty: ir.Type) -> bool:
         """Does this LLVM type hold heap state that needs a release
@@ -3835,19 +3862,20 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 raise CodegenError(
                     f"tablet {e.name!r} field {fname!r}: initializer has no value"
                 )
-            # Ownership: cleanup-bearing fields take over their source's
-            # cleanup (if the initializer is an owning Ident) or get a
-            # deep-clone of the value (if the source is a borrow /
-            # rvalue with no transferable cleanup). Keeps the new
-            # struct as sole owner of its heap bytes so a later
-            # release walk is safe.
+            # Ownership into the field: transfer from an owning Ident,
+            # pass through a fresh-owned rvalue unchanged, or deep-
+            # clone a borrow source (alias into existing storage, or
+            # an Ident naming a borrow binding with no cleanup to
+            # transfer). Three-way split avoids the redundant clone
+            # that `Box { s: make() }` used to perform.
             if self._is_cleanup_bearing_ty(fty):
-                transferred = False
                 if isinstance(fexpr, A.Ident):
                     transferred = self._transfer_cleanup_into_container(
                         fexpr.name,
                     )
-                if not transferred:
+                    if not transferred:
+                        fv = self._deep_clone_if_cleanup_bearing(fv)
+                elif self._is_borrow_source_expr(fexpr):
                     fv = self._deep_clone_if_cleanup_bearing(fv)
             value = self.builder.insert_value(value, self._coerce(fv, fty), i)
         return value

@@ -51,6 +51,7 @@ class Tok(Enum):
     LOST = auto()
     COLOPHON = auto()    # reserved; no semantics yet (see NEXT.md)
     GLOSS = auto()       # emitted by `gloss` keyword — operator overload decl
+    COPY = auto()        # emitted by `copy` keyword — deep-clone prefix op
 
     # type keywords (value: str — "i64", "bool", etc.)
     TYPE_KW = auto()
@@ -139,6 +140,12 @@ KEYWORDS: dict[str, Tok] = {
     # for user types, mirroring the ancient scribal practice of
     # writing a gloss above a word to explain its reading.
     "gloss": Tok.GLOSS,
+    # `copy x` deep-clones a cleanup-bearing value into independent
+    # ownership. Assyriological use: archival scribes made "copies" of
+    # originals. Syntactic escape hatch under the freeze-while-borrow
+    # rule — when a borrow would cross a mut-reaching call, `copy`
+    # makes the cost visible in source.
+    "copy": Tok.COPY,
     "true": Tok.TRUE,
     "false": Tok.FALSE,
 }

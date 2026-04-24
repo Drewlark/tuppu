@@ -578,6 +578,13 @@ class Parser:
             e = self.parse_expr()
             self.eat(Tok.RPAREN)
             return e
+        if t.kind is Tok.COPY:
+            # `copy expr` — deep-clone prefix. Binds tight like unary
+            # so `copy name.field` and `copy arr[i]` parse as the
+            # clone of the accessed value, not a clone of the root.
+            self.advance()
+            operand = self.parse_expr(min_prec=8)
+            return _at(t, A.Copy(value=operand))
         if t.kind is Tok.MINUS or t.kind is Tok.BANG:
             op = "-" if t.kind is Tok.MINUS else "!"
             self.advance()

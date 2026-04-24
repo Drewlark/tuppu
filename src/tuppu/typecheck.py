@@ -1247,6 +1247,7 @@ class Checker:
         if isinstance(e, A.Index):     return self._tc_index(e)
         if isinstance(e, A.Slice):     return self._tc_slice(e)
         if isinstance(e, A.Cast):      return self._tc_cast(e)
+        if isinstance(e, A.Copy):      return self._tc_copy(e, expected)
         if isinstance(e, A.StructLit): return self._tc_struct_lit(e)
         if isinstance(e, A.TabletsLit): return self._tc_tablets_lit(e, expected)
         if isinstance(e, A.Block):     return self._tc_block(e, expected=expected)
@@ -2113,6 +2114,14 @@ class Checker:
                     e.line, e.col,
                 )
         return str_ty
+
+    def _tc_copy(self, e: A.Copy, expected: Ty | None = None) -> Ty:
+        """`copy x` has the same type as its operand. At codegen we
+        dispatch to `_deep_clone_if_cleanup_bearing`, which is a no-op
+        on scalars/handles/fn-pointers — so `copy` on a plain int is
+        harmless redundancy rather than an error. Future lint could
+        warn, but v0.1 stays permissive."""
+        return self._tc_expr(e.value, expected=expected)
 
     def _tc_cast(self, e: A.Cast) -> Ty:
         src = self._tc_expr(e.value)
