@@ -1349,18 +1349,21 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             # All arms diverged.
             self.builder.unreachable()
             return None
-        if all(r[0] is None for r in results):
+        # Treat void-typed arm values (e.g. a bare `noop()` call tail)
+        # as "no value" — LLVM doesn't allow a phi of void type, and
+        # the match is being consumed as a statement anyway. Equivalent
+        # to the unit-producing branches in a stmt-position if.
+        def _usable(v: ir.Value | None) -> bool:
+            return v is not None and not isinstance(v.type, ir.VoidType)
+        if not any(_usable(r[0]) for r in results):
             return None
-        # Find a non-None representative to pick the phi type.
-        rep = next((r for r in results if r[0] is not None), None)
-        if rep is None:
-            return None
+        rep = next(r for r in results if _usable(r[0]))
         phi = self.builder.phi(rep[0].type)
         for val, bb in results:
-            if val is None:
-                # Diverged arms don't contribute to the phi; but arms
-                # that produced unit in a unit-typed match shouldn't
-                # reach here in practice.
+            if not _usable(val):
+                # Diverged / unit / void arms don't contribute. Safe
+                # because the typechecker already rejects a match
+                # whose arms produce mismatched value types.
                 continue
             phi.add_incoming(val, bb)
         return phi

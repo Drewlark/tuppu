@@ -285,6 +285,62 @@ def test_match_scrutinee_must_be_seal(tmp_path):
         compile_to_ir(src)
 
 
+def test_match_stmt_arm_with_void_call_tail(tmp_path):
+    # match used as a statement (value discarded), one arm body ends
+    # in a void-returning call like `{ noop() }`. Codegen used to
+    # emit `phi void` at the merge block — LLVM rejects it (void
+    # types only allowed as fn returns). The fix normalizes void-
+    # typed arm values to "no value" so the phi is skipped entirely.
+    # Surfaced by the Lua parser's `match p.cur { TkRParen =>
+    # { p_bump(p) }, _ => {} }` consume-optional shape.
+    src = (
+        "seal T { A, B }\n"
+        "fn noop() {}\n"
+        "fn f(x: T) -> i64 {\n"
+        "  match x {\n"
+        "    A => { noop() },\n"
+        "    _ => {},\n"
+        "  }\n"
+        "  42\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  println(f(A))\n"
+        "  println(f(B))\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out, _ = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"42\n42\n"
+
+
+def test_match_stmt_multiple_void_call_arms(tmp_path):
+    # Mixed arms: void-call tail, empty body, another void-call tail.
+    # All should normalize to no-value; no phi construction.
+    src = (
+        "seal T { A, B, C }\n"
+        "fn noop1() {}\n"
+        "fn noop2() {}\n"
+        "fn f(x: T) -> i64 {\n"
+        "  match x {\n"
+        "    A => { noop1() },\n"
+        "    B => { noop2() },\n"
+        "    C => {},\n"
+        "  }\n"
+        "  7\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  println(f(A))\n"
+        "  println(f(B))\n"
+        "  println(f(C))\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out, _ = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"7\n7\n7\n"
+
+
 def test_variant_ctor_transfers_ownership_from_ident(tmp_path):
     # `Ok(s)` where `s` is an owned str binding must take over s's
     # cleanup — otherwise s's scope-exit release frees the bytes that
