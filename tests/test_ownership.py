@@ -821,6 +821,33 @@ def test_borrow_scoped_release_at_block_exit(tmp_path):
     assert out == b"hi!\n"
 
 
+def test_accumulator_pattern_no_false_positive(tmp_path):
+    # `mut result = p.lex; loop { result = updated }; use(result)` —
+    # the mut binding is initialized as a borrow of p, but the loop
+    # rebinds it to fresh-owned values. The rule must treat the
+    # rebind as moving `result` out of borrow state, otherwise the
+    # post-loop read would be incorrectly rejected. Community-
+    # reported false positive.
+    src = (
+        "tablet Lex { buf: str }\n"
+        "tablet P { lex: Lex }\n"
+        "fn main() -> i32 {\n"
+        "  mut p: P = P { lex: Lex { buf: \"\" } }\n"
+        "  mut result: Lex = p.lex\n"
+        "  mut i: i64 = 0\n"
+        "  while i < 3 {\n"
+        "    result = Lex { buf: result.buf + \"x\" }\n"
+        "    i = i + 1\n"
+        "  }\n"
+        "  println(result.buf)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"xxx\n"
+
+
 def test_mut_binding_borrow_chain_rejected(tmp_path):
     # Community-reported gap: `mut l: Lex = p.lex` makes l a borrow
     # of p's bytes. `advance(l)` (mut param) mutates l, which writes

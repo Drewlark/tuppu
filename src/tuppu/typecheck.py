@@ -375,6 +375,11 @@ class Checker:
         # is a use-after-free and gets rejected.
         self._local_tablets: set[str] = set()
         self._tainted: dict[str, bool] = {}
+        # Escape analysis: which names in scope are fn parameters
+        # (borrowing their bytes back out is fine — caller owns the
+        # storage). Anything else in scope is locally declared and
+        # cannot escape via return without an explicit `copy`.
+        self._fn_params: set[str] = set()
         # Freeze-while-borrow state. Per-scope, `_borrow_sources` maps
         # a borrow binding's name → its source root (the outermost
         # owning Ident whose mutation would invalidate the borrow).
@@ -1011,6 +1016,28 @@ class Checker:
         self._borrow_sources[-1][name] = root
         self._invalidated.discard(name)
 
+    def _is_borrow_binding(self, name: str) -> bool:
+        """Is `name` currently registered as a borrow in any live
+        scope? Used by assignment to distinguish rebinding a borrow
+        (no old heap freed) from overwriting an owning slot."""
+        return any(name in scope for scope in self._borrow_sources)
+
+    def _rebind_borrow(self, name: str, new_rhs: A.Expr) -> None:
+        """On assignment `name = new_rhs`, update `name`'s borrow
+        registration to match the RHS. Fresh-owner RHS turns `name`
+        into an owning binding; borrow-source RHS rebinds to the
+        new source. Clears any stale invalidation on `name` since
+        its underlying bytes are now fresh."""
+        # Drop the old registration from every live scope so re-
+        # registration works even if name was introduced in an outer
+        # block.
+        for scope in self._borrow_sources:
+            scope.pop(name, None)
+        self._invalidated.discard(name)
+        new_root = self._borrow_source_root(new_rhs)
+        if new_root is not None:
+            self._register_borrow(name, new_root)
+
     def _borrow_source_root(self, e: A.Expr) -> str | None:
         """Walk a borrow-source expression to its root Ident. Returns
         None for expressions that produce fresh ownership (Call,
@@ -1212,14 +1239,30 @@ class Checker:
             if self._expr_escapes(a.value):
                 self._tainted[a.target.name] = True
         # Freeze-while-borrow: assignment to a cleanup-bearing path
-        # invalidates every live borrow rooted at the path's base —
-        # the old heap contents get freed. Scalar / wedge / fn-pointer
-        # assignments (like `b.next = a` where `.next` is a wedge) do
-        # NOT free anything, so existing borrows stay valid.
-        if self._needs_borrow_tracking(target_ty):
+        # can free old heap and thus invalidate borrows rooted at
+        # the target's base. Two cases differ:
+        #
+        # - Ident target that was itself a borrow: rebinding doesn't
+        #   free the SOURCE's bytes (the slot only held a cap=0 view
+        #   whose release no-ops). No invalidation; instead, update
+        #   the target's borrow registration to match the new RHS —
+        #   fresh-owner RHS turns the target into an owning binding,
+        #   borrow RHS rebinds to the new source. This is what makes
+        #   the `mut result = p.lex; result = fresh` accumulator
+        #   pattern work.
+        #
+        # - Field / Index target, or Ident target that owned its
+        #   bytes: old heap IS freed, invalidate as before.
+        target_is_ident = isinstance(a.target, A.Ident)
+        target_was_borrow = target_is_ident and self._is_borrow_binding(
+            a.target.name,
+        )
+        if self._needs_borrow_tracking(target_ty) and not target_was_borrow:
             root = self._assign_target_root(a.target)
             if root is not None:
                 self._invalidate_root(root)
+        if target_is_ident and self._needs_borrow_tracking(target_ty):
+            self._rebind_borrow(a.target.name, a.value)
 
     def _invalidate_mut_call_args(
         self, fn_ty: "TyFn", args: list[A.Expr],
