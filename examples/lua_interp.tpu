@@ -1,0 +1,1529 @@
+// lua_parse.tpu — stage 2 of the Lua interpreter: parser + AST.
+//
+// Bundles stage 1's lexer in-file (single-file compile), adds AST
+// types, a recursive-descent parser with Pratt-style precedence
+// layering for expressions, and a pretty-printer that dumps the
+// parsed tree so we can verify by eye.
+//
+// Subset: nil/true/false, int + string literals, identifiers, unary
+// (- not #), binary (+ - * / % < > <= >= == ~= and or ..), parens,
+// function calls f(a,b,...), index t[e], field t.name.
+// Statements: assign, local, if/elseif/else, while, return,
+// expression-as-statement, function defs (global + local), block end
+// markers. No tables, no for loops, no method syntax yet — next turn.
+
+// ===================================================================
+// LEXER (identical to lua_lex.tpu)
+// ===================================================================
+
+seal Token {
+  TkInt(i64),
+  TkStr(str),
+  TkIdent(str),
+  TkAnd, TkBreak, TkDo, TkElse, TkElseif, TkEnd,
+  TkFalse, TkFor, TkFunction, TkGoto, TkIf, TkIn,
+  TkLocal, TkNil, TkNot, TkOr, TkRepeat,
+  TkReturn, TkThen, TkTrue, TkUntil, TkWhile,
+  TkLParen, TkRParen, TkLBrace, TkRBrace, TkLBracket, TkRBracket,
+  TkComma, TkSemi, TkColon, TkDoubleColon,
+  TkDot, TkDotDot, TkDotDotDot,
+  TkPlus, TkMinus, TkStar, TkSlash, TkSlashSlash,
+  TkPercent, TkCaret, TkHash,
+  TkAssign, TkEqEq, TkNotEq, TkLt, TkGt, TkLtEq, TkGtEq,
+  TkEof
+}
+
+tablet Lex { src: str, pos: i64 }
+
+fn peek(l: Lex) -> u8 {
+  if l.pos >= l.src.len { 0 as u8 } else { l.src[l.pos] }
+}
+fn peek2(l: Lex) -> u8 {
+  if (l.pos + 1) >= l.src.len { 0 as u8 } else { l.src[l.pos + 1] }
+}
+fn advance(mut l: Lex) { l.pos += 1 }
+
+fn is_space(b: u8) -> bool {
+  b == (32 as u8) || b == (9 as u8) || b == (10 as u8) || b == (13 as u8)
+}
+fn is_digit(b: u8) -> bool {
+  if b < (48 as u8) { false } else { b <= (57 as u8) }
+}
+fn is_alpha(b: u8) -> bool {
+  if b == (95 as u8) { yield true }
+  if b < (65 as u8)  { yield false }
+  if b <= (90 as u8) { yield true }
+  if b < (97 as u8)  { yield false }
+  b <= (122 as u8)
+}
+fn is_alnum(b: u8) -> bool { is_alpha(b) || is_digit(b) }
+
+fn skip_trivia(mut l: Lex) {
+  mut done: bool = false
+  while !done {
+    step c: u8 = peek(l)
+    if is_space(c) {
+      advance(l)
+    } elif c == (45 as u8) {
+      if peek2(l) == (45 as u8) {
+        advance(l)
+        advance(l)
+        mut at_eol: bool = false
+        while !at_eol {
+          step k: u8 = peek(l)
+          if k == (0 as u8) {
+            at_eol = true
+          } elif k == (10 as u8) {
+            at_eol = true
+          } else {
+            advance(l)
+          }
+        }
+      } else {
+        done = true
+      }
+    } else {
+      done = true
+    }
+  }
+}
+
+fn scan_ident(mut l: Lex) -> str {
+  mut buf: buffer[256]u8
+  mut n: i64 = 0
+  mut done: bool = false
+  while !done {
+    step c: u8 = peek(l)
+    if is_alnum(c) {
+      buf[n] = c
+      n += 1
+      advance(l)
+    } else {
+      done = true
+    }
+  }
+  buffer_to_str(buf, n)
+}
+
+fn scan_int(mut l: Lex) -> i64 {
+  mut v: i64 = 0
+  mut done: bool = false
+  while !done {
+    step c: u8 = peek(l)
+    if is_digit(c) {
+      v = v * 10 + ((c as i64) - 48)
+      advance(l)
+    } else {
+      done = true
+    }
+  }
+  v
+}
+
+fn scan_string(mut l: Lex, quote: u8) -> str {
+  advance(l)
+  mut buf: buffer[4096]u8
+  mut n: i64 = 0
+  mut done: bool = false
+  while !done {
+    step c: u8 = peek(l)
+    if c == (0 as u8) {
+      done = true
+    } elif c == quote {
+      advance(l)
+      done = true
+    } elif c == (92 as u8) {
+      advance(l)
+      step e: u8 = peek(l)
+      if e == (110 as u8) {
+        buf[n] = 10 as u8
+      } elif e == (116 as u8) {
+        buf[n] = 9 as u8
+      } elif e == (114 as u8) {
+        buf[n] = 13 as u8
+      } elif e == (92 as u8) {
+        buf[n] = 92 as u8
+      } elif e == (34 as u8) {
+        buf[n] = 34 as u8
+      } elif e == (39 as u8) {
+        buf[n] = 39 as u8
+      } else {
+        buf[n] = e
+      }
+      n += 1
+      advance(l)
+    } else {
+      buf[n] = c
+      n += 1
+      advance(l)
+    }
+  }
+  buffer_to_str(buf, n)
+}
+
+fn kw_or_ident(name: str) -> Token {
+  if str_eq(name, "and")      { yield TkAnd }
+  if str_eq(name, "break")    { yield TkBreak }
+  if str_eq(name, "do")       { yield TkDo }
+  if str_eq(name, "else")     { yield TkElse }
+  if str_eq(name, "elseif")   { yield TkElseif }
+  if str_eq(name, "end")      { yield TkEnd }
+  if str_eq(name, "false")    { yield TkFalse }
+  if str_eq(name, "for")      { yield TkFor }
+  if str_eq(name, "function") { yield TkFunction }
+  if str_eq(name, "goto")     { yield TkGoto }
+  if str_eq(name, "if")       { yield TkIf }
+  if str_eq(name, "in")       { yield TkIn }
+  if str_eq(name, "local")    { yield TkLocal }
+  if str_eq(name, "nil")      { yield TkNil }
+  if str_eq(name, "not")      { yield TkNot }
+  if str_eq(name, "or")       { yield TkOr }
+  if str_eq(name, "repeat")   { yield TkRepeat }
+  if str_eq(name, "return")   { yield TkReturn }
+  if str_eq(name, "then")     { yield TkThen }
+  if str_eq(name, "true")     { yield TkTrue }
+  if str_eq(name, "until")    { yield TkUntil }
+  if str_eq(name, "while")    { yield TkWhile }
+  TkIdent(name)
+}
+
+fn next_token(mut l: Lex) -> Token {
+  skip_trivia(l)
+  step c: u8 = peek(l)
+  if c == (0 as u8) { yield TkEof }
+
+  if is_alpha(c) {
+    step name: str = scan_ident(l)
+    yield kw_or_ident(name)
+  }
+
+  if is_digit(c) {
+    yield TkInt(scan_int(l))
+  }
+
+  if c == (34 as u8) { yield TkStr(scan_string(l, c)) }
+  if c == (39 as u8) { yield TkStr(scan_string(l, c)) }
+
+  if c == (40 as u8) { advance(l) yield TkLParen }
+  if c == (41 as u8) { advance(l) yield TkRParen }
+  if c == (123 as u8) { advance(l) yield TkLBrace }
+  if c == (125 as u8) { advance(l) yield TkRBrace }
+  if c == (91 as u8) { advance(l) yield TkLBracket }
+  if c == (93 as u8) { advance(l) yield TkRBracket }
+  if c == (44 as u8) { advance(l) yield TkComma }
+  if c == (59 as u8) { advance(l) yield TkSemi }
+  if c == (43 as u8) { advance(l) yield TkPlus }
+  if c == (45 as u8) { advance(l) yield TkMinus }
+  if c == (42 as u8) { advance(l) yield TkStar }
+  if c == (37 as u8) { advance(l) yield TkPercent }
+  if c == (94 as u8) { advance(l) yield TkCaret }
+  if c == (35 as u8) { advance(l) yield TkHash }
+
+  if c == (47 as u8) {
+    advance(l)
+    if peek(l) == (47 as u8) { advance(l) yield TkSlashSlash }
+    yield TkSlash
+  }
+  if c == (61 as u8) {
+    advance(l)
+    if peek(l) == (61 as u8) { advance(l) yield TkEqEq }
+    yield TkAssign
+  }
+  if c == (126 as u8) {
+    advance(l)
+    if peek(l) == (61 as u8) { advance(l) yield TkNotEq }
+    yield TkEof
+  }
+  if c == (60 as u8) {
+    advance(l)
+    if peek(l) == (61 as u8) { advance(l) yield TkLtEq }
+    yield TkLt
+  }
+  if c == (62 as u8) {
+    advance(l)
+    if peek(l) == (61 as u8) { advance(l) yield TkGtEq }
+    yield TkGt
+  }
+  if c == (58 as u8) {
+    advance(l)
+    if peek(l) == (58 as u8) { advance(l) yield TkDoubleColon }
+    yield TkColon
+  }
+  if c == (46 as u8) {
+    advance(l)
+    if peek(l) == (46 as u8) {
+      advance(l)
+      if peek(l) == (46 as u8) { advance(l) yield TkDotDotDot }
+      yield TkDotDot
+    }
+    yield TkDot
+  }
+
+  advance(l)
+  TkEof
+}
+
+// ===================================================================
+// AST
+// ===================================================================
+
+seal UnOp  { UNeg, UNot, ULen }
+
+seal BinOp {
+  BAdd, BSub, BMul, BDiv, BMod,
+  BLt, BGt, BLtEq, BGtEq, BEq, BNotEq,
+  BAnd, BOr, BConcat
+}
+
+tablet ExprNode  { e: Expr }
+tablet ArgNode   { expr: wedge ExprNode, next: wedge ArgNode }
+tablet ParamNode { name: str,           next: wedge ParamNode }
+tablet StmtNode  { s: Stmt, next: wedge StmtNode }
+
+seal Expr {
+  ENil, EFalse, ETrue,
+  EInt(i64),
+  EStr(str),
+  EVar(str),
+  EUnary(UnOp, wedge ExprNode),
+  EBinary(BinOp, wedge ExprNode, wedge ExprNode),
+  ECall(wedge ExprNode, wedge ArgNode),
+  EIndex(wedge ExprNode, wedge ExprNode),
+  EField(wedge ExprNode, str),
+  EFunction(wedge ParamNode, wedge StmtNode)
+}
+
+seal Stmt {
+  SExpr(wedge ExprNode),
+  SAssign(str, wedge ExprNode),
+  SLocal(str, wedge ExprNode),
+  SIf(wedge ExprNode, wedge StmtNode, wedge StmtNode),
+  SWhile(wedge ExprNode, wedge StmtNode),
+  SReturn(wedge ExprNode),
+  SFunction(str, wedge ParamNode, wedge StmtNode)
+}
+
+// ===================================================================
+// PARSER
+// ===================================================================
+
+tablet Parser { lex: Lex, cur: Token }
+
+fn p_new(src: str) -> Parser {
+  mut p: Parser
+  p.lex.src = src
+  p.lex.pos = 0
+  mut l: Lex = copy p.lex
+  p.cur = next_token(l)
+  p.lex = l
+  p
+}
+
+fn p_bump(mut p: Parser) {
+  mut l: Lex = copy p.lex
+  p.cur = next_token(l)
+  p.lex = l
+}
+
+fn is_block_end(t: Token) -> bool {
+  match t {
+    TkEnd    => true,
+    TkElse   => true,
+    TkElseif => true,
+    TkUntil  => true,
+    TkEof    => true,
+    _        => false,
+  }
+}
+
+fn un_prec_of(t: Token) -> UnOp {
+  match t {
+    TkMinus => UNeg,
+    TkNot   => UNot,
+    TkHash  => ULen,
+    _       => UNeg,
+  }
+}
+
+fn is_unary_start(t: Token) -> bool {
+  match t {
+    TkMinus => true,
+    TkNot   => true,
+    TkHash  => true,
+    _       => false,
+  }
+}
+
+// Precedence-layered expression parser. Each layer:
+//   parse_or    → parse_and ('or' parse_and)*
+//   parse_and   → parse_cmp ('and' parse_cmp)*
+//   parse_cmp   → parse_concat (CMP parse_concat)*      (non-assoc in Lua; we make it left-assoc)
+//   parse_concat→ parse_add ('..' parse_concat)?         (right-assoc, sloppy)
+//   parse_add   → parse_mul (('+'|'-') parse_mul)*
+//   parse_mul   → parse_unary (('*'|'/'|'%') parse_unary)*
+//   parse_unary → UNOP parse_unary | parse_postfix
+//   parse_postfix → parse_atom postfix*
+//   parse_atom  → int | str | nil | true | false | ident | '(' expr ')'
+
+fn parse_expr(
+  mut p: Parser,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> wedge ExprNode {
+  parse_or(p, exprs, args, params, stmts)
+}
+
+fn parse_or(
+  mut p: Parser,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> wedge ExprNode {
+  mut lhs: wedge ExprNode = parse_and(p, exprs, args, params, stmts)
+  mut done: bool = false
+  while !done {
+    match p.cur {
+      TkOr => {
+        p_bump(p)
+        step rhs: wedge ExprNode = parse_and(p, exprs, args, params, stmts)
+        lhs = exprs.push(ExprNode { e: EBinary(BOr, lhs, rhs) })
+      },
+      _ => { done = true },
+    }
+  }
+  lhs
+}
+
+fn parse_and(
+  mut p: Parser,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> wedge ExprNode {
+  mut lhs: wedge ExprNode = parse_cmp(p, exprs, args, params, stmts)
+  mut done: bool = false
+  while !done {
+    match p.cur {
+      TkAnd => {
+        p_bump(p)
+        step rhs: wedge ExprNode = parse_cmp(p, exprs, args, params, stmts)
+        lhs = exprs.push(ExprNode { e: EBinary(BAnd, lhs, rhs) })
+      },
+      _ => { done = true },
+    }
+  }
+  lhs
+}
+
+fn cmp_op(t: Token) -> BinOp {
+  match t {
+    TkLt    => BLt,
+    TkGt    => BGt,
+    TkLtEq  => BLtEq,
+    TkGtEq  => BGtEq,
+    TkEqEq  => BEq,
+    TkNotEq => BNotEq,
+    _       => BEq,
+  }
+}
+
+fn is_cmp_op(t: Token) -> bool {
+  match t {
+    TkLt    => true, TkGt   => true, TkLtEq => true,
+    TkGtEq  => true, TkEqEq => true, TkNotEq => true,
+    _       => false,
+  }
+}
+
+fn parse_cmp(
+  mut p: Parser,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> wedge ExprNode {
+  mut lhs: wedge ExprNode = parse_concat(p, exprs, args, params, stmts)
+  mut done: bool = false
+  while !done {
+    if is_cmp_op(p.cur) {
+      step op: BinOp = cmp_op(p.cur)
+      p_bump(p)
+      step rhs: wedge ExprNode = parse_concat(p, exprs, args, params, stmts)
+      lhs = exprs.push(ExprNode { e: EBinary(op, lhs, rhs) })
+    } else {
+      done = true
+    }
+  }
+  lhs
+}
+
+// Right-assoc concat (..). Simple recursion.
+fn parse_concat(
+  mut p: Parser,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> wedge ExprNode {
+  mut lhs: wedge ExprNode = parse_add(p, exprs, args, params, stmts)
+  match p.cur {
+    TkDotDot => {
+      p_bump(p)
+      step rhs: wedge ExprNode = parse_concat(p, exprs, args, params, stmts)
+      exprs.push(ExprNode { e: EBinary(BConcat, lhs, rhs) })
+    },
+    _ => lhs,
+  }
+}
+
+fn parse_add(
+  mut p: Parser,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> wedge ExprNode {
+  mut lhs: wedge ExprNode = parse_mul(p, exprs, args, params, stmts)
+  mut done: bool = false
+  while !done {
+    match p.cur {
+      TkPlus  => {
+        p_bump(p)
+        step rhs: wedge ExprNode = parse_mul(p, exprs, args, params, stmts)
+        lhs = exprs.push(ExprNode { e: EBinary(BAdd, lhs, rhs) })
+      },
+      TkMinus => {
+        p_bump(p)
+        step rhs: wedge ExprNode = parse_mul(p, exprs, args, params, stmts)
+        lhs = exprs.push(ExprNode { e: EBinary(BSub, lhs, rhs) })
+      },
+      _ => { done = true },
+    }
+  }
+  lhs
+}
+
+fn parse_mul(
+  mut p: Parser,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> wedge ExprNode {
+  mut lhs: wedge ExprNode = parse_unary(p, exprs, args, params, stmts)
+  mut done: bool = false
+  while !done {
+    match p.cur {
+      TkStar    => {
+        p_bump(p)
+        step rhs: wedge ExprNode = parse_unary(p, exprs, args, params, stmts)
+        lhs = exprs.push(ExprNode { e: EBinary(BMul, lhs, rhs) })
+      },
+      TkSlash   => {
+        p_bump(p)
+        step rhs: wedge ExprNode = parse_unary(p, exprs, args, params, stmts)
+        lhs = exprs.push(ExprNode { e: EBinary(BDiv, lhs, rhs) })
+      },
+      TkPercent => {
+        p_bump(p)
+        step rhs: wedge ExprNode = parse_unary(p, exprs, args, params, stmts)
+        lhs = exprs.push(ExprNode { e: EBinary(BMod, lhs, rhs) })
+      },
+      _ => { done = true },
+    }
+  }
+  lhs
+}
+
+fn parse_unary(
+  mut p: Parser,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> wedge ExprNode {
+  if is_unary_start(p.cur) {
+    step op: UnOp = un_prec_of(p.cur)
+    p_bump(p)
+    step inner: wedge ExprNode = parse_unary(p, exprs, args, params, stmts)
+    yield exprs.push(ExprNode { e: EUnary(op, inner) })
+  }
+  parse_postfix(p, exprs, args, params, stmts)
+}
+
+// Parse a call's comma-separated arg list (already past '(', consumes ')').
+fn parse_args(
+  mut p: Parser,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> wedge ArgNode {
+  match p.cur {
+    TkRParen => { p_bump(p) yield lost },
+    _        => {},
+  }
+  step first_expr: wedge ExprNode = parse_expr(p, exprs, args, params, stmts)
+  step head: wedge ArgNode = args.push(ArgNode { expr: first_expr, next: lost })
+  step head_safe: wedge ArgNode = copy head
+  mut tail_idx: i64 = args.len - 1
+  mut done: bool = false
+  while !done {
+    match p.cur {
+      TkComma => {
+        p_bump(p)
+        step e: wedge ExprNode = parse_expr(p, exprs, args, params, stmts)
+        step node: wedge ArgNode = args.push(ArgNode { expr: e, next: lost })
+        args[tail_idx].next = node
+        tail_idx = args.len - 1
+      },
+      _ => { done = true },
+    }
+  }
+  // consume ')'
+  match p.cur {
+    TkRParen => { p_bump(p) },
+    _        => {},
+  }
+  head_safe
+}
+
+fn parse_postfix(
+  mut p: Parser,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> wedge ExprNode {
+  mut lhs: wedge ExprNode = parse_atom(p, exprs, args, params, stmts)
+  mut done: bool = false
+  while !done {
+    match p.cur {
+      TkLParen => {
+        p_bump(p)
+        step a: wedge ArgNode = parse_args(p, exprs, args, params, stmts)
+        lhs = exprs.push(ExprNode { e: ECall(lhs, a) })
+      },
+      TkLBracket => {
+        p_bump(p)
+        step idx: wedge ExprNode = parse_expr(p, exprs, args, params, stmts)
+        match p.cur {
+          TkRBracket => { p_bump(p) },
+          _          => {},
+        }
+        lhs = exprs.push(ExprNode { e: EIndex(lhs, idx) })
+      },
+      TkDot => {
+        p_bump(p)
+        match p.cur {
+          TkIdent(name) => {
+            p_bump(p)
+            lhs = exprs.push(ExprNode { e: EField(lhs, name) })
+          },
+          _ => { done = true },
+        }
+      },
+      _ => { done = true },
+    }
+  }
+  lhs
+}
+
+fn parse_param_list(
+  mut p: Parser,
+  mut params: tablets[32]ParamNode
+) -> wedge ParamNode {
+  // expects cur to be '('
+  match p.cur {
+    TkLParen => { p_bump(p) },
+    _        => {},
+  }
+  match p.cur {
+    TkRParen => { p_bump(p) yield lost },
+    _        => {},
+  }
+  mut head: wedge ParamNode = lost
+  mut tail: wedge ParamNode = lost
+  mut done: bool = false
+  while !done {
+    match p.cur {
+      TkIdent(name) => {
+        p_bump(p)
+        step node: wedge ParamNode = params.push(ParamNode { name: name, next: lost })
+        if head == lost {
+          head = node
+          tail = node
+        } else {
+          tail.next = node
+          tail = node
+        }
+      },
+      _ => { done = true },
+    }
+    match p.cur {
+      TkComma => { p_bump(p) },
+      _       => { done = true },
+    }
+  }
+  match p.cur {
+    TkRParen => { p_bump(p) },
+    _        => {},
+  }
+  head
+}
+
+fn parse_atom(
+  mut p: Parser,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> wedge ExprNode {
+  match p.cur {
+    TkInt(n)      => { p_bump(p) exprs.push(ExprNode { e: EInt(n) }) },
+    TkStr(s)      => { p_bump(p) exprs.push(ExprNode { e: EStr(s) }) },
+    TkIdent(name) => { p_bump(p) exprs.push(ExprNode { e: EVar(name) }) },
+    TkTrue        => { p_bump(p) exprs.push(ExprNode { e: ETrue }) },
+    TkFalse       => { p_bump(p) exprs.push(ExprNode { e: EFalse }) },
+    TkNil         => { p_bump(p) exprs.push(ExprNode { e: ENil }) },
+    TkLParen      => {
+      p_bump(p)
+      step inner: wedge ExprNode = parse_expr(p, exprs, args, params, stmts)
+      match p.cur {
+        TkRParen => { p_bump(p) },
+        _        => {},
+      }
+      inner
+    },
+    TkFunction => {
+      // anonymous: function (params) body end
+      p_bump(p)
+      step ps: wedge ParamNode = parse_param_list(p, params)
+      step body: wedge StmtNode = parse_block(p, exprs, args, params, stmts)
+      match p.cur {
+        TkEnd => { p_bump(p) },
+        _     => {},
+      }
+      exprs.push(ExprNode { e: EFunction(ps, body) })
+    },
+    _ => exprs.push(ExprNode { e: ENil }),
+  }
+}
+
+// ---- statements ----------------------------------------------------
+
+// Helper: parse `function Name (params) body end` as a named-function
+// stmt, given that we've already consumed the `function` keyword.
+fn parse_fn_stmt(
+  mut p: Parser,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> Stmt {
+  match p.cur {
+    TkIdent(name) => {
+      p_bump(p)
+      step ps: wedge ParamNode = parse_param_list(p, params)
+      step body: wedge StmtNode = parse_block(p, exprs, args, params, stmts)
+      match p.cur {
+        TkEnd => { p_bump(p) },
+        _     => {},
+      }
+      SFunction(name, ps, body)
+    },
+    _ => SReturn(exprs.push(ExprNode { e: ENil })),
+  }
+}
+
+// Handle the `local` prefix — either `local function Name ...` or
+// `local Name [= expr]`.
+fn parse_local_stmt(
+  mut p: Parser,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> Stmt {
+  match p.cur {
+    TkFunction => {
+      p_bump(p)
+      parse_fn_stmt(p, exprs, args, params, stmts)
+    },
+    TkIdent(name) => {
+      p_bump(p)
+      match p.cur {
+        TkAssign => {
+          p_bump(p)
+          step e: wedge ExprNode = parse_expr(p, exprs, args, params, stmts)
+          SLocal(name, e)
+        },
+        _ => SLocal(name, exprs.push(ExprNode { e: ENil })),
+      }
+    },
+    _ => SReturn(exprs.push(ExprNode { e: ENil })),
+  }
+}
+
+// After consuming `TkIdent(name)`, decide: assignment, or expression-
+// statement starting with that identifier.
+fn parse_ident_stmt(
+  mut p: Parser,
+  name_in: str,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> Stmt {
+  match p.cur {
+    TkAssign => {
+      p_bump(p)
+      step e: wedge ExprNode = parse_expr(p, exprs, args, params, stmts)
+      SAssign(name_in, e)
+    },
+    _ => {
+      step prefix: wedge ExprNode = exprs.push(ExprNode { e: EVar(name_in) })
+      step full: wedge ExprNode = parse_postfix_from(p, prefix, exprs, args, params, stmts)
+      SExpr(full)
+    },
+  }
+}
+
+fn parse_return_stmt(
+  mut p: Parser,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> Stmt {
+  if is_block_end(p.cur) {
+    yield SReturn(exprs.push(ExprNode { e: ENil }))
+  }
+  match p.cur {
+    TkSemi => {
+      p_bump(p)
+      SReturn(exprs.push(ExprNode { e: ENil }))
+    },
+    _ => {
+      step e: wedge ExprNode = parse_expr(p, exprs, args, params, stmts)
+      SReturn(e)
+    },
+  }
+}
+
+fn parse_stmt(
+  mut p: Parser,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> Stmt {
+  match p.cur {
+    TkLocal => {
+      p_bump(p)
+      parse_local_stmt(p, exprs, args, params, stmts)
+    },
+    TkFunction => {
+      p_bump(p)
+      parse_fn_stmt(p, exprs, args, params, stmts)
+    },
+    TkIf => {
+      p_bump(p)
+      step cond: wedge ExprNode = parse_expr(p, exprs, args, params, stmts)
+      match p.cur {
+        TkThen => { p_bump(p) },
+        _      => {},
+      }
+      step then_head: wedge StmtNode = parse_block(p, exprs, args, params, stmts)
+      step else_head: wedge StmtNode = parse_if_tail(p, exprs, args, params, stmts)
+      SIf(cond, then_head, else_head)
+    },
+    TkWhile => {
+      p_bump(p)
+      step cond: wedge ExprNode = parse_expr(p, exprs, args, params, stmts)
+      match p.cur {
+        TkDo => { p_bump(p) },
+        _    => {},
+      }
+      step body: wedge StmtNode = parse_block(p, exprs, args, params, stmts)
+      match p.cur {
+        TkEnd => { p_bump(p) },
+        _     => {},
+      }
+      SWhile(cond, body)
+    },
+    TkReturn => {
+      p_bump(p)
+      parse_return_stmt(p, exprs, args, params, stmts)
+    },
+    TkIdent(name) => {
+      p_bump(p)
+      parse_ident_stmt(p, name, exprs, args, params, stmts)
+    },
+    _ => {
+      step e: wedge ExprNode = parse_expr(p, exprs, args, params, stmts)
+      SExpr(e)
+    },
+  }
+}
+
+// Like parse_postfix but starts from an already-built lhs.
+fn parse_postfix_from(
+  mut p: Parser,
+  lhs_in: wedge ExprNode,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> wedge ExprNode {
+  mut lhs: wedge ExprNode = lhs_in
+  mut done: bool = false
+  while !done {
+    match p.cur {
+      TkLParen => {
+        p_bump(p)
+        step a: wedge ArgNode = parse_args(p, exprs, args, params, stmts)
+        lhs = exprs.push(ExprNode { e: ECall(lhs, a) })
+      },
+      TkLBracket => {
+        p_bump(p)
+        step idx: wedge ExprNode = parse_expr(p, exprs, args, params, stmts)
+        match p.cur {
+          TkRBracket => { p_bump(p) },
+          _          => {},
+        }
+        lhs = exprs.push(ExprNode { e: EIndex(lhs, idx) })
+      },
+      TkDot => {
+        p_bump(p)
+        match p.cur {
+          TkIdent(fname) => {
+            p_bump(p)
+            lhs = exprs.push(ExprNode { e: EField(lhs, fname) })
+          },
+          _ => { done = true },
+        }
+      },
+      _ => { done = true },
+    }
+  }
+  lhs
+}
+
+fn parse_if_tail(
+  mut p: Parser,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> wedge StmtNode {
+  match p.cur {
+    TkElseif => {
+      p_bump(p)
+      step cond: wedge ExprNode = parse_expr(p, exprs, args, params, stmts)
+      match p.cur {
+        TkThen => { p_bump(p) },
+        _      => {},
+      }
+      step then_head: wedge StmtNode = parse_block(p, exprs, args, params, stmts)
+      step else_head: wedge StmtNode = parse_if_tail(p, exprs, args, params, stmts)
+      step nested: wedge StmtNode = stmts.push(
+        StmtNode { s: SIf(cond, then_head, else_head), next: lost }
+      )
+      nested
+    },
+    TkElse => {
+      p_bump(p)
+      step body: wedge StmtNode = parse_block(p, exprs, args, params, stmts)
+      match p.cur {
+        TkEnd => { p_bump(p) },
+        _     => {},
+      }
+      body
+    },
+    TkEnd => {
+      p_bump(p)
+      step nul: wedge StmtNode = lost
+      nul
+    },
+    _ => {
+      step nul: wedge StmtNode = lost
+      nul
+    },
+  }
+}
+
+fn parse_block(
+  mut p: Parser,
+  mut exprs: tablets[256]ExprNode,
+  mut args:  tablets[64]ArgNode,
+  mut params: tablets[32]ParamNode,
+  mut stmts: tablets[128]StmtNode
+) -> wedge StmtNode {
+  mut head: wedge StmtNode = lost
+  mut tail: wedge StmtNode = lost
+  mut done: bool = false
+  while !done {
+    // skip optional ';'
+    match p.cur {
+      TkSemi => { p_bump(p) },
+      _      => {},
+    }
+    if is_block_end(p.cur) {
+      done = true
+    } else {
+      step s: Stmt = parse_stmt(p, exprs, args, params, stmts)
+      step node: wedge StmtNode = stmts.push(StmtNode { s: s, next: lost })
+      if head == lost {
+        head = node
+        tail = node
+      } else {
+        tail.next = node
+        tail = node
+      }
+    }
+  }
+  head
+}
+
+// ===================================================================
+// PRETTY-PRINTER
+// ===================================================================
+
+fn un_str(u: UnOp) -> str {
+  match u {
+    UNeg => "-",
+    UNot => "not ",
+    ULen => "#",
+  }
+}
+
+fn bin_str(b: BinOp) -> str {
+  match b {
+    BAdd    => "+",  BSub => "-",  BMul   => "*",  BDiv => "/",  BMod   => "%",
+    BLt     => "<",  BGt  => ">",  BLtEq  => "<=", BGtEq=> ">=", BEq    => "==", BNotEq => "~=",
+    BAnd    => "and", BOr => "or", BConcat => "..",
+  }
+}
+
+fn pad(n: i64) -> str {
+  mut buf: buffer[64]u8
+  mut i: i64 = 0
+  while i < n {
+    buf[i] = 32 as u8
+    i += 1
+  }
+  buffer_to_str(buf, n)
+}
+
+fn pp_args(a: wedge ArgNode, depth: i64) {
+  mut cur: wedge ArgNode = a
+  while cur != lost {
+    pp_expr(cur.expr, depth)
+    cur = cur.next
+  }
+}
+
+fn pp_params(p: wedge ParamNode) {
+  mut cur: wedge ParamNode = p
+  mut first: bool = true
+  while cur != lost {
+    if first {
+      print(cur.name)
+      first = false
+    } else {
+      print(", ", cur.name)
+    }
+    cur = cur.next
+  }
+}
+
+fn pp_expr(n: wedge ExprNode, depth: i64) {
+  step pre: str = pad(depth * 2)
+  match n.e {
+    ENil        => println(pre, "nil"),
+    ETrue       => println(pre, "true"),
+    EFalse      => println(pre, "false"),
+    EInt(v)     => println(pre, "int ", v),
+    EStr(s)     => println(pre, "str \"", s, "\""),
+    EVar(name)  => println(pre, "var ", name),
+    EUnary(op, inner) => {
+      println(pre, "unary ", un_str(op))
+      pp_expr(inner, depth + 1)
+    },
+    EBinary(op, l, r) => {
+      println(pre, "binary ", bin_str(op))
+      pp_expr(l, depth + 1)
+      pp_expr(r, depth + 1)
+    },
+    ECall(callee, a) => {
+      println(pre, "call")
+      pp_expr(callee, depth + 1)
+      println(pre, "  args:")
+      pp_args(a, depth + 2)
+    },
+    EIndex(obj, idx) => {
+      println(pre, "index")
+      pp_expr(obj, depth + 1)
+      pp_expr(idx, depth + 1)
+    },
+    EField(obj, name) => {
+      println(pre, "field .", name)
+      pp_expr(obj, depth + 1)
+    },
+    EFunction(ps, body) => {
+      print(pre, "function(")
+      pp_params(ps)
+      println(")")
+      pp_stmts(body, depth + 1)
+    },
+  }
+}
+
+fn pp_stmt(s: Stmt, depth: i64) {
+  step pre: str = pad(depth * 2)
+  match s {
+    SExpr(e) => {
+      println(pre, "expr-stmt")
+      pp_expr(e, depth + 1)
+    },
+    SAssign(name, e) => {
+      println(pre, "assign ", name, " =")
+      pp_expr(e, depth + 1)
+    },
+    SLocal(name, e) => {
+      println(pre, "local ", name, " =")
+      pp_expr(e, depth + 1)
+    },
+    SIf(cond, then_head, else_head) => {
+      println(pre, "if")
+      pp_expr(cond, depth + 1)
+      println(pre, "then:")
+      pp_stmts(then_head, depth + 1)
+      if else_head != lost {
+        println(pre, "else:")
+        pp_stmts(else_head, depth + 1)
+      }
+    },
+    SWhile(cond, body) => {
+      println(pre, "while")
+      pp_expr(cond, depth + 1)
+      println(pre, "do:")
+      pp_stmts(body, depth + 1)
+    },
+    SReturn(e) => {
+      println(pre, "return")
+      pp_expr(e, depth + 1)
+    },
+    SFunction(name, ps, body) => {
+      print(pre, "function ", name, "(")
+      pp_params(ps)
+      println(")")
+      pp_stmts(body, depth + 1)
+    },
+  }
+}
+
+fn pp_stmts(head: wedge StmtNode, depth: i64) {
+  mut cur: wedge StmtNode = head
+  while cur != lost {
+    pp_stmt(cur.s, depth)
+    cur = cur.next
+  }
+}
+
+// ===================================================================
+// DRIVER
+// ===================================================================
+
+// ===================================================================
+// VALUES + ENVIRONMENT
+// ===================================================================
+
+seal Value {
+  VNil,
+  VBool(bool),
+  VInt(i64),
+  VStr(str),
+  VFunc(wedge ParamNode, wedge StmtNode, wedge Env),
+  VBuiltinPrint
+}
+
+tablet Binding { name: str, val: Value, next: wedge Binding }
+tablet Env     { head: wedge Binding, parent: wedge Env }
+
+// Returned by exec_stmt / exec_block to propagate `return`.
+seal Flow { FNormal, FReturn(Value) }
+
+fn env_define(
+  env: wedge Env,
+  mut bindings: tablets[256]Binding,
+  name: str,
+  v: Value
+) {
+  step head_old: wedge Binding = env.head
+  step node: wedge Binding = bindings.push(
+    Binding { name: copy name, val: v, next: head_old }
+  )
+  env.head = node
+}
+
+// Walk from current env up the parent chain.
+fn env_lookup(env: wedge Env, name: str) -> Value {
+  mut cur_env: wedge Env = env
+  while cur_env != lost {
+    mut b: wedge Binding = cur_env.head
+    while b != lost {
+      if str_eq(b.name, name) { yield copy b.val }
+      b = b.next
+    }
+    cur_env = cur_env.parent
+  }
+  VNil
+}
+
+// Update an existing binding (anywhere in the chain) or define new in
+// the current env if not found.
+fn env_assign(
+  env: wedge Env,
+  mut bindings: tablets[256]Binding,
+  name: str,
+  v: Value
+) {
+  mut cur_env: wedge Env = env
+  while cur_env != lost {
+    mut b: wedge Binding = cur_env.head
+    while b != lost {
+      if str_eq(b.name, name) {
+        b.val = copy v
+        yield
+      }
+      b = b.next
+    }
+    cur_env = cur_env.parent
+  }
+  env_define(env, bindings, name, v)
+}
+
+// ===================================================================
+// EVAL
+// ===================================================================
+
+fn truthy(v: Value) -> bool {
+  match v {
+    VNil      => false,
+    VBool(b)  => b,
+    _         => true,
+  }
+}
+
+fn val_eq(a: Value, b: Value) -> bool {
+  match a {
+    VNil       => match b { VNil => true, _ => false },
+    VBool(x)   => match b { VBool(y) => x == y, _ => false },
+    VInt(x)    => match b { VInt(y)  => x == y, _ => false },
+    VStr(x)    => match b { VStr(y)  => str_eq(x, y), _ => false },
+    _          => false,
+  }
+}
+
+fn val_to_str(v: Value) -> str {
+  match v {
+    VNil          => "nil",
+    VBool(b)      => if b { "true" } else { "false" },
+    VInt(n)       => int_to_str(n),
+    VStr(s)       => copy s,
+    VFunc(_, _, _) => "<function>",
+    VBuiltinPrint => "<builtin print>",
+  }
+}
+
+fn print_value(v: Value) { print(val_to_str(v)) }
+
+// Apply a builtin (only print for now).
+fn call_print(
+  args_head: wedge ArgNode,
+  env: wedge Env,
+  mut bindings: tablets[256]Binding,
+  mut envs: tablets[64]Env
+) -> Value {
+  mut a: wedge ArgNode = args_head
+  mut first: bool = true
+  while a != lost {
+    step v: Value = eval_expr(a.expr, env, bindings, envs)
+    if first { first = false } else { print("\t") }
+    print_value(v)
+    a = a.next
+  }
+  println("")
+  VNil
+}
+
+// Evaluate an expression to a Value.
+fn eval_expr(
+  n: wedge ExprNode,
+  env: wedge Env,
+  mut bindings: tablets[256]Binding,
+  mut envs: tablets[64]Env
+) -> Value {
+  match n.e {
+    ENil      => VNil,
+    ETrue     => VBool(true),
+    EFalse    => VBool(false),
+    EInt(v)   => VInt(v),
+    EStr(s)   => VStr(copy s),
+    EVar(name) => env_lookup(env, name),
+    EUnary(op, inner) => {
+      step v: Value = eval_expr(inner, env, bindings, envs)
+      match op {
+        UNeg => match v {
+          VInt(x) => VInt(0 - x),
+          _       => VNil,
+        },
+        UNot => VBool(!truthy(v)),
+        ULen => match v {
+          VStr(s) => VInt(s.len),
+          _       => VNil,
+        },
+      }
+    },
+    EBinary(op, l, r) => {
+      // Short-circuit and/or before evaluating r.
+      match op {
+        BAnd => {
+          step lv: Value = eval_expr(l, env, bindings, envs)
+          if truthy(lv) { eval_expr(r, env, bindings, envs) } else { lv }
+        },
+        BOr => {
+          step lv: Value = eval_expr(l, env, bindings, envs)
+          if truthy(lv) { lv } else { eval_expr(r, env, bindings, envs) }
+        },
+        _ => {
+          step lv: Value = eval_expr(l, env, bindings, envs)
+          step rv: Value = eval_expr(r, env, bindings, envs)
+          eval_bin(op, lv, rv)
+        },
+      }
+    },
+    ECall(callee, args_head) => {
+      step f: Value = eval_expr(callee, env, bindings, envs)
+      match f {
+        VBuiltinPrint => call_print(args_head, env, bindings, envs),
+        VFunc(params, body, captured) => {
+          // Build a fresh env whose parent is the captured env.
+          step new_env_raw: wedge Env = envs.push(
+            Env { head: lost, parent: captured }
+          )
+          step new_env: wedge Env = copy new_env_raw
+          // Bind params from args.
+          mut p_cur: wedge ParamNode = params
+          mut a_cur: wedge ArgNode = args_head
+          while p_cur != lost {
+            step v: Value = if a_cur != lost {
+              step e: wedge ExprNode = a_cur.expr
+              a_cur = a_cur.next
+              eval_expr(e, env, bindings, envs)
+            } else {
+              VNil
+            }
+            step pname: str = copy p_cur.name
+            env_define(new_env, bindings, pname, v)
+            p_cur = p_cur.next
+          }
+          step result: Flow = exec_block(body, new_env, bindings, envs)
+          match result {
+            FReturn(v) => v,
+            FNormal    => VNil,
+          }
+        },
+        _ => VNil,
+      }
+    },
+    EIndex(_, _)    => VNil,
+    EField(_, _)    => VNil,
+    EFunction(params, body) => VFunc(params, body, env),
+  }
+}
+
+fn eval_bin(op: BinOp, a: Value, b: Value) -> Value {
+  match op {
+    BAdd => match a {
+      VInt(x) => match b { VInt(y) => VInt(x + y), _ => VNil },
+      _       => VNil,
+    },
+    BSub => match a {
+      VInt(x) => match b { VInt(y) => VInt(x - y), _ => VNil },
+      _       => VNil,
+    },
+    BMul => match a {
+      VInt(x) => match b { VInt(y) => VInt(x * y), _ => VNil },
+      _       => VNil,
+    },
+    BDiv => match a {
+      VInt(x) => match b { VInt(y) => VInt(x / y), _ => VNil },
+      _       => VNil,
+    },
+    BMod => match a {
+      VInt(x) => match b { VInt(y) => VInt(x - (x / y) * y), _ => VNil },
+      _       => VNil,
+    },
+    BLt => match a {
+      VInt(x) => match b { VInt(y) => VBool(x < y), _ => VBool(false) },
+      _       => VBool(false),
+    },
+    BGt => match a {
+      VInt(x) => match b { VInt(y) => VBool(x > y), _ => VBool(false) },
+      _       => VBool(false),
+    },
+    BLtEq => match a {
+      VInt(x) => match b { VInt(y) => VBool(x <= y), _ => VBool(false) },
+      _       => VBool(false),
+    },
+    BGtEq => match a {
+      VInt(x) => match b { VInt(y) => VBool(x >= y), _ => VBool(false) },
+      _       => VBool(false),
+    },
+    BEq    => VBool(val_eq(a, b)),
+    BNotEq => VBool(!val_eq(a, b)),
+    BConcat => VStr(val_to_str(a) + val_to_str(b)),
+    BAnd => VNil,
+    BOr  => VNil,
+  }
+}
+
+fn exec_stmt(
+  s: Stmt,
+  env: wedge Env,
+  mut bindings: tablets[256]Binding,
+  mut envs: tablets[64]Env
+) -> Flow {
+  match s {
+    SExpr(e) => {
+      step _v: Value = eval_expr(e, env, bindings, envs)
+      FNormal
+    },
+    SAssign(name, e) => {
+      step v: Value = eval_expr(e, env, bindings, envs)
+      env_assign(env, bindings, name, v)
+      FNormal
+    },
+    SLocal(name, e) => {
+      step v: Value = eval_expr(e, env, bindings, envs)
+      env_define(env, bindings, name, v)
+      FNormal
+    },
+    SIf(cond, then_head, else_head) => {
+      step cv: Value = eval_expr(cond, env, bindings, envs)
+      if truthy(cv) {
+        exec_block(then_head, env, bindings, envs)
+      } else {
+        if else_head != lost {
+          exec_block(else_head, env, bindings, envs)
+        } else {
+          FNormal
+        }
+      }
+    },
+    SWhile(cond, body) => {
+      mut result: Flow = FNormal
+      mut keep: bool = true
+      while keep {
+        step cv: Value = eval_expr(cond, env, bindings, envs)
+        if !truthy(cv) {
+          keep = false
+        } else {
+          step r: Flow = exec_block(body, env, bindings, envs)
+          match r {
+            FReturn(v) => {
+              result = FReturn(v)
+              keep   = false
+            },
+            FNormal => {},
+          }
+        }
+      }
+      result
+    },
+    SReturn(e) => {
+      step v: Value = eval_expr(e, env, bindings, envs)
+      FReturn(v)
+    },
+    SFunction(name, params, body) => {
+      env_define(env, bindings, name, VFunc(params, body, env))
+      FNormal
+    },
+  }
+}
+
+fn exec_block(
+  head: wedge StmtNode,
+  env: wedge Env,
+  mut bindings: tablets[256]Binding,
+  mut envs: tablets[64]Env
+) -> Flow {
+  mut cur: wedge StmtNode = head
+  mut result: Flow = FNormal
+  mut keep: bool = true
+  while keep {
+    if cur == lost {
+      keep = false
+    } else {
+      step r: Flow = exec_stmt(cur.s, env, bindings, envs)
+      match r {
+        FReturn(v) => {
+          result = FReturn(v)
+          keep   = false
+        },
+        FNormal => { cur = cur.next },
+      }
+    }
+  }
+  result
+}
+
+// ===================================================================
+// DRIVER
+// ===================================================================
+
+fn run(src: str) {
+  println("------------------------------------")
+  println("> ", src)
+  println("---")
+  mut p: Parser = p_new(src)
+  mut exprs: tablets[256]ExprNode
+  mut args:  tablets[64]ArgNode
+  mut params: tablets[32]ParamNode
+  mut stmts: tablets[128]StmtNode
+  step root: wedge StmtNode = parse_block(p, exprs, args, params, stmts)
+
+  mut bindings: tablets[256]Binding
+  mut envs:     tablets[64]Env
+  step global: wedge Env = envs.push(Env { head: lost, parent: lost })
+  env_define(global, bindings, "print", VBuiltinPrint)
+
+  step _r: Flow = exec_block(root, global, bindings, envs)
+}
+
+fn main() -> i32 {
+  println("=== Tuppu-hosted Lua interpreter ===")
+  println("")
+
+  run("print(1 + 2 * 3)")
+  run("print((1 + 2) * 3)")
+  run("local x = 5  print(x * 2)")
+  run("local s = \"hello, \" .. \"world\"  print(s)")
+  run("if 10 > 5 then print(\"big\") else print(\"small\") end")
+  run("local i = 1  while i <= 5 do print(i)  i = i + 1 end")
+  run("local function sq(x) return x * x end  print(sq(7))")
+  run("local function fact(n) if n <= 1 then return 1 else return n * fact(n - 1) end end  print(fact(5))")
+  run("local function fib(n) if n < 2 then return n else return fib(n - 1) + fib(n - 2) end end  print(fib(10))")
+  run("local function makeAdder(x) return function(y) return x + y end end  local add5 = makeAdder(5)  print(add5(3))  print(add5(100))")
+  run("local function apply(f, v) return f(v) end  local function dbl(n) return n * 2 end  print(apply(dbl, 21))")
+  run("local function counter() local n = 0  local function step() n = n + 1  return n end  return step end  local c = counter()  print(c())  print(c())  print(c())")
+
+  0
+}
