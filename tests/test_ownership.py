@@ -734,6 +734,60 @@ def test_borrow_scoped_release_at_block_exit(tmp_path):
     assert out == b"hi!\n"
 
 
+def test_mut_binding_borrow_chain_rejected(tmp_path):
+    # Community-reported gap: `mut l: Lex = p.lex` makes l a borrow
+    # of p's bytes. `advance(l)` (mut param) mutates l, which writes
+    # THROUGH to p's bytes. Then `p.lex = l` reads l on the RHS
+    # while l's ultimate root has been mut-reached — the write-back
+    # alias pattern that silently corrupted heap strings.
+    #
+    # Freeze rule catches it once `_invalidate_root` walks the borrow
+    # chain to the ultimate owner. A 3-line fix inside the existing
+    # rule — not a per-case patch.
+    src = (
+        "tablet Lex { buf: str, pos: i64 }\n"
+        "tablet Parser { lex: Lex, depth: i64 }\n"
+        "fn advance(mut l: Lex) { l.pos = l.pos + 1 }\n"
+        "fn main() -> i32 {\n"
+        "  mut p: Parser = Parser {\n"
+        "    lex: Lex { buf: \"hel\" + \"lo\", pos: 0 },\n"
+        "    depth: 0,\n"
+        "  }\n"
+        "  mut l: Lex = p.lex\n"
+        "  advance(l)\n"
+        "  p.lex = l\n"
+        "  0\n"
+        "}\n"
+    )
+    with pytest.raises(CompileError, match="use of borrow 'l'"):
+        compile_to_ir(src)
+
+
+def test_mut_binding_copy_opt_out(tmp_path):
+    # Same program with `copy` at the binding site. l owns
+    # independent bytes; the round trip is safe.
+    src = (
+        "tablet Lex { buf: str, pos: i64 }\n"
+        "tablet Parser { lex: Lex, depth: i64 }\n"
+        "fn advance(mut l: Lex) { l.pos = l.pos + 1 }\n"
+        "fn main() -> i32 {\n"
+        "  mut p: Parser = Parser {\n"
+        "    lex: Lex { buf: \"hel\" + \"lo\", pos: 0 },\n"
+        "    depth: 0,\n"
+        "  }\n"
+        "  mut l: Lex = copy p.lex\n"
+        "  advance(l)\n"
+        "  p.lex = l\n"
+        "  println(p.lex.buf)\n"
+        "  println(p.lex.pos)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello\n1\n"
+
+
 def test_seal_pure_enum_no_release_fn(tmp_path):
     # A seal with only nullary / scalar-payload variants should NOT
     # get a release fn — _seal_needs_cleanup returns False and no IR

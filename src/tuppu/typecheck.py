@@ -1038,10 +1038,19 @@ class Checker:
         """Flag every live borrow rooted at `root` as invalidated. A
         subsequent read of any such binding will error out. Called when
         `root` (or a path through `root`) is mut-reached by a call or
-        by a direct assignment."""
+        by a direct assignment.
+
+        Walks up the borrow chain first: if `root` is itself a borrow
+        binding (e.g. `mut l: Lex = p.lex` makes `l` a borrow of `p`),
+        a mut-reach on `l` is effectively a mut-reach on `p` — any
+        write through `l` reaches `p`'s bytes. Without this,
+        `advance(l); p.lex = l` wouldn't flag the latent UAF."""
+        ultimate = self._root_for(root)
+        # Also invalidate the mut-reached binding itself (in case it's
+        # a borrow) and every borrow rooted at the ultimate owner.
         for scope in self._borrow_sources:
             for name, src in scope.items():
-                if src == root:
+                if src == ultimate or name == root:
                     self._invalidated.add(name)
 
     def _check_use_not_invalidated(
