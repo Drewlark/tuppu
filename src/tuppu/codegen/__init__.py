@@ -1277,26 +1277,13 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             )
         variants = self._seal_variants[seal_key]
         name_to_index = {vn: i for i, (vn, _) in enumerate(variants)}
-        # Spill scrutinee so we can GEP into it for the payload. If
-        # the scrutinee carries cleanup-bearing payload fields, deep-
-        # clone it into the slot so match.scrut owns its bytes —
-        # otherwise arm bodies that free the ORIGINAL scrutinee (e.g.
-        # `match p.cur { Ident(name) => { p_bump(p); use(name) } }`
-        # where p_bump frees p.cur's payload) would dangle every
-        # binder that aliases into the source. The clone is paid
-        # once per match; binders stay zero-cost reads.
+        # Spill scrutinee so we can GEP into it for the payload. No
+        # runtime deep-clone needed: the freeze-while-borrow rule
+        # rejects the UAF shape (mut-reach to the scrutinee's source
+        # while a binder is live) at typecheck, so binders into the
+        # shallow match.scrut copy are safe.
         slot = self._alloca_entry(scrutinee.type, "match.scrut")
-        if (
-            self._seal_key_for_ty(scrutinee.type) is not None
-            and self._seal_needs_cleanup(scrutinee.type)
-        ):
-            scrutinee = self._deep_clone_if_cleanup_bearing(scrutinee)
-            self.builder.store(scrutinee, slot)
-            self._cleanup_frames[-1].append(
-                (self._get_seal_release(scrutinee.type), slot, "match.scrut"),
-            )
-        else:
-            self.builder.store(scrutinee, slot)
+        self.builder.store(scrutinee, slot)
         tag_ptr = self.builder.gep(
             slot, [ir.Constant(I32, 0), ir.Constant(I32, 0)], inbounds=True,
         )

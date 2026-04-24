@@ -314,13 +314,12 @@ def test_match_stmt_arm_with_void_call_tail(tmp_path):
     assert out == b"42\n42\n"
 
 
-def test_match_binder_survives_scrutinee_source_mutation(tmp_path):
-    # Match binders alias into the scrutinee's payload. If the arm
-    # body calls anything that frees the SOURCE of the scrutinee
-    # (here p_bump reassigns p.cur, releasing the old Ident payload),
-    # a naive borrow binder would dangle. Fix: deep-clone the
-    # scrutinee into match.scrut so binders read from a stable local
-    # copy, independent of the source.
+def test_match_binder_rejected_when_scrutinee_mutated(tmp_path):
+    # Freeze-while-borrow: a match binder aliases the scrutinee's
+    # payload. If the arm body calls anything that mut-reaches the
+    # scrutinee's source (here `p_bump(p)` reassigns `p.cur`), the
+    # binder would dangle. The checker rejects at compile time with
+    # a suggestion to use `copy` at the binder site.
     src = (
         "seal Tok { Ident(str), EOF }\n"
         "tablet Parser { cur: Tok }\n"
@@ -333,6 +332,33 @@ def test_match_binder_survives_scrutinee_source_mutation(tmp_path):
         "    Ident(name) => {\n"
         "      p_bump(p)\n"
         "      println(name)\n"
+        "    },\n"
+        "    EOF => println(\"eof\"),\n"
+        "  }\n"
+        "  0\n"
+        "}\n"
+    )
+    with pytest.raises(CompileError, match="use of borrow 'name'"):
+        compile_to_ir(src)
+
+
+def test_match_binder_copy_opt_out(tmp_path):
+    # With `copy` the binder's bytes are independently owned, so
+    # mut-reaching the scrutinee doesn't invalidate. Same program,
+    # one-line change.
+    src = (
+        "seal Tok { Ident(str), EOF }\n"
+        "tablet Parser { cur: Tok }\n"
+        "fn p_bump(mut p: Parser) {\n"
+        "  p.cur = EOF\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  mut p: Parser = Parser { cur: Ident(\"hel\" + \"lo\") }\n"
+        "  match p.cur {\n"
+        "    Ident(name) => {\n"
+        "      step n = copy name\n"
+        "      p_bump(p)\n"
+        "      println(n)\n"
         "    },\n"
         "    EOF => println(\"eof\"),\n"
         "  }\n"

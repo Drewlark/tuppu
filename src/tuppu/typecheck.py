@@ -18,7 +18,7 @@ Coercion rules (match existing codegen behavior):
 from __future__ import annotations
 
 import difflib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable
 
 from . import ast as A
@@ -180,6 +180,12 @@ class TyFn:
     # collects trailing call-site args into a synthetic TabletsLit
     # wrapped around the element type. Non-variadic fns set this False.
     is_variadic: bool = False
+    # Per-param mut flag — parallels `params`. Used by the freeze-
+    # while-borrow analysis: a `mut`-annotated param is a mut-reach on
+    # its argument root, invalidating any live borrow rooted there.
+    # `compare=False` keeps mut-ness out of TyFn equality so a fn
+    # literal (no mut info) compares equal to its registered decl.
+    param_muts: tuple = field(default=(), compare=False)
     def __str__(self) -> str:
         args_list = []
         for i, p in enumerate(self.params):
@@ -369,6 +375,14 @@ class Checker:
         # is a use-after-free and gets rejected.
         self._local_tablets: set[str] = set()
         self._tainted: dict[str, bool] = {}
+        # Freeze-while-borrow state. Per-scope, `_borrow_sources` maps
+        # a borrow binding's name → its source root (the outermost
+        # owning Ident whose mutation would invalidate the borrow).
+        # `_invalidated` records borrows whose root has been mut-
+        # reached since their binding — any read of an invalidated
+        # borrow is rejected with a suggestion to `copy`.
+        self._borrow_sources: list[dict[str, str]] = [{}]
+        self._invalidated: set[str] = set()
 
     def _warn(self, message: str, line: int = 0, col: int = 0) -> None:
         self.warnings.append(CompileWarning(message=message, line=line, col=col))
@@ -549,7 +563,10 @@ class Checker:
                 f"would dangle — use a str or tablets instead)",
                 fn.line, fn.col,
             )
-        self.fns[fn.name] = TyFn(params=params, ret=ret, is_variadic=is_variadic)
+        self.fns[fn.name] = TyFn(
+            params=params, ret=ret, is_variadic=is_variadic,
+            param_muts=tuple(p.is_mut for p in fn.params),
+        )
         # Did-you-mean warning: users who write `fn add(a: Vec, b: Vec)
         # -> Vec` on user types probably meant `gloss add`. Warn but
         # don't reject — the regular fn may be intentional.
@@ -649,7 +666,10 @@ class Checker:
         )
         if c.return_type is not None:
             check_ffi_type(ret, "return type", is_return=True)
-        self.fns[c.name] = TyFn(params=params, ret=ret)
+        self.fns[c.name] = TyFn(
+            params=params, ret=ret,
+            param_muts=tuple(p.is_mut for p in c.params),
+        )
         # Tracked so codegen can emit extern declarations instead of
         # trying to lower a body.
         self.colophons.add(c.name)
@@ -729,7 +749,10 @@ class Checker:
                 f"collides with an existing declaration",
                 g.line, g.col,
             )
-        self.fns[mangled] = TyFn(params=params, ret=ret)
+        self.fns[mangled] = TyFn(
+            params=params, ret=ret,
+            param_muts=tuple(p.is_mut for p in g.params),
+        )
         self.gloss_dispatch[key] = mangled
         self.fn_type_params[mangled] = ()
 
@@ -968,8 +991,74 @@ class Checker:
 
     # --- scope ------------------------------------------------------
 
-    def _push(self) -> None: self.scopes.append({})
-    def _pop(self) -> None: self.scopes.pop()
+    def _push(self) -> None:
+        self.scopes.append({})
+        self._borrow_sources.append({})
+
+    def _pop(self) -> None:
+        self.scopes.pop()
+        # Borrows go out of scope when the block ends; their
+        # invalidation state no longer matters. Clear any leftover
+        # invalidation entries pointing at borrows we're about to drop.
+        dropped = self._borrow_sources.pop()
+        for name in dropped:
+            self._invalidated.discard(name)
+
+    def _register_borrow(self, name: str, root: str) -> None:
+        """Mark `name` as a borrow whose heap bytes are rooted in
+        `root` (the outermost owning Ident). Used by `_tc_binding` for
+        Ident/Field/Index initializers and by match-pattern binders."""
+        self._borrow_sources[-1][name] = root
+        self._invalidated.discard(name)
+
+    def _borrow_source_root(self, e: A.Expr) -> str | None:
+        """Walk a borrow-source expression to its root Ident. Returns
+        None for expressions that produce fresh ownership (Call,
+        Copy, literals), which don't establish aliasing relationships."""
+        if isinstance(e, A.Ident):
+            # Follow the borrow chain: `step q = p; step r = q` — r's
+            # root is whatever p's root was (or p itself if p is an
+            # owning binding).
+            return self._root_for(e.name)
+        if isinstance(e, A.Field):
+            return self._borrow_source_root(e.target)
+        if isinstance(e, A.Index):
+            return self._borrow_source_root(e.target)
+        return None
+
+    def _root_for(self, name: str) -> str:
+        """If `name` is itself a borrow, return the root its chain
+        points at. Otherwise `name` IS the root."""
+        for scope in reversed(self._borrow_sources):
+            if name in scope:
+                return scope[name]
+        return name
+
+    def _invalidate_root(self, root: str) -> None:
+        """Flag every live borrow rooted at `root` as invalidated. A
+        subsequent read of any such binding will error out. Called when
+        `root` (or a path through `root`) is mut-reached by a call or
+        by a direct assignment."""
+        for scope in self._borrow_sources:
+            for name, src in scope.items():
+                if src == root:
+                    self._invalidated.add(name)
+
+    def _check_use_not_invalidated(
+        self, name: str, line: int, col: int,
+    ) -> None:
+        """At each Ident read, enforce the freeze-while-borrow rule:
+        the borrow hasn't been invalidated by a mut-reach to its root
+        since it was bound. The fix the user needs is `step n = copy
+        name` at the binding site."""
+        if name in self._invalidated:
+            raise CheckError(
+                f"use of borrow {name!r} after its source may have "
+                f"been mutated — bind a fresh copy at the borrow "
+                f"site with `step n = copy {name}` and use `n` after "
+                f"the mutation instead",
+                line, col,
+            )
 
     def _bind(self, name: str, ty: Ty, line: int, col: int) -> None:
         if name in self.scopes[-1]:
@@ -1048,6 +1137,30 @@ class Checker:
             self._local_tablets.add(b.name)
         if isinstance(final_ty, TyHandle):
             self._tainted[b.name] = self._expr_escapes(b.init)
+        # Freeze-while-borrow: if this binding aliases into some
+        # existing storage (borrow-init via Ident/Field/Index), remember
+        # its source root. A later mut-reach to that root invalidates
+        # this binding; subsequent reads error out with a `copy` hint.
+        if self._needs_borrow_tracking(final_ty):
+            root = self._borrow_source_root(b.init)
+            if root is not None:
+                self._register_borrow(b.name, root)
+
+    def _needs_borrow_tracking(self, ty: Ty) -> bool:
+        """Which types are susceptible to borrow invalidation? Any
+        cleanup-bearing type — str, user struct, tablets, or seal with
+        cleanup-bearing payload. Scalars, wedges, and fn pointers don't
+        carry heap state so can't UAF from mutation."""
+        str_ty = self.structs.get("str")
+        if str_ty is not None and ty == str_ty:
+            return True
+        if isinstance(ty, TyStruct):
+            return True
+        if isinstance(ty, TyTablets):
+            return True
+        if isinstance(ty, TySeal):
+            return True
+        return False
 
     def _tc_assign(self, a: A.Assign) -> None:
         # Type-check the target as an expression: this both validates
@@ -1067,6 +1180,39 @@ class Checker:
         if isinstance(target_ty, TyHandle) and isinstance(a.target, A.Ident):
             if self._expr_escapes(a.value):
                 self._tainted[a.target.name] = True
+        # Freeze-while-borrow: assignment to a path invalidates every
+        # live borrow rooted at the path's base. Covers `s.field = x`,
+        # `arr[i] = x`, and `r = x` — all paths whose mutation could
+        # free or overwrite the bytes a borrow aliases into.
+        root = self._assign_target_root(a.target)
+        if root is not None:
+            self._invalidate_root(root)
+
+    def _invalidate_mut_call_args(
+        self, fn_ty: "TyFn", args: list[A.Expr],
+    ) -> None:
+        """For each call argument passed as `mut`, invalidate every
+        live borrow rooted at that arg's base. Used by both direct fn
+        calls and first-class fn-value calls."""
+        if not fn_ty.param_muts:
+            return
+        for is_mut, arg in zip(fn_ty.param_muts, args):
+            if not is_mut:
+                continue
+            root = self._assign_target_root(arg)
+            if root is not None:
+                self._invalidate_root(root)
+
+    def _assign_target_root(self, target: A.Expr) -> str | None:
+        """Root of an assignment lvalue. `r.field.field2 = x` roots at
+        `r`; `arr[i] = x` roots at `arr`; `x = y` roots at `x`."""
+        if isinstance(target, A.Ident):
+            return target.name
+        if isinstance(target, A.Field):
+            return self._assign_target_root(target.target)
+        if isinstance(target, A.Index):
+            return self._assign_target_root(target.target)
+        return None
 
     def _tc_for(self, f: A.ForStmt) -> None:
         # Resolve element type before we look at the body so errors about
@@ -1239,6 +1385,9 @@ class Checker:
                             e.line, e.col,
                         )
                     return self.fns[e.name]
+            # Freeze-while-borrow: reject reads of a borrow whose
+            # source has been mut-reached since it was bound.
+            self._check_use_not_invalidated(e.name, e.line, e.col)
             return self._lookup(e.name, e.line, e.col)
         if isinstance(e, A.Unary):     return self._tc_unary(e)
         if isinstance(e, A.Binary):    return self._tc_binary(e)
@@ -1690,6 +1839,11 @@ class Checker:
                 h if not self._has_open_tyvar(h, inst_names) else None
             )
         arg_tys = [self._tc_expr(a, expected=h) for a, h in zip(e.args, arg_hints)]
+        # Freeze-while-borrow: each mut-annotated param invalidates
+        # every live borrow rooted at the root of its arg expression.
+        # The callee can write through the mut param, which may free
+        # or overwrite whatever a borrow aliases.
+        self._invalidate_mut_call_args(fn, e.args)
         for i, (at, pty) in enumerate(zip(arg_tys, fn.params)):
             freshened = self._substitute(pty, inst_subst)
             try:
@@ -1874,6 +2028,13 @@ class Checker:
                         f"element type is {recv_ty.element}",
                         e.line, e.col,
                     )
+                # Freeze-while-borrow: `a.push(x)` mut-reaches `a`.
+                # Invalidate every live borrow rooted there — a push
+                # may reallocate or append into the same chunk a
+                # borrow aliases.
+                recv_root = self._assign_target_root(e.callee.target)
+                if recv_root is not None:
+                    self._invalidate_root(recv_root)
                 # push returns a handle to the newly-pushed element —
                 # discarded automatically in statement position.
                 return TyHandle(element=recv_ty.element)
@@ -2394,11 +2555,22 @@ class Checker:
                             f"variant has {len(vfs)} field(s)",
                             arm.line, arm.col,
                         )
+                    # Match binders alias into the scrutinee's
+                    # payload — register each as a borrow rooted at
+                    # the scrutinee expression's root. Any mut-reach
+                    # to that root during the arm body invalidates
+                    # the binder.
+                    scrut_root = self._borrow_source_root(e.scrutinee)
                     for binder, fty in zip(arm.pattern.binders, vfs):
                         if binder is None:
                             continue
                         concrete = self._substitute(fty, subst)
                         self._bind(binder, concrete, arm.line, arm.col)
+                        if (
+                            scrut_root is not None
+                            and self._needs_borrow_tracking(concrete)
+                        ):
+                            self._register_borrow(binder, scrut_root)
                 else:
                     raise CheckError(
                         f"unsupported pattern: {type(arm.pattern).__name__}",

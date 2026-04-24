@@ -25,7 +25,10 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from tuppu.driver import compile_to_binary
+import pytest
+
+from tuppu.driver import compile_to_binary, compile_to_ir
+from tuppu.errors import CompileError
 
 
 def run(src: str, tmp_path: Path) -> tuple[int, bytes]:
@@ -617,6 +620,118 @@ def test_variant_ctor_call_result_is_single_malloc(tmp_path):
     wrap_end = ir.find("define ", wrap_start + 1)
     wrap_body = ir[wrap_start:wrap_end if wrap_end > 0 else len(ir)]
     assert "str_clone" not in wrap_body, wrap_body
+
+
+# --- freeze-while-borrow rule ----------------------------------------
+
+def test_borrow_step_from_index_rejected_after_mut_call(tmp_path):
+    # `step p = a[0]; a.push(x); use(p)` — the push mut-reaches a
+    # and may grow/invalidate a's chunks, dangling p. Rule rejects.
+    src = (
+        "fn main() -> i32 {\n"
+        "  mut a: tablets[4]str\n"
+        "  step _x = a.push(\"hi\" + \"!\")\n"
+        "  step p = a[0]\n"
+        "  step _y = a.push(\"other\" + \"!\")\n"
+        "  println(p)\n"
+        "  0\n"
+        "}\n"
+    )
+    with pytest.raises(CompileError, match="use of borrow 'p'"):
+        compile_to_ir(src)
+
+
+def test_borrow_step_from_field_rejected_after_mut_assign(tmp_path):
+    # `step s = r.label; r.label = x; use(s)` — the assignment to
+    # r.label releases the old heap bytes, dangling s.
+    src = (
+        "tablet Row { label: str }\n"
+        "fn main() -> i32 {\n"
+        "  mut r: Row = Row { label: \"first\" + \"!\" }\n"
+        "  step s = r.label\n"
+        "  r.label = \"second\" + \"!\"\n"
+        "  println(s)\n"
+        "  0\n"
+        "}\n"
+    )
+    with pytest.raises(CompileError, match="use of borrow 's'"):
+        compile_to_ir(src)
+
+
+def test_borrow_used_before_mut_call_fine(tmp_path):
+    # Borrow's use happens BEFORE the mut call; no subsequent read
+    # triggers the rule. The check is "use-triggered" — a mut-reach
+    # silently invalidates the borrow, and the error surfaces only
+    # on a post-invalidation read. Naturally permissive for this
+    # common shape.
+    src = (
+        "fn main() -> i32 {\n"
+        "  mut a: tablets[4]str\n"
+        "  step _x = a.push(\"hi\" + \"!\")\n"
+        "  step p = a[0]\n"
+        "  println(p)\n"
+        "  step _y = a.push(\"other\" + \"!\")\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hi!\n"
+
+
+def test_borrow_no_mut_reach_fine(tmp_path):
+    # No mut-reach between borrow bind and use. Always fine.
+    src = (
+        "fn main() -> i32 {\n"
+        "  mut a: tablets[4]str\n"
+        "  step _x = a.push(\"hello\" + \"\")\n"
+        "  step p = a[0]\n"
+        "  println(p)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello\n"
+
+
+def test_borrow_copy_at_bind_site_allows_use_after_mut(tmp_path):
+    # `step n = copy p` where p is a borrow: n is independently
+    # owned, so subsequent mut to a doesn't invalidate it.
+    src = (
+        "fn main() -> i32 {\n"
+        "  mut a: tablets[4]str\n"
+        "  step _x = a.push(\"hello\" + \"\")\n"
+        "  step p = a[0]\n"
+        "  step n = copy p\n"
+        "  step _y = a.push(\"other\" + \"\")\n"
+        "  println(n)\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello\n"
+
+
+def test_borrow_scoped_release_at_block_exit(tmp_path):
+    # Borrow in inner block goes out of scope at block exit, so
+    # subsequent mut-reach in the outer scope is fine.
+    src = (
+        "fn main() -> i32 {\n"
+        "  mut a: tablets[4]str\n"
+        "  step _x = a.push(\"hi\" + \"!\")\n"
+        "  if true {\n"
+        "    step p = a[0]\n"
+        "    println(p)\n"
+        "  }\n"
+        "  step _y = a.push(\"other\" + \"!\")\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hi!\n"
 
 
 def test_seal_pure_enum_no_release_fn(tmp_path):
