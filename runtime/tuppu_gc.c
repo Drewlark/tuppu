@@ -47,8 +47,15 @@ void  __tuppu_gc_push_root(void* slot, const tuppu_type_t* type);
 void  __tuppu_gc_pop_roots(size_t n);
 void  __tuppu_gc_collect(void);
 
+/* Magic precedes every GC header so mark_ptr can distinguish a
+ * GC-tracked allocation from a malloc'd buffer or random stack
+ * garbage. Chosen so it doesn't collide with common byte patterns
+ * (all zeros, all ones, pointer-looking values). */
+#define TUPPU_GC_MAGIC 0x7475707075475443ULL   /* "tuppuGTC" */
+
 /* Object header precedes every GC-tracked allocation. */
 typedef struct tuppu_hdr {
+    uint64_t            magic;  /* TUPPU_GC_MAGIC — sentinel */
     const tuppu_type_t* type;   /* NULL = raw bytes (leaf) */
     size_t              size;   /* total allocation size including header */
     uint8_t             mark;
@@ -99,6 +106,11 @@ void __tuppu_gc_pop_roots(size_t n) {
 
 /* --- mark ---------------------------------------------------------- */
 
+/* Opt-in tracing via the `TUPPU_GC_DEBUG=1` env var. Enables
+ * per-allocation and per-collection stderr lines, used during
+ * migration work to verify shadow-stack state at collect time. */
+static int gc_debug = 0;
+
 static void mark_ptr(void* p);
 
 static void trace_struct(char* obj, const tuppu_type_t* type) {
@@ -112,6 +124,13 @@ static void trace_struct(char* obj, const tuppu_type_t* type) {
 static void mark_ptr(void* p) {
     if (!p) return;
     tuppu_hdr_t* hdr = HDR_OF(p);
+    /* Pointer-validation: during the migration window, Tuppu has
+     * strs and tablets backed by GC memory but other leaf pointers
+     * (colophon returns, string literals pointing into globals,
+     * malloc'd buffers) also flow through the same type-descriptor
+     * machinery. The magic byte distinguishes a GC header from
+     * everything else; unknown ptrs are harmless to ignore. */
+    if (hdr->magic != TUPPU_GC_MAGIC) return;
     if (hdr->mark) return;
     hdr->mark = 1;
     if (hdr->type) {
@@ -123,11 +142,22 @@ static void mark_ptr(void* p) {
 static void mark_all(void) {
     for (size_t i = 0; i < shadow_top; i++) {
         tuppu_root_t r = shadow[i];
+        if (gc_debug) {
+            fprintf(stderr, "gc: root[%zu] slot=%p type=%s n_ptrs=%zu\n",
+                    i, r.slot,
+                    r.type ? r.type->name : "(bytes)",
+                    r.type ? r.type->n_ptrs : 0);
+            if (r.type) {
+                for (size_t j = 0; j < r.type->n_ptrs; j++) {
+                    void* p = *(void**)((char*)r.slot + r.type->ptr_offsets[j]);
+                    fprintf(stderr, "gc:   ptr[%zu off=%zu] = %p\n",
+                            j, r.type->ptr_offsets[j], p);
+                }
+            }
+        }
         if (r.type) {
-            /* Slot IS a struct by value — trace its pointer fields in place. */
             trace_struct((char*)r.slot, r.type);
         } else {
-            /* Slot holds a bare pointer (e.g. raw bytes). */
             mark_ptr(*(void**)r.slot);
         }
     }
@@ -161,23 +191,34 @@ void __tuppu_gc_collect(void) {
 
 static void maybe_collect(void) {
     if (live_bytes >= gc_threshold) {
+        if (gc_debug) fprintf(stderr, "gc: collect start live=%zu top=%zu\n",
+                              live_bytes, shadow_top);
         __tuppu_gc_collect();
-        /* Adaptive threshold: keep GC frequency roughly constant by
-         * aiming for live_bytes at collect time ~= half threshold. */
+        if (gc_debug) fprintf(stderr, "gc: collect end   live=%zu\n",
+                              live_bytes);
         if (live_bytes * 2 > gc_threshold) {
             gc_threshold = live_bytes * 2;
         }
     }
 }
 
+__attribute__((constructor))
+static void gc_init(void) {
+    const char* env = getenv("TUPPU_GC_DEBUG");
+    gc_debug = (env && env[0] == '1');
+}
+
 static void* raw_alloc(size_t obj_size, const tuppu_type_t* type) {
     maybe_collect();
+    if (gc_debug) fprintf(stderr, "gc: alloc %zu bytes live=%zu\n",
+                          obj_size, live_bytes);
     size_t total = HDR_SIZE + obj_size;
     tuppu_hdr_t* hdr = (tuppu_hdr_t*)calloc(1, total);
     if (!hdr) {
         fprintf(stderr, "tuppu: out of memory allocating %zu bytes\n", total);
         abort();
     }
+    hdr->magic = TUPPU_GC_MAGIC;
     hdr->type = type;
     hdr->size = total;
     hdr->mark = 0;
@@ -193,4 +234,13 @@ void* __tuppu_gc_alloc(size_t obj_size, const tuppu_type_t* type) {
 
 void* __tuppu_gc_alloc_bytes(size_t n) {
     return raw_alloc(n, NULL);
+}
+
+/* During the Stage 2 migration, codegen still emits `free(ptr)`
+ * calls from the old release paths (str_release, tablet chunk free).
+ * We route those to this no-op so the libc heap doesn't get
+ * corrupted by a free on a GC-owned buffer. Once Stage 2.5 deletes
+ * the release machinery outright, this symbol becomes unused. */
+void __tuppu_gc_noop_free(void* p) {
+    (void)p;
 }

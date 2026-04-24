@@ -97,6 +97,9 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         # entry, popped at block exit (emitting releases along the way).
         # Mirrors the scope stack — same push/pop cadence.
         self._cleanup_frames: list[list[tuple[ir.Function, ir.Value, str]]] = []
+        # Parallel to _cleanup_frames: count of GC roots pushed into
+        # the innermost frame, popped at frame exit.
+        self._gc_root_counts: list[int] = []
         self._struct_types: dict[str, ir.LiteralStructType] = {}
         self._struct_fields: dict[str, list[tuple[str, ir.Type]]] = {}
         # Seal (sum type) state. `_seal_types` keys are seal names for
@@ -183,6 +186,14 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         return ir.Function(self.module, fn_type, name=name)
 
     def _get_malloc(self) -> ir.Function:
+        """Heap allocator for Tuppu-emitted code. Currently libc
+        malloc. The Stage 2 migration will swap this to
+        `__tuppu_gc_alloc_bytes`, but that requires every allocation
+        site that takes part in the GC reachability graph to also
+        have a type descriptor — tablets chunks in particular need a
+        custom trace fn to walk the chunk chain. Until that landing,
+        we stay on libc malloc and only the Tuppu-side GC helpers
+        (root push/pop, type descs) are wired in preparation."""
         if self._malloc is None:
             self._malloc = self._get_or_declare_libc(
                 "malloc", ir.FunctionType(I8.as_pointer(), [I64]),
@@ -824,7 +835,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         # borrow (caller forced cap=0), so the initial release is a no-op.
         # Non-mut str params stay SSA — they can't be reassigned, and the
         # cap=0 borrow has nothing to free.
-        self._cleanup_frames.append([])
+        self._push_cleanup_frame()
         try:
             # Parameters: step-bound (direct SSA ref) unless the user wrote
             # `mut` — in which case we alloca + store the incoming arg and
@@ -866,6 +877,24 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                         is_mut=True, ir_ref=slot, value_ty=arg.type,
                     )
                     self._maybe_register_cleanup(p.name, arg.type, slot)
+                elif self._type_desc_key(arg.type) is not None:
+                    # Non-mut cleanup-bearing param: spill to a shadow-
+                    # stack-rooted slot so GC cycles during the body
+                    # see it as a root. Without this, a param passed
+                    # as-is through SSA is invisible to the collector
+                    # and can be prematurely reclaimed when a callee
+                    # triggers GC. Cleanup release is still a no-op
+                    # for borrowed-semantics params (caller owns).
+                    slot = self._alloca_entry(arg.type, p.name)
+                    self.builder.store(arg, slot)
+                    # Bind SSA (the incoming value) so reads don't go
+                    # through the slot — the slot is a root spill only.
+                    # `.ir_ref` remains the SSA value for downstream
+                    # ident reads that expect a value, not a pointer.
+                    self.scopes[-1][p.name] = Variable(
+                        is_mut=False, ir_ref=arg, value_ty=arg.type,
+                    )
+                    self._register_gc_root(slot, arg.type)
                 else:
                     self.scopes[-1][p.name] = Variable(
                         is_mut=False, ir_ref=arg, value_ty=arg.type,
@@ -879,6 +908,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 return
             if fn.return_type is None:
                 self._emit_frame_cleanups(self._cleanup_frames[-1])
+                self._emit_all_gc_root_pops_for_early_return()
                 self.builder.ret_void()
             else:
                 if value is None:
@@ -896,9 +926,10 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 if tail_expr is not None:
                     coerced = self._neuter_return_if_borrow(coerced, tail_expr)
                 self._emit_frame_cleanups(self._cleanup_frames[-1])
+                self._emit_all_gc_root_pops_for_early_return()
                 self.builder.ret(coerced)
         finally:
-            self._cleanup_frames.pop()
+            self._pop_cleanup_frame()
 
     def _block_tail_expr(self, e: "A.Expr") -> "A.Expr | None":
         """Find the source expression for a fn/block's tail value, if
@@ -1123,12 +1154,14 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         saved_builder = self.builder
         saved_scopes = self.scopes
         saved_cleanup = self._cleanup_frames
+        saved_root_counts = self._gc_root_counts
         saved_loc = self._current_loc
         # Give the specialization a fresh scope + cleanup stack so it
         # doesn't inherit state from whichever outer emit we're nested
         # inside. _gen_fn_body will overwrite self.scopes anyway but
         # the cleanup stack needs to start empty here.
         self._cleanup_frames = []
+        self._gc_root_counts = []
         self._type_arg_subst = dict(zip(decl.type_params, arg_tys))
         # Declare with a tagged name. Fresh function — distinct from
         # the generic AST decl.name which we never emit directly.
@@ -1175,6 +1208,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             self.builder = saved_builder
             self.scopes = saved_scopes
             self._cleanup_frames = saved_cleanup
+            self._gc_root_counts = saved_root_counts
             self._current_loc = saved_loc
             if saved_functions is None:
                 del self.functions[name]
@@ -1490,7 +1524,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         for arm, vidx, bb in variant_arms:
             self.builder.position_at_end(bb)
             self.scopes.append({})
-            self._cleanup_frames.append([])
+            self._push_cleanup_frame()
             try:
                 self._bind_variant_pattern(arm.pattern, slot, seal_key)
                 val = self._gen_expr(arm.body)
@@ -1503,13 +1537,13 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                     self.builder.branch(merge_bb)
             finally:
                 self.scopes.pop()
-                self._cleanup_frames.pop()
+                self._pop_cleanup_frame()
 
         # Emit default (wildcard or unreachable trap).
         self.builder.position_at_end(default_bb)
         if wildcard_arm is not None:
             self.scopes.append({})
-            self._cleanup_frames.append([])
+            self._push_cleanup_frame()
             try:
                 val = self._gen_expr(wildcard_arm.body)
                 end_bb = self.builder.block
@@ -1521,7 +1555,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                     self.builder.branch(merge_bb)
             finally:
                 self.scopes.pop()
-                self._cleanup_frames.pop()
+                self._pop_cleanup_frame()
         else:
             self.builder.unreachable()
 
@@ -2010,6 +2044,55 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             return val
         return self._deep_clone_if_cleanup_bearing(val)
 
+    def _register_gc_root(self, slot: ir.Value, value_ty: ir.Type) -> None:
+        """If `value_ty` has traceable pointer fields, emit a
+        `__tuppu_gc_push_root(slot, &type_desc)` call at the current
+        IRBuilder position and bump the innermost cleanup frame's
+        pending-root count so the matching `pop_roots(n)` at frame
+        exit balances out. Safe to call for types with no pointer
+        fields — the emit is skipped and nothing is counted."""
+        if not self._cleanup_frames:
+            return
+        pushed = self._emit_gc_push_root(slot, value_ty)
+        if pushed:
+            # Parallel counter: one entry per cleanup frame tracking
+            # how many roots were pushed within it.
+            while len(self._gc_root_counts) < len(self._cleanup_frames):
+                self._gc_root_counts.append(0)
+            self._gc_root_counts[-1] += 1
+
+    def _push_cleanup_frame(self) -> None:
+        """Push a fresh cleanup frame + GC-root counter in lockstep."""
+        self._cleanup_frames.append([])
+        self._gc_root_counts.append(0)
+
+    def _pop_cleanup_frame(self) -> None:
+        """Pop the innermost cleanup frame AND emit the matching
+        `__tuppu_gc_pop_roots(n)` IR call for the roots pushed into
+        that frame. Skip IR emission if the current block is already
+        terminated — the ret has fired, the pop happened inline just
+        before it (via `_emit_all_gc_root_pops_for_early_return`)."""
+        if self._gc_root_counts:
+            n = self._gc_root_counts.pop()
+            if (
+                n > 0
+                and self.builder is not None
+                and not self.builder.block.is_terminated
+            ):
+                self._emit_gc_pop_roots(n)
+        self._cleanup_frames.pop()
+
+    def _emit_all_gc_root_pops_for_early_return(self) -> None:
+        """At an early-return site, unwind every currently-active
+        GC root in one shot. Doesn't mutate `_gc_root_counts` — the
+        Python-side bookkeeping is still needed to satisfy the
+        normal per-frame pops that fire when the (now-dead) body
+        code path is still walked by codegen. LLVM optimizes the
+        dead post-ret IR away."""
+        total = sum(self._gc_root_counts)
+        if total > 0 and self.builder is not None:
+            self._emit_gc_pop_roots(total)
+
     def _deep_clone_if_cleanup_bearing(self, val: ir.Value) -> ir.Value:
         """Deep-clone `val` if it's a cleanup-bearing type — str, a
         user struct whose fields recursively require cloning, a
@@ -2045,9 +2128,12 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
     def _emit_all_cleanups_for_early_return(self) -> None:
         """Emit release calls for every live cleanup frame in the
         current function, innermost first. Used by yield to unwind
-        before the ret."""
+        before the ret. Also emits a cumulative GC pop_roots over
+        every live frame so the shadow stack balance matches the
+        runtime call path."""
         for frame in reversed(self._cleanup_frames):
             self._emit_frame_cleanups(frame)
+        self._emit_all_gc_root_pops_for_early_return()
 
     def _gen_binding(self, b: A.Binding) -> None:
         # Uninitialized mut binding with explicit type: zero-initialize.
@@ -2162,17 +2248,22 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         for the innermost cleanup frame so it fires automatically at
         scope exit. Handled: tablets, the built-in str, user structs
         that (transitively) hold any of those, and seals whose
-        variants carry cleanup-bearing payloads."""
+        variants carry cleanup-bearing payloads.
+
+        Also emits a GC root push for the slot if the type has
+        pointer fields. Tracked count is popped at frame exit."""
         if not self._cleanup_frames:
             return
         info = self._tablets_info_for(value_ty)
         if info is not None:
             self._cleanup_frames[-1].append((info.release, slot, name))
+            self._register_gc_root(slot, value_ty)
             return
         if self._is_str_value(value_ty):
             self._cleanup_frames[-1].append(
                 (self._get_str_release(), slot, name),
             )
+            self._register_gc_root(slot, value_ty)
             return
         if (
             self._struct_fields_for(value_ty) is not None
@@ -2294,6 +2385,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         self._cleanup_frames[-1].append(
             (self._get_struct_release(struct_ty), slot, ".struct.temp"),
         )
+        self._register_gc_root(slot, val.type)
 
     def _get_struct_release(self, struct_ty: ir.Type) -> ir.Function:
         """Build (once, caching by LLVM-type identity) a release fn for
@@ -2660,6 +2752,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         self._cleanup_frames[-1].append(
             (self._get_str_release(), slot, ".str.temp"),
         )
+        self._register_gc_root(slot, val.type)
 
     def _gen_assign(self, a: A.Assign) -> None:
         assert self.builder is not None
@@ -3012,7 +3105,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         """Evaluate a block. Returns the value of its trailing expression, or
         None if the block has no tail or diverged before reaching it."""
         self.scopes.append({})
-        self._cleanup_frames.append([])
+        self._push_cleanup_frame()
         try:
             for stmt in b.stmts:
                 if self._is_terminated():
@@ -3055,7 +3148,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             return tail_val
         finally:
             self.scopes.pop()
-            self._cleanup_frames.pop()
+            self._pop_cleanup_frame()
 
     def _is_borrow_source_expr(self, expr: "A.Expr") -> bool:
         """Does this AST expression read through to bytes someone else

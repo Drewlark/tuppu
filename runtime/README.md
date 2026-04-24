@@ -103,59 +103,67 @@ current shape is "simplest thing that works."
 
 ### Stage 2 — GC on, analyzer still correctness
 
-Everything is allocated via GC. Analyzer still runs and still
-enforces UAF-prevention. Worst-case perf — every alloc goes
-through the GC, every cleanup-bearing local is on the shadow
-stack. This stage is deliberately unoptimized so we can measure
-"pure GC cost" vs. baseline and then measure what Stage 3
-recovers.
+**Progress so far (all LANDED, still gated behind libc malloc):**
+- GC runtime (`tuppu_gc.c`) with magic-guarded mark-sweep + shadow
+  stack. `TUPPU_GC_DEBUG=1` opt-in trace.
+- Codegen helpers: `_get_gc_alloc_bytes`, `_get_gc_push_root`,
+  `_get_gc_pop_roots`.
+- Per-type descriptor emitter `_get_type_desc(value_ty)` for str
+  and user structs with str fields.
+- `_push_cleanup_frame` / `_pop_cleanup_frame` / `_register_gc_root`
+  wrappers wired into every cleanup-frame lifecycle site.
+- `_maybe_register_cleanup`, `_register_str_rvalue_cleanup`,
+  `_register_struct_rvalue_cleanup` all push GC roots.
+- Non-mut cleanup-bearing params spill to shadow-stack-rooted
+  slots at fn entry (critical: SSA params are invisible to the
+  collector otherwise).
+- Early-return / yield paths emit a cumulative `pop_roots(total)`.
 
-**Must migrate atomically.** A half-migrated state crashes: if
-any allocation path still calls malloc while the matching release
-path calls __tuppu_gc_alloc_bytes (or vice versa), `free()` on a
-GC-owned buffer corrupts the libc heap. No partial-migration
-intermediate state is safe.
+**The atomic switch is NOT yet flipped.** `_get_malloc` still
+returns libc malloc. When it flips to `__tuppu_gc_alloc_bytes`,
+the following work has to land together in one change:
 
-Migration checklist (all in one commit or one tight sequence):
+- [ ] **Tablets tracing.** This is the blocker. `tablets[N]T` uses
+      a chunk chain (`{elements: [N×T], used: i64, next: *node}`)
+      that a flat ptr_offsets table can't walk. Runtime needs a
+      `trace_fn` field on `tuppu_type_t`; if non-null, GC calls it
+      instead of iterating offsets. Codegen emits a per-
+      (N, elem_ty) trace fn that walks chunks and calls
+      `mark_ptr` on each pointer-bearing field of each used slot.
+- [ ] Runtime: add `trace_fn` field + dispatch to `tuppu_type_t`,
+      update `trace_struct` / `mark_ptr` to call it.
+- [ ] Codegen: `_type_desc_key` / `_type_ptr_offsets` / new
+      `_type_trace_fn` cover tablets + struct-with-tablets-field
+      + seal variants with cleanup payloads.
+- [ ] Flip `_get_malloc` to return `_get_gc_alloc_bytes()`. Flip
+      `_get_free` to return a no-op (add `__tuppu_gc_noop_free`
+      to runtime, which exists already in this branch's earlier
+      exploration).
+- [ ] Diagnose two known failure modes from the earlier spike:
+      - `test_slice_of_concat_no_leak` crashes at ~100 iterations
+        because the stdlib `str_concat` uses `mut buf: tablets[64]u8`
+        internally; without tablets tracing, the chunk gets GC'd
+        mid-iteration.
+      - `test_str_repeat_linear_on_large_n` same root cause.
+- [ ] Update `test_helpers_emitted` to match new IR
+      (`__tuppu_gc_alloc_bytes` in place of `malloc`).
+- [ ] Capture Stage-2 benchmark pass vs BENCH_BASELINE.md.
 
-- [x] Codegen: GC-extern helpers + type descriptor emitter.
-      (commit abc028b)
-- [ ] Codegen: type descriptor for str (one ptr field at offset 0,
-      24-byte size). Call via `_get_type_desc`.
-- [ ] Codegen: type descriptors for user structs (transitively
-      cleanup-bearing). Walk fields, pick up str-field offsets;
-      extend later to nested struct / seal fields.
-- [ ] Codegen: type descriptor for tablets — CUSTOM TRACE needed.
-      Tablets chunks are a linked-list of blocks; a simple
-      ptr_offsets array can't express walk-the-chain. Add a
-      `trace_fn` field to `tuppu_type_t`, emit a per-tablets-type
-      trace fn that walks chunks and calls `mark_ptr` on each
-      element's ptr field. Runtime change: if `trace != NULL`,
-      call `trace(obj)` instead of iterating `ptr_offsets`.
-- [ ] Codegen: replace `_get_malloc()` with `_get_gc_alloc_bytes()`
-      at every str / tablets allocation site — there are ~12 total
-      across codegen/__init__.py, codegen/strs.py, codegen/tablets.py.
-      Consider just changing `_get_malloc` itself to return the GC
-      allocator; then every caller transparently moves.
-- [ ] Codegen: remove `free()` calls in str_release, tablets
-      release, cstr-to-str cleanup. Make these paths no-ops (GC
-      reclaims). Alternatively route `_get_free` to a no-op.
-- [ ] Codegen: at `_maybe_register_cleanup`, also emit
-      `_emit_gc_push_root(slot, value_ty)`. Track the count per
-      cleanup frame.
-- [ ] Codegen: at `_emit_frame_cleanups`, after the existing
-      release walks, emit `_emit_gc_pop_roots(count)`.
-- [ ] Runtime: add `trace_fn` field + call site in tuppu_gc.c.
-- [ ] Run full test suite — expect some adjustments for the
-      changed malloc ↔ GC boundary.
-- [ ] Capture Stage-2 benchmark pass.
-
-**Crucial correctness invariant** (when stage 2 lands): every live
+**Crucial correctness invariant** (when Stage 2 lands): every live
 cleanup-bearing local must be on the shadow stack between any two
 allocation sites. An allocation can trigger a GC, which will
-reclaim anything not rooted. The conservative rule — push a root
-at every alloca, pop at every return — is unconditionally safe.
-Optimization (stage 3) loosens this.
+reclaim anything not rooted. Conservative rule — push a root at
+every alloca, pop at every return — is unconditionally safe.
+Optimization (Stage 3) loosens this.
+
+**Lesson from the partial attempt:** SSA register values aren't
+roots. Non-mut cleanup-bearing params had to be spilled to
+shadow-stack slots at fn entry. Same discipline applies to any
+intermediate result held in SSA across an allocating call — the
+existing `_register_str_rvalue_cleanup` / `_register_struct_rvalue_cleanup`
+sites cover the common cases (anonymous call-arg temporaries), but
+sweep through once the atomic flip happens to verify no SSA
+borrow-return survives across a GC trigger.
 
 ### Stage 2.5 — delete correctness analyzer
 
