@@ -1036,15 +1036,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 raise CodegenError("fn-value call arg has no value")
             coerced = self._coerce(v, expected_ty)
             if self._is_str_value(expected_ty):
-                self._register_str_rvalue_cleanup(coerced, arg)
                 coerced = self._str_as_borrow(coerced)
             elif (
                 self._struct_fields_for(expected_ty) is not None
                 and self._struct_needs_cleanup(expected_ty)
             ):
-                self._register_struct_rvalue_cleanup(
-                    coerced, arg, expected_ty,
-                )
                 coerced = self._struct_as_borrow(coerced, expected_ty)
             call_args.append(coerced)
         return self.builder.call(fn_ptr, call_args)
@@ -1758,11 +1754,8 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                             coerced = self._deep_clone_if_cleanup_bearing(coerced)
                     elif self._is_borrow_source_expr(arg):
                         coerced = self._deep_clone_if_cleanup_bearing(coerced)
-                    else:
-                        # Fresh rvalue (Call, Binary, etc.): spill + root
-                        # the SSA value so subsequent arg eval or the
-                        # ctor's own internal work can't reclaim it.
-                        self._root_rvalue_for_gc(coerced, arg)
+                    # else: fresh-owned rvalue is already rooted by the
+                    # `_gen_expr` chokepoint; no extra spill here.
                 field_ptr = self.builder.gep(
                     typed_ptr,
                     [ir.Constant(I32, 0), ir.Constant(I32, i)],
@@ -2142,9 +2135,10 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         if isinstance(s, A.ReleaseStmt):
             self._gen_release(s); return
         if isinstance(s, A.ExprStmt):
-            val = self._gen_expr(s.expr)
-            if val is not None:
-                self._register_str_rvalue_cleanup(val, s.expr)
+            # The `_gen_expr` chokepoint has already rooted any
+            # cleanup-bearing rvalue produced by `s.expr`; discard
+            # the value.
+            self._gen_expr(s.expr)
             return
         raise CodegenError(f"statement not supported yet: {type(s).__name__}")
 
@@ -2739,26 +2733,6 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 result = b.insert_value(result, borrowed, i)
         return result
 
-    def _register_struct_rvalue_cleanup(
-        self, val: ir.Value, src: A.Expr, struct_ty: ir.Type,
-    ) -> None:
-        """Anonymous cleanup for a cleanup-bearing struct rvalue the
-        caller doesn't bind — e.g. `take(build_row())`. Skips Idents
-        and Fields (already owned by someone tracked); struct literals,
-        calls, etc. genuinely produce fresh owners that this scope
-        now holds."""
-        if isinstance(src, (A.Ident, A.Field)):
-            return
-        if not self._cleanup_frames:
-            return
-        assert self.builder is not None
-        slot = self._alloca_entry(val.type, ".struct.temp")
-        self.builder.store(val, slot)
-        self._cleanup_frames[-1].append(
-            (self._get_struct_release(struct_ty), slot, ".struct.temp"),
-        )
-        self._register_gc_root(slot, val.type)
-
     def _get_struct_release(self, struct_ty: ir.Type) -> ir.Function:
         """Build (once, caching by LLVM-type identity) a release fn for
         a user struct: `__tuppu_struct_<name>_release(s: *struct_ty)`.
@@ -3156,30 +3130,6 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             return f"{name}__{arg_tag}"
         return "anon_seal"
 
-    def _register_str_rvalue_cleanup(
-        self, val: ir.Value, src: A.Expr,
-    ) -> None:
-        """Anonymous-temp auto-release for a str rvalue the caller doesn't
-        bind. The heap bytes in `val` need an owner somewhere; if the
-        source expression can produce a freshly-owned str (a Call) we
-        spill it to a local slot and register release at current-scope
-        exit. Idents and Fields are intentionally skipped — they read a
-        value someone else already owns. String literals carry cap=0,
-        so there's nothing to free."""
-        if not self._is_str_value(val.type):
-            return
-        if isinstance(src, (A.Ident, A.Field, A.StringLit)):
-            return
-        if not self._cleanup_frames:
-            return
-        assert self.builder is not None
-        slot = self._alloca_entry(val.type, ".str.temp")
-        self.builder.store(val, slot)
-        self._cleanup_frames[-1].append(
-            (self._get_str_release(), slot, ".str.temp"),
-        )
-        self._register_gc_root(slot, val.type)
-
     def _force_root_cleanup_value(self, val: ir.Value) -> ir.Value:
         """Chokepoint primitive. Unconditionally spill+root a
         cleanup-bearing rvalue — used at PRODUCTION sites (Call /
@@ -3229,17 +3179,6 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             )
         self._register_gc_root(slot, val.type)
         return val
-
-    def _root_rvalue_for_gc(self, val: ir.Value, src: A.Expr) -> None:
-        """DEPRECATED — consumer-site rooting. Delegates to the
-        chokepoint primitive, skipping aliased sources (Idents,
-        Fields, Indexes, StringLits) whose owners already provide
-        reachability. New code should call `_force_root_cleanup_value`
-        directly at producer sites; this shim is kept only while the
-        existing consumer-site call sites are being unwound."""
-        if isinstance(src, (A.Ident, A.Field, A.Index, A.StringLit)):
-            return
-        self._force_root_cleanup_value(val)
 
     def _gen_assign(self, a: A.Assign) -> None:
         assert self.builder is not None
@@ -3817,15 +3756,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 raise CodegenError("gloss arg has no value")
             coerced = self._coerce(v, expected_ty.type)
             if self._is_str_value(expected_ty.type):
-                self._register_str_rvalue_cleanup(coerced, arg_expr)
                 coerced = self._str_as_borrow(coerced)
             elif (
                 self._struct_fields_for(expected_ty.type) is not None
                 and self._struct_needs_cleanup(expected_ty.type)
             ):
-                self._register_struct_rvalue_cleanup(
-                    coerced, arg_expr, expected_ty.type,
-                )
                 coerced = self._struct_as_borrow(coerced, expected_ty.type)
             call_args.append(coerced)
         return self.builder.call(fn, call_args)
@@ -4194,15 +4129,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             if param_mut_list is not None and i < len(param_mut_list):
                 param_is_mut = param_mut_list[i]
             if self._is_str_value(expected_ty):
-                self._register_str_rvalue_cleanup(coerced, arg)
                 coerced = self._str_as_borrow(coerced)
             elif (
                 self._struct_fields_for(expected_ty) is not None
                 and self._struct_needs_cleanup(expected_ty)
             ):
-                self._register_struct_rvalue_cleanup(
-                    coerced, arg, expected_ty,
-                )
                 if param_is_mut:
                     coerced = self._struct_as_borrow(coerced, expected_ty)
             call_args.append(coerced)
@@ -4239,7 +4170,6 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             val = self._gen_expr(arg)
             if val is None:
                 raise CodegenError("print argument has no value")
-            self._register_str_rvalue_cleanup(val, arg)
             last = (i == len(args) - 1)
             self._emit_one_print(val, newline=(newline and last))
 
@@ -4348,8 +4278,6 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         intermediate (`foo() + "x"`) is released at scope exit."""
         assert self.builder is not None
         b = self.builder
-        for v, src in parts:
-            self._register_str_rvalue_cleanup(v, src)
         # Extract ptr / len up front so the two passes (sum lengths,
         # copy bytes) share the same SSA values.
         ptrs_lens = [
@@ -4455,7 +4383,6 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         hi = self._gen_expr(args[2])
         if s is None or lo is None or hi is None:
             raise CodegenError("str_slice argument has no value")
-        self._register_str_rvalue_cleanup(s, args[0])
         lo = self._coerce(lo, I64)
         hi = self._coerce(hi, I64)
         return self.builder.call(self._get_str_slice(), [s, lo, hi])
@@ -4620,15 +4547,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             # true owner stays in the caller's frame — same convention
             # as passing through a cap=0 str param.
             if self._is_str_value(info.elem_ty):
-                self._register_str_rvalue_cleanup(v, fexpr)
                 v = self._str_as_borrow(v)
             elif (
                 self._struct_fields_for(info.elem_ty) is not None
                 and self._struct_needs_cleanup(info.elem_ty)
             ):
-                self._register_struct_rvalue_cleanup(
-                    v, fexpr, info.elem_ty,
-                )
                 v = self._struct_as_borrow(v, info.elem_ty)
             self.builder.call(info.push, [slot, v])
         return slot
@@ -4701,11 +4624,8 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                         fv = self._deep_clone_if_cleanup_bearing(fv)
                 elif self._is_borrow_source_expr(fexpr):
                     fv = self._deep_clone_if_cleanup_bearing(fv)
-                else:
-                    # Fresh rvalue (Call, Binary, StructLit, etc.) —
-                    # root the SSA value so subsequent field eval's
-                    # allocations can't reclaim it under GC.
-                    self._root_rvalue_for_gc(fv, fexpr)
+                # else: fresh rvalue already rooted by the `_gen_expr`
+                # chokepoint when `fexpr` was evaluated.
             value = self.builder.insert_value(value, self._coerce(fv, fty), i)
         return value
 
@@ -4844,10 +4764,8 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             raise CodegenError(
                 "slice expression target must be a str value"
             )
-        # If the target itself is a heap-producing rvalue (e.g.
-        # `str_concat(a,b)[0:3]`), register it for cleanup so the
-        # bytes don't orphan after the slice call reads them.
-        self._register_str_rvalue_cleanup(target, e.target)
+        # Heap-producing rvalue targets (`str_concat(a,b)[0:3]`) were
+        # already rooted by `_gen_expr`'s chokepoint; no extra spill.
         if e.lo is None:
             lo = ir.Constant(I64, 0)
         else:
