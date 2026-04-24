@@ -366,7 +366,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         if cached is not None:
             return cached
         offsets = self._chunk_ptr_offsets(N, elem_ty)
-        size = N * self._size_of_ty(elem_ty) + 16
+        size = N * self._size_of(elem_ty) + 16
         offsets_arr_ty = ir.ArrayType(I64, len(offsets))
         offsets_arr = ir.GlobalVariable(
             self.module, offsets_arr_ty, f"{key}_offsets",
@@ -398,27 +398,6 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         ])
         self._type_descs[key] = desc
         return desc
-
-    def _size_of_ty(self, ty: ir.Type) -> int:
-        """Conservative byte size used for laying out type
-        descriptors. Matches the sizes clang emits on a 64-bit host
-        for the types Tuppu generates — scalars at their natural
-        width, pointers at 8, aggregates as a sum of fields. This
-        only feeds the GC's ptr_offset table; LLVM still owns the
-        actual layout in codegen."""
-        if isinstance(ty, ir.IntType):
-            return (ty.width + 7) // 8
-        if isinstance(ty, ir.PointerType):
-            return 8
-        if isinstance(ty, ir.DoubleType):
-            return 8
-        if isinstance(ty, ir.FloatType):
-            return 4
-        if isinstance(ty, ir.LiteralStructType) or isinstance(ty, ir.IdentifiedStructType):
-            return sum(self._size_of_ty(el) for el in ty.elements)
-        if isinstance(ty, ir.ArrayType):
-            return ty.count * self._size_of_ty(ty.element)
-        return 8  # fallback
 
     def _get_type_desc(self, value_ty: ir.Type) -> ir.GlobalVariable | None:
         """Fetch or emit a `tuppu_type_t` global for `value_ty`. Returns
@@ -483,7 +462,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         desc.global_constant = True
         desc.initializer = ir.Constant(self._type_desc_ty, [
             name_arr.bitcast(I8.as_pointer()),
-            ir.Constant(I64, self._size_of_ty(value_ty)),
+            ir.Constant(I64, self._size_of(value_ty)),
             ir.Constant(I64, len(offsets)),
             offsets_arr.bitcast(I64.as_pointer()),
             trace_init,
