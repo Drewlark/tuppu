@@ -314,6 +314,36 @@ def test_match_stmt_arm_with_void_call_tail(tmp_path):
     assert out == b"42\n42\n"
 
 
+def test_match_binder_survives_scrutinee_source_mutation(tmp_path):
+    # Match binders alias into the scrutinee's payload. If the arm
+    # body calls anything that frees the SOURCE of the scrutinee
+    # (here p_bump reassigns p.cur, releasing the old Ident payload),
+    # a naive borrow binder would dangle. Fix: deep-clone the
+    # scrutinee into match.scrut so binders read from a stable local
+    # copy, independent of the source.
+    src = (
+        "seal Tok { Ident(str), EOF }\n"
+        "tablet Parser { cur: Tok }\n"
+        "fn p_bump(mut p: Parser) {\n"
+        "  p.cur = EOF\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  mut p: Parser = Parser { cur: Ident(\"hel\" + \"lo\") }\n"
+        "  match p.cur {\n"
+        "    Ident(name) => {\n"
+        "      p_bump(p)\n"
+        "      println(name)\n"
+        "    },\n"
+        "    EOF => println(\"eof\"),\n"
+        "  }\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out, _ = run(src, tmp_path)
+    assert rc == 0
+    assert out == b"hello\n"
+
+
 def test_match_stmt_multiple_void_call_arms(tmp_path):
     # Mixed arms: void-call tail, empty body, another void-call tail.
     # All should normalize to no-value; no phi construction.
