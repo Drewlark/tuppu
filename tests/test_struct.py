@@ -651,6 +651,47 @@ def test_generic_recursive_with_wedge(tmp_path):
     assert out == b"2\n1\n"
 
 
+def test_wedge_field_assign_through_mut_handle(tmp_path):
+    # `w.field = v` where w is a mut wedge binding. The lvalue path
+    # auto-derefs the wedge (same as the read side) and GEPs into
+    # the tablets-owned struct. Fails previously with "not a user
+    # tablet" because the lvalue walk saw the pointer type.
+    src = (
+        "tablet N { next: wedge N, val: i64 }\n"
+        "fn main() -> i32 {\n"
+        "  mut store: tablets[8]N\n"
+        "  mut a: wedge N = store.push(N { next: lost, val: 10 })\n"
+        "  mut b: wedge N = store.push(N { next: lost, val: 20 })\n"
+        "  b.next = a\n"
+        "  println(b.next.val)\n"
+        "  println(b.val)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"10\n20\n"
+
+
+def test_wedge_field_assign_through_step_handle(tmp_path):
+    # Step-bound wedges are SSA-immutable (the handle itself can't
+    # be reassigned), but mutating the struct THAT the wedge points
+    # at is fine — the tablets owns that storage and is mut.
+    # Parallels `arr[n].field = v`.
+    src = (
+        "tablet N { next: wedge N, val: i64 }\n"
+        "fn main() -> i32 {\n"
+        "  mut store: tablets[8]N\n"
+        "  step a = store.push(N { next: lost, val: 1 })\n"
+        "  step b = store.push(N { next: lost, val: 2 })\n"
+        "  b.next = a\n"
+        "  println(b.next.val)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"1\n"
+
+
 def test_generic_arity_mismatch_rejected():
     with pytest.raises(CompileError, match="expects 1 type argument"):
         compile_to_ir(

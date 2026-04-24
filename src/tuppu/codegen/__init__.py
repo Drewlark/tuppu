@@ -2494,18 +2494,52 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
     def _lvalue_slot(self, target: A.Expr) -> tuple[ir.Value, ir.Type]:
         """Resolve an lvalue to (pointer-to-slot, value-type-at-slot).
 
-        Root must be a mut-bound Ident. Each Field step GEPs one level
+        Root must be a mut-bound Ident, or a step-bound wedge (step
+        bindings are SSA-immutable but writing THROUGH the handle into
+        the underlying tablets slot is fine, same as `arr[n].field = v`
+        going through a mut tablets). Each Field step GEPs one level
         deeper through the appropriate user-struct LLVM type."""
         assert self.builder is not None
         if isinstance(target, A.Ident):
             var = self._lookup(target.name)
-            if not var.is_mut:
-                raise CodegenError(
-                    f"cannot assign to step binding {target.name!r}"
-                )
-            return var.ir_ref, var.value_ty
+            if var.is_mut:
+                return var.ir_ref, var.value_ty
+            # Step-bound wedge: the binding is an SSA pointer value.
+            # Spill to a throwaway slot so Field auto-deref has a
+            # pointer-to-pointer to load from. The spill is local —
+            # mutations happen in the pointee, not in the binding.
+            if isinstance(var.value_ty, ir.PointerType):
+                slot = self._alloca_entry(var.value_ty, f".{target.name}.lv")
+                self.builder.store(var.ir_ref, slot)
+                return slot, var.value_ty
+            raise CodegenError(
+                f"cannot assign to step binding {target.name!r}"
+            )
         if isinstance(target, A.Field):
             parent_ptr, parent_ty = self._lvalue_slot(target.target)
+            # Wedge (tablet handle) auto-deref for lvalue field access:
+            # the parent slot holds a `*T` pointer into a tablets-owned
+            # slot. Load the handle, then GEP through the pointee to
+            # the field — mirrors the read-side wedge-deref in
+            # `_gen_field`. Without this, `w.field = x` on a `wedge T`
+            # errored with "not a user tablet" since the direct path
+            # sees the pointer type.
+            if isinstance(parent_ty, ir.PointerType):
+                pointee = parent_ty.pointee
+                pointee_fields = self._struct_fields_for(pointee)
+                if pointee_fields is not None:
+                    wedge_val = self.builder.load(parent_ptr)
+                    for i, (fname, fty) in enumerate(pointee_fields):
+                        if fname == target.name:
+                            field_ptr = self.builder.gep(
+                                wedge_val,
+                                [ir.Constant(I32, 0), ir.Constant(I32, i)],
+                                inbounds=True,
+                            )
+                            return field_ptr, fty
+                    raise CodegenError(
+                        f"tablet has no field {target.name!r}"
+                    )
             fields = self._struct_fields_for(parent_ty)
             if fields is None:
                 raise CodegenError(
