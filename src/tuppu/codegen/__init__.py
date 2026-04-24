@@ -1529,6 +1529,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                             coerced = self._deep_clone_if_cleanup_bearing(coerced)
                     elif self._is_borrow_source_expr(arg):
                         coerced = self._deep_clone_if_cleanup_bearing(coerced)
+                    else:
+                        # Fresh rvalue (Call, Binary, etc.): spill + root
+                        # the SSA value so subsequent arg eval or the
+                        # ctor's own internal work can't reclaim it.
+                        self._root_rvalue_for_gc(coerced, arg)
                 field_ptr = self.builder.gep(
                     typed_ptr,
                     [ir.Constant(I32, 0), ir.Constant(I32, i)],
@@ -2860,6 +2865,59 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         self._cleanup_frames[-1].append(
             (self._get_str_release(), slot, ".str.temp"),
         )
+        self._register_gc_root(slot, val.type)
+
+    def _root_rvalue_for_gc(self, val: ir.Value, src: A.Expr) -> None:
+        """Generalization of `_register_str_rvalue_cleanup` to ANY
+        cleanup-bearing rvalue. Spills the SSA value to a stack slot
+        and pushes it onto the GC shadow stack so subsequent
+        allocations in the enclosing expression can't reclaim it.
+
+        Idents / Fields / Indexes / StringLits are intentionally
+        skipped — those read an alias into storage someone else
+        owns, and that owner's root (or the source struct's trace)
+        covers reachability. Only fresh-rvalue producers (Call,
+        Binary, StructLit, TabletsLit, variant Call, Copy, etc.)
+        need the spill.
+
+        Release-cleanup is also registered, mirroring the str path,
+        so the normal scope-exit release runs (no-op under GC, but
+        preserved for the transitional window when some paths may
+        still be libc-backed)."""
+        if not self._cleanup_frames:
+            return
+        if isinstance(src, (A.Ident, A.Field, A.Index, A.StringLit)):
+            return
+        if self._type_desc_key(val.type) is None:
+            return
+        assert self.builder is not None
+        slot = self._alloca_entry(val.type, ".rvalue.root")
+        self.builder.store(val, slot)
+        # Release entry — dispatch by type. Keeps the scope-exit
+        # release machinery's shape consistent, so post-GC-delete
+        # work can sweep them all at once.
+        if self._is_str_value(val.type):
+            release = self._get_str_release()
+        else:
+            info = self._tablets_info_for(val.type)
+            if info is not None:
+                release = info.release
+            elif (
+                self._struct_fields_for(val.type) is not None
+                and self._struct_needs_cleanup(val.type)
+            ):
+                release = self._get_struct_release(val.type)
+            elif (
+                self._seal_key_for_ty(val.type) is not None
+                and self._seal_needs_cleanup(val.type)
+            ):
+                release = self._get_seal_release(val.type)
+            else:
+                release = None
+        if release is not None:
+            self._cleanup_frames[-1].append(
+                (release, slot, ".rvalue.root"),
+            )
         self._register_gc_root(slot, val.type)
 
     def _gen_assign(self, a: A.Assign) -> None:
@@ -4280,6 +4338,11 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                         fv = self._deep_clone_if_cleanup_bearing(fv)
                 elif self._is_borrow_source_expr(fexpr):
                     fv = self._deep_clone_if_cleanup_bearing(fv)
+                else:
+                    # Fresh rvalue (Call, Binary, StructLit, etc.) —
+                    # root the SSA value so subsequent field eval's
+                    # allocations can't reclaim it under GC.
+                    self._root_rvalue_for_gc(fv, fexpr)
             value = self.builder.insert_value(value, self._coerce(fv, fty), i)
         return value
 
