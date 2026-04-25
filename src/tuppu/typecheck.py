@@ -22,15 +22,7 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 from . import ast as A
-from .effects import EffectAnalyzer, ParamEffects
 from .errors import CompileError, CompileWarning
-
-
-def _paths_overlap(a: tuple[str, ...], b: tuple[str, ...]) -> bool:
-    """Two field paths overlap if one is a prefix of the other — a
-    write at `a` reaches, or is reached by, a borrow at `b`."""
-    n = min(len(a), len(b))
-    return a[:n] == b[:n]
 
 
 def _suggest(name: str, candidates: Iterable[str]) -> str:
@@ -388,53 +380,6 @@ class Checker:
         # storage). Anything else in scope is locally declared and
         # cannot escape via return without an explicit `copy`.
         self._fn_params: set[str] = set()
-        # Per-fn inference: if `foo`'s body tail aliases parameter N,
-        # `fn_return_alias["foo"] = N`. Call sites consult this to
-        # register the call result as a borrow of args[N]'s root.
-        # None / missing means the return is fresh-owned.
-        self.fn_return_alias: dict[str, int] = {}
-        # Parameter index order for each fn, so `_tc_call` can map
-        # alias indices back to arg expressions.
-        self.fn_param_names: dict[str, tuple[str, ...]] = {}
-        # Freeze-while-borrow state. Per-scope, `_borrow_sources` maps
-        # a borrow binding's name → its source root (the outermost
-        # owning Ident whose mutation would invalidate the borrow).
-        # `_invalidated` records borrows whose root has been mut-
-        # reached since their binding — any read of an invalidated
-        # borrow is rejected with a suggestion to `copy`.
-        self._borrow_sources: list[dict[str, str]] = [{}]
-        self._invalidated: set[str] = set()
-        # Persistent borrow registry for the current fn body —
-        # parallels `_borrow_sources` but doesn't get popped at scope
-        # exit. Needed for escape analysis: the match-arm escape
-        # check runs AFTER the arm scopes have been popped, so it
-        # needs a record of which bindings were borrows of what.
-        self._all_borrow_sources: dict[str, str] = {}
-        # Borrows whose chain passes through a Field / Index read
-        # (directly or transitively) or through a match pattern
-        # binder. These CAN'T be returned as an Ident and have
-        # ownership transferred — the source is inside a container /
-        # seal payload, not its own slot. Returning them is an
-        # escape even if the ultimate root looks local-safe via
-        # transfer-on-tail.
-        self._field_borrows: set[str] = set()
-        # Maps a borrow binding's name → its originating Binding AST
-        # node, so a later invalidated read can retroactively wrap
-        # the init in Copy (Phase A implicit-copy + warning). When a
-        # borrow is registered without a Binding node (match binders,
-        # wedge handle pseudo-borrows), it's absent here and a
-        # rejection can't auto-fix — those paths keep the hard error.
-        self._borrow_binding_nodes: dict[str, A.Binding] = {}
-        # Effect analysis summaries. Populated after fn signatures
-        # are known; consumed at call-site invalidation to skip
-        # borrows whose paths don't overlap a callee's write set.
-        # Keyed by fn name; each value is a list aligned with the
-        # fn's parameter positions.
-        self.fn_effects: dict[str, list[ParamEffects]] = {}
-        # Path from each borrow's root to the borrowed bytes. Empty
-        # tuple means the whole root. Used together with fn_effects
-        # to rule out bogus invalidations.
-        self._borrow_paths: dict[str, tuple[str, ...]] = {}
 
     def _warn(self, message: str, line: int = 0, col: int = 0) -> None:
         self.warnings.append(CompileWarning(message=message, line=line, col=col))
@@ -469,20 +414,11 @@ class Checker:
         for d in self.prog.decls:
             if isinstance(d, A.TableDecl):
                 self._register_table(d)
-        # Phase 1b: effect analysis over user fn bodies. The call-site
-        # freeze rule consults these summaries to skip invalidation of
-        # borrows whose paths don't overlap the callee's write set.
-        self._compute_fn_effects()
         for d in self.prog.decls:
             if isinstance(d, A.FnDecl):
                 self._check_fn_body(d)
             elif isinstance(d, A.GlossDecl):
                 self._check_gloss_body(d)
-
-    def _compute_fn_effects(self) -> None:
-        fn_decls = [d for d in self.prog.decls if isinstance(d, A.FnDecl)]
-        analyzer = EffectAnalyzer(fn_decls, set(self.colophons))
-        self.fn_effects = analyzer.run()
 
     # --- registration ------------------------------------------------
 
@@ -628,7 +564,6 @@ class Checker:
             params=params, ret=ret, is_variadic=is_variadic,
             param_muts=tuple(p.is_mut for p in fn.params),
         )
-        self.fn_param_names[fn.name] = tuple(p.name for p in fn.params)
         # Did-you-mean warning: users who write `fn add(a: Vec, b: Vec)
         # -> Vec` on user types probably meant `gloss add`. Warn but
         # don't reject — the regular fn may be intentional.
@@ -904,12 +839,6 @@ class Checker:
         self._local_tablets = set()
         self._tainted = {}
         self._fn_params = {p.name for p in fn.params}
-        self._borrow_sources = [{}]
-        self._all_borrow_sources = {}
-        self._field_borrows = set()
-        self._invalidated = set()
-        self._borrow_binding_nodes = {}
-        self._borrow_paths = {}
         # Type params are in scope while we check the body so local
         # bindings with annotations like `mut cur: wedge Node<T>` work.
         saved = self._active_type_vars
@@ -946,85 +875,6 @@ class Checker:
                 f"instead.",
                 fn.line, fn.col,
             )
-        # Escape analysis: a borrow-valued fn body tail that aliases
-        # a binding local to this fn would dangle at return. Rewrite
-        # the escape leaves to `copy <leaf>` and emit an implicit-
-        # copy warning at each site. (Wedges go through the separate
-        # `_expr_escapes` path above; this rule covers str / struct /
-        # tablets / seal returns.)
-        if not isinstance(expected, (TyUnit, TyDiverge)):
-            if self._return_borrow_escape(fn.body) is not None:
-                self._wrap_escape_sites(fn.body)
-        # Return-aliases-param inference. If the tail / any yielded
-        # value aliases a parameter, record which param index for
-        # call-site borrow tracking. Stops callers from treating the
-        # return as fresh-owned when it's actually a pass-through
-        # borrow.
-        if self._needs_borrow_tracking(expected):
-            idx = self._infer_return_alias(fn.body)
-            if idx is not None:
-                self.fn_return_alias[fn.name] = idx
-
-    def _infer_return_alias(self, e: A.Expr) -> int | None:
-        """Walk reachable tail expressions. If any tail resolves to a
-        parameter (by Ident-chain or through Field/Index), return that
-        param's index. Conservatively picks the first param found —
-        callers treat the whole return as a borrow of that arg."""
-        if isinstance(e, A.Ident):
-            param_names = self.fn_param_names.get(self.current_fn, ())
-            if e.name in param_names:
-                return param_names.index(e.name)
-            # Transitively chase borrow chains. A `step w = y; w` at
-            # tail resolves to y; if y is a param, aliased.
-            if e.name in self._all_borrow_sources:
-                root = self._all_borrow_sources[e.name]
-                while root in self._all_borrow_sources:
-                    root = self._all_borrow_sources[root]
-                if root in param_names:
-                    return param_names.index(root)
-            return None
-        if isinstance(e, (A.Field, A.Index)):
-            cur: A.Expr = e
-            while isinstance(cur, (A.Field, A.Index)):
-                cur = cur.target
-            if isinstance(cur, A.Ident):
-                return self._infer_return_alias(cur)
-            return None
-        if isinstance(e, A.Block):
-            return self._infer_return_alias(e.tail) if e.tail else None
-        if isinstance(e, A.IfExpr):
-            t = (
-                self._infer_return_alias(e.then.tail)
-                if isinstance(e.then, A.Block) and e.then.tail
-                else None
-            )
-            if t is not None:
-                return t
-            if e.else_ is None:
-                return None
-            if isinstance(e.else_, A.IfExpr):
-                return self._infer_return_alias(e.else_)
-            if isinstance(e.else_, A.Block):
-                return (
-                    self._infer_return_alias(e.else_.tail)
-                    if e.else_.tail else None
-                )
-            return None
-        if isinstance(e, A.MatchExpr):
-            for arm in e.arms:
-                idx = self._infer_return_alias(arm.body)
-                if idx is not None:
-                    return idx
-            return None
-        if isinstance(e, A.Call) and isinstance(e.callee, A.Ident):
-            # Transitive: calling a fn that itself return-aliases its
-            # own param N passes through to whichever of OUR args
-            # gets passed there.
-            callee_alias = self.fn_return_alias.get(e.callee.name)
-            if callee_alias is not None and callee_alias < len(e.args):
-                return self._infer_return_alias(e.args[callee_alias])
-            return None
-        return None
 
     # --- type resolution --------------------------------------------
 
@@ -1141,329 +991,9 @@ class Checker:
 
     def _push(self) -> None:
         self.scopes.append({})
-        self._borrow_sources.append({})
 
     def _pop(self) -> None:
         self.scopes.pop()
-        # Borrows go out of scope when the block ends; their
-        # invalidation state no longer matters. Clear any leftover
-        # invalidation entries pointing at borrows we're about to drop.
-        dropped = self._borrow_sources.pop()
-        for name in dropped:
-            self._invalidated.discard(name)
-
-    def _return_borrow_escape(self, e: A.Expr) -> str | None:
-        """Return the name of a local binding whose storage would be
-        freed at fn exit but which appears as (part of) the fn's
-        return value via borrowing. Returns None if the expression is
-        safe to return — either fresh-owned or rooted at a parameter.
-
-        Recurses through block tails, if-arms, match-arms so the
-        escape check covers every reachable tail expression. Only
-        borrow-shaped expressions (Ident naming a borrow, Field,
-        Index) can escape; fresh-owner expressions (Call, Copy,
-        StructLit, etc.) cannot."""
-        if isinstance(e, A.Ident):
-            # Owning local returned as Ident = ownership transfer
-            # (codegen calls _transfer_ownership_out). Safe.
-            if e.name not in self._all_borrow_sources:
-                return None
-            # Pure Ident-chain borrow of a local owning binding:
-            # codegen transfers ownership through the chain. Safe.
-            # Only Field / Index / match-binder origins (tracked in
-            # `_field_borrows`) truly can't transfer — they alias
-            # inside a container / payload.
-            if e.name not in self._field_borrows:
-                return None
-            # Field-origin borrow: root must be a param to be safe.
-            root = self._all_borrow_sources.get(e.name, e.name)
-            while root in self._all_borrow_sources:
-                root = self._all_borrow_sources[root]
-            if root in self._fn_params:
-                return None
-            return e.name
-        if isinstance(e, (A.Field, A.Index)):
-            # Walk through Field/Index chain to the root ident,
-            # following the persistent borrow chain if the root is
-            # itself a borrow binding.
-            cur: A.Expr = e
-            while isinstance(cur, (A.Field, A.Index)):
-                cur = cur.target
-            if not isinstance(cur, A.Ident):
-                return None
-            root = cur.name
-            while root in self._all_borrow_sources:
-                root = self._all_borrow_sources[root]
-            if root in self._fn_params:
-                return None
-            return cur.name
-        if isinstance(e, A.Block):
-            return self._return_borrow_escape(e.tail) if e.tail else None
-        if isinstance(e, A.IfExpr):
-            then_leak = (
-                self._return_borrow_escape(e.then.tail)
-                if isinstance(e.then, A.Block) and e.then.tail
-                else None
-            )
-            if then_leak is not None:
-                return then_leak
-            if e.else_ is None:
-                return None
-            if isinstance(e.else_, A.IfExpr):
-                return self._return_borrow_escape(e.else_)
-            if isinstance(e.else_, A.Block):
-                return (
-                    self._return_borrow_escape(e.else_.tail)
-                    if e.else_.tail else None
-                )
-            return None
-        if isinstance(e, A.MatchExpr):
-            for arm in e.arms:
-                leak = self._return_borrow_escape(arm.body)
-                if leak is not None:
-                    return leak
-            return None
-        # Call / Copy / StructLit / TabletsLit / Unary / Binary /
-        # Cast / literals: fresh-owned. Can't escape a local binding
-        # they don't alias.
-        return None
-
-    def _wrap_escape_sites(self, e: A.Expr) -> A.Expr:
-        """Walk a return-valued expression, wrapping every escape
-        leaf (an Ident/Field/Index that would dangle at caller) in a
-        synthetic `A.Copy(...)` and emitting an implicit-copy warning
-        at each wrap site. Returns the (possibly rewrapped) outer
-        expression. For container expressions (Block / If / Match)
-        we recurse into the tails / arms and reassign the child
-        slots in place; the top-level node is returned unchanged
-        only if it's a container, or wrapped only if it's a leaf.
-
-        Paired with the escape detection above: if
-        `_return_borrow_escape(e)` previously returned a name, this
-        rewrite visits every tail position and wraps the problematic
-        leaves so codegen sees `copy <leaf>` instead of the bare
-        borrow."""
-        if isinstance(e, (A.Ident, A.Field, A.Index)):
-            if self._return_borrow_escape(e) is None:
-                return e
-            line, col = getattr(e, "line", 0), getattr(e, "col", 0)
-            self._warn(
-                f"in fn {self.current_fn!r}: implicit copy inserted "
-                f"on return value — its bytes would otherwise dangle "
-                f"once the fn's locals are freed. Wrap the returned "
-                f"expression in `copy` to silence this warning.",
-                line, col,
-            )
-            return A.Copy(value=e, line=line, col=col)
-        if isinstance(e, A.Block):
-            if e.tail is not None:
-                e.tail = self._wrap_escape_sites(e.tail)
-            return e
-        if isinstance(e, A.IfExpr):
-            if isinstance(e.then, A.Block) and e.then.tail is not None:
-                e.then.tail = self._wrap_escape_sites(e.then.tail)
-            if e.else_ is not None:
-                if isinstance(e.else_, A.IfExpr):
-                    e.else_ = self._wrap_escape_sites(e.else_)
-                elif isinstance(e.else_, A.Block) and e.else_.tail is not None:
-                    e.else_.tail = self._wrap_escape_sites(e.else_.tail)
-            return e
-        if isinstance(e, A.MatchExpr):
-            for arm in e.arms:
-                arm.body = self._wrap_escape_sites(arm.body)
-            return e
-        return e
-
-    def _register_borrow(
-        self, name: str, root: str,
-        path: tuple[str, ...] = (),
-        binding_node: A.Binding | None = None,
-    ) -> None:
-        """Mark `name` as a borrow whose heap bytes are rooted in
-        `root` (the outermost owning Ident). `path` is the field /
-        index chain from `root` down to the borrowed bytes — used by
-        effect-aware invalidation to rule out writes on disjoint
-        siblings. When `binding_node` is provided, record it so a
-        later invalidated read can retroactively wrap `init` in
-        Copy as part of the implicit-copy + warning path."""
-        self._borrow_sources[-1][name] = root
-        self._all_borrow_sources[name] = root
-        self._borrow_paths[name] = path
-        self._invalidated.discard(name)
-        if binding_node is not None:
-            self._borrow_binding_nodes[name] = binding_node
-
-    def _is_borrow_binding(self, name: str) -> bool:
-        """Is `name` currently registered as a borrow in any live
-        scope? Used by assignment to distinguish rebinding a borrow
-        (no old heap freed) from overwriting an owning slot."""
-        return any(name in scope for scope in self._borrow_sources)
-
-    def _rebind_borrow(self, name: str, new_rhs: A.Expr) -> None:
-        """On assignment `name = new_rhs`, update `name`'s borrow
-        registration to match the RHS. Fresh-owner RHS turns `name`
-        into an owning binding; borrow-source RHS rebinds to the
-        new source. Clears any stale invalidation on `name` since
-        its underlying bytes are now fresh."""
-        # Drop the old registration from every live scope so re-
-        # registration works even if name was introduced in an outer
-        # block.
-        for scope in self._borrow_sources:
-            scope.pop(name, None)
-        self._invalidated.discard(name)
-        new_root = self._borrow_source_root(new_rhs)
-        if new_root is not None:
-            self._register_borrow(name, new_root)
-
-    def _borrow_source_root(self, e: A.Expr) -> str | None:
-        """Walk a borrow-source expression to its root Ident. Returns
-        None for expressions that produce fresh ownership (Copy,
-        literals). Calls to fns whose return aliases a param are
-        treated as borrow sources rooted at the aliased arg."""
-        if isinstance(e, A.Ident):
-            # Follow the borrow chain: `step q = p; step r = q` — r's
-            # root is whatever p's root was (or p itself if p is an
-            # owning binding).
-            return self._root_for(e.name)
-        if isinstance(e, A.Field):
-            return self._borrow_source_root(e.target)
-        if isinstance(e, A.Index):
-            return self._borrow_source_root(e.target)
-        if isinstance(e, A.Call) and isinstance(e.callee, A.Ident):
-            # A fn whose return aliases its Nth param: the call
-            # result aliases whatever arg N does. Inherit that root.
-            alias_idx = self.fn_return_alias.get(e.callee.name)
-            if alias_idx is not None and alias_idx < len(e.args):
-                return self._borrow_source_root(e.args[alias_idx])
-        return None
-
-    def _borrow_source_path(self, e: A.Expr) -> tuple[str, ...]:
-        """Mirror of `_borrow_source_root`, returning the path from
-        the root to the borrowed bytes. An Ident chain inherits the
-        source's path; Field/Index accumulate their accessor. Calls
-        that return-alias a param project through the aliased arg."""
-        if isinstance(e, A.Ident):
-            return self._borrow_paths.get(e.name, ())
-        if isinstance(e, A.Field):
-            return self._borrow_source_path(e.target) + (e.name,)
-        if isinstance(e, A.Index):
-            return self._borrow_source_path(e.target) + ("__index__",)
-        if isinstance(e, A.Call) and isinstance(e.callee, A.Ident):
-            alias_idx = self.fn_return_alias.get(e.callee.name)
-            if alias_idx is not None and alias_idx < len(e.args):
-                return self._borrow_source_path(e.args[alias_idx])
-        return ()
-
-    def _root_for(self, name: str) -> str:
-        """If `name` is itself a borrow, return the root its chain
-        points at. Otherwise `name` IS the root."""
-        for scope in reversed(self._borrow_sources):
-            if name in scope:
-                return scope[name]
-        return name
-
-    def _invalidate_root(
-        self, root: str,
-        effects: ParamEffects | None = None,
-        write_path: tuple[str, ...] = (),
-    ) -> None:
-        """Flag live borrows rooted at `root` as invalidated.
-
-        When `effects` is None (the conservative path), every borrow
-        rooted at the ultimate owner is flagged — preserves the old
-        freeze semantics for calls we can't reason about. When
-        `effects` is provided, only borrows whose own path conflicts
-        with the effect set are flagged. `write_path` shifts the
-        effect's paths — `writes through arg.field_x` are the
-        callee's effect paths prefixed by `(field_x,)`.
-
-        Walks up the borrow chain first: if `root` is itself a borrow
-        binding (e.g. `mut l: Lex = p.lex` makes `l` a borrow of `p`),
-        a mut-reach on `l` is effectively a mut-reach on `p` — any
-        write through `l` reaches `p`'s bytes. Without this,
-        `advance(l); p.lex = l` wouldn't flag the latent UAF."""
-        ultimate = self._root_for(root)
-        root_path = self._borrow_paths.get(root, ())
-        # A write through `root` at `write_path` reaches the ultimate
-        # owner at `root_path + write_path` (the root's own position
-        # inside its chain, then the write's inner offset).
-        effective_write = root_path + write_path
-        for scope in self._borrow_sources:
-            for name, src in scope.items():
-                if src != ultimate and name != root:
-                    continue
-                if effects is None:
-                    self._invalidated.add(name)
-                    continue
-                borrow_path = self._borrow_paths.get(name, ())
-                if effects.full:
-                    if _paths_overlap(effective_write, borrow_path):
-                        self._invalidated.add(name)
-                    continue
-                for wp in effects.paths:
-                    if _paths_overlap(effective_write + wp, borrow_path):
-                        self._invalidated.add(name)
-                        break
-
-    def _check_use_not_invalidated(
-        self, name: str, line: int, col: int,
-    ) -> None:
-        """At each Ident read, enforce the freeze-while-borrow rule:
-        the borrow hasn't been invalidated by a mut-reach to its root
-        since it was bound.
-
-        Reads of non-heap-bearing types (wedges, scalars, fn pointers)
-        skip the check: the binding holds a value that doesn't point
-        at any freeable heap, so reading it after a mut-reach is
-        always safe. Field/Index accesses off such a binding will
-        trigger their own type-driven checks at the access point.
-
-        When the binding that introduced the borrow is reachable via
-        `_borrow_binding_nodes`, rewrite its `init` in place as
-        `copy <init>` and emit a CompileWarning. The binding becomes
-        owning; subsequent reads are unaffected by further mut-reaches
-        on the former source. If we can't locate the originating
-        Binding (match binders, wedge handle pseudo-borrows), fall
-        back to the hard error with the old `copy` hint."""
-        if name not in self._invalidated:
-            return
-        for scope in reversed(self.scopes):
-            if name in scope:
-                ty = scope[name]
-                if not self._needs_borrow_tracking(ty):
-                    return
-                break
-        binding = self._borrow_binding_nodes.get(name)
-        if binding is not None and binding.init is not None \
-                and not isinstance(binding.init, A.Copy):
-            init = binding.init
-            binding.init = A.Copy(
-                value=init,
-                line=getattr(init, "line", binding.line),
-                col=getattr(init, "col", binding.col),
-            )
-            self._invalidated.discard(name)
-            for scope in self._borrow_sources:
-                scope.pop(name, None)
-            self._all_borrow_sources.pop(name, None)
-            self._field_borrows.discard(name)
-            self._borrow_binding_nodes.pop(name, None)
-            self._warn(
-                f"implicit copy inserted at binding {name!r}: source "
-                f"was mutated before this read; deep-cloning init to "
-                f"preserve the value. Wrap the initializer in `copy` "
-                f"explicitly to silence this warning, or restructure "
-                f"to read before the mutation.",
-                binding.line, binding.col,
-            )
-            return
-        raise CheckError(
-            f"use of borrow {name!r} after its source may have "
-            f"been mutated — bind a fresh copy at the borrow "
-            f"site with `step n = copy {name}` and use `n` after "
-            f"the mutation instead",
-            line, col,
-        )
 
     def _bind(self, name: str, ty: Ty, line: int, col: int) -> None:
         if name in self.scopes[-1]:
@@ -1542,159 +1072,12 @@ class Checker:
             self._local_tablets.add(b.name)
         if isinstance(final_ty, TyHandle):
             self._tainted[b.name] = self._expr_escapes(b.init)
-        # Freeze-while-borrow: if this binding aliases into some
-        # existing storage (borrow-init via Ident/Field/Index), remember
-        # its source root. A later mut-reach to that root invalidates
-        # this binding; subsequent reads error out with a `copy` hint.
-        if self._needs_borrow_tracking(final_ty):
-            root = self._borrow_source_root(b.init)
-            if root is not None:
-                path = self._borrow_source_path(b.init)
-                self._register_borrow(
-                    b.name, root, path=path, binding_node=b,
-                )
-                # Track field-origin-ness for escape analysis. An
-                # Ident init inherits the source's status (a chain of
-                # Ident borrows stays ident-only). Field / Index init
-                # always marks the binding as field-origin. A Call
-                # that return-aliases a param inherits the
-                # field-origin-ness of that arg.
-                if isinstance(b.init, (A.Field, A.Index)):
-                    self._field_borrows.add(b.name)
-                elif isinstance(b.init, A.Ident):
-                    if b.init.name in self._field_borrows:
-                        self._field_borrows.add(b.name)
-                elif (
-                    isinstance(b.init, A.Call)
-                    and isinstance(b.init.callee, A.Ident)
-                ):
-                    alias_idx = self.fn_return_alias.get(
-                        b.init.callee.name,
-                    )
-                    if (
-                        alias_idx is not None
-                        and alias_idx < len(b.init.args)
-                    ):
-                        arg = b.init.args[alias_idx]
-                        if isinstance(arg, (A.Field, A.Index)) or (
-                            isinstance(arg, A.Ident)
-                            and arg.name in self._field_borrows
-                        ):
-                            self._field_borrows.add(b.name)
-        # Wedge bindings alias into the arena they point at. The most
-        # common source is `store.push(x)` — register the handle as a
-        # borrow rooted at `store` so a later `store[i] = v` or
-        # `store.push(...)` invalidates it. The path through the
-        # arena is opaque (we don't track which slot) — represent it
-        # as `("__index__",)` so effect-aware writes on specific
-        # slots and on nested fields of slot contents both invalidate
-        # borrows through the handle.
-        if isinstance(final_ty, TyHandle):
-            arena_root = self._wedge_arena_root(b.init)
-            if arena_root is not None:
-                self._register_borrow(
-                    b.name, arena_root, path=("__index__",),
-                )
-
-    def _wedge_arena_root(self, e: A.Expr) -> str | None:
-        """Find the arena (tablets) root that a wedge-valued expression
-        points into. Currently handles the common case:
-        `store.push(...)` → `store`. Other sources (field reads of
-        wedge type, fn returns of wedge type) are unknown at this
-        analysis's granularity and return None."""
-        if isinstance(e, A.Call) and isinstance(e.callee, A.Field):
-            if e.callee.name == "push":
-                return self._assign_target_root(e.callee.target)
-        if isinstance(e, A.Ident):
-            # Transitive: wedge-bound to another wedge binding.
-            return self._root_for(e.name) if e.name != self._root_for(e.name) else None
-        return None
-
-    def _needs_borrow_tracking(self, ty: Ty, _seen: set | None = None) -> bool:
-        """Which types are susceptible to borrow invalidation? A type
-        is tracked iff it (transitively) holds heap bytes that a write
-        could free: str, tablets, a struct with at least one
-        cleanup-bearing field, or a seal with at least one cleanup-
-        bearing payload field. Structs / seals of only scalars / wedges
-        return False — overwriting a slot of such a type doesn't free
-        any heap, so the freeze rule shouldn't flag borrows rooted at
-        the container."""
-        if _seen is None:
-            _seen = set()
-        str_ty = self.structs.get("str")
-        if str_ty is not None and ty == str_ty:
-            return True
-        if isinstance(ty, TyTablets):
-            return True
-        if isinstance(ty, TyStruct):
-            key = ("struct", ty.name, ty.args)
-            if key in _seen:
-                return False   # break cycles; assume non-heap
-            _seen.add(key)
-            for _, fty in self.struct_fields.get(ty.name, ()):
-                if self._needs_borrow_tracking(fty, _seen):
-                    return True
-            return False
-        if isinstance(ty, TySeal):
-            key = ("seal", ty.name, ty.args)
-            if key in _seen:
-                return False
-            _seen.add(key)
-            for _, variant_fields in self.seal_variants.get(ty.name, ()):
-                for fty in variant_fields:
-                    if self._needs_borrow_tracking(fty, _seen):
-                        return True
-            return False
-        return False
 
     def _tc_assign(self, a: A.Assign) -> None:
         # Type-check the target as an expression: this both validates
         # the chain (field names must exist on their struct types) and
         # yields the expected type of the RHS.
         target_ty = self._tc_expr(a.target)
-        # Freeze-while-borrow: assignment to a cleanup-bearing path
-        # can free old heap and thus invalidate borrows rooted at
-        # the target's base. We invalidate BEFORE reading the RHS so
-        # that a RHS ident naming one of the newly-invalidated
-        # borrows triggers the implicit-copy wrap at its binding
-        # site. This closes the writeback UAF class:
-        #   `mut l: Lex = p.lex; p.lex = l` — without the pre-read
-        #   invalidation, `l` would be read as a live borrow, the
-        #   assign would drop `p.lex`'s old heap, and the subsequent
-        #   deep-clone of `l` would read freed bytes. Two target
-        #   shapes differ:
-        #
-        # - Ident target that was itself a borrow: rebinding doesn't
-        #   free the SOURCE's bytes (the slot only held a cap=0 view
-        #   whose release no-ops). No invalidation; instead, update
-        #   the target's borrow registration to match the new RHS
-        #   after the RHS is typechecked.
-        #
-        # - Field / Index target, or Ident target that owned its
-        #   bytes: old heap IS freed, invalidate as before.
-        target_is_ident = isinstance(a.target, A.Ident)
-        target_was_borrow = target_is_ident and self._is_borrow_binding(
-            a.target.name,
-        )
-        if self._needs_borrow_tracking(target_ty) and not target_was_borrow:
-            root = self._assign_target_root(a.target)
-            if root is not None:
-                # We know exactly which path is written — use
-                # effects-style invalidation so sibling borrows on
-                # disjoint fields aren't flagged.
-                target_path = self._expr_access_path(a.target)
-                if not target_path:
-                    # Whole-binding reassignment: invalidate every
-                    # borrow rooted here (legacy conservative path).
-                    self._invalidate_root(root)
-                else:
-                    single_write = ParamEffects(
-                        full=False,
-                        paths=frozenset({target_path}),
-                    )
-                    self._invalidate_root(
-                        root, effects=single_write, write_path=(),
-                    )
         value_ty = self._tc_expr(a.value, expected=target_ty)
         if not _coerces_to(value_ty, target_ty):
             raise CheckError(
@@ -1708,64 +1091,6 @@ class Checker:
         if isinstance(target_ty, TyHandle) and isinstance(a.target, A.Ident):
             if self._expr_escapes(a.value):
                 self._tainted[a.target.name] = True
-        if target_is_ident and self._needs_borrow_tracking(target_ty):
-            self._rebind_borrow(a.target.name, a.value)
-
-    def _invalidate_mut_call_args(
-        self, fn_ty: "TyFn", args: list[A.Expr],
-        fn_name: str | None = None,
-    ) -> None:
-        """For each call argument, invalidate borrows rooted at the
-        arg whose paths overlap what the callee actually writes. When
-        effect summaries are available for `fn_name`, only conflicting
-        borrows are flagged; otherwise fall back to the conservative
-        "invalidate all mut args" path for signatures we can't reason
-        about (fn-value calls, pre-analysis callers, generics)."""
-        summaries = (
-            self.fn_effects.get(fn_name) if fn_name is not None else None
-        )
-        if summaries is not None:
-            for arg_idx, arg in enumerate(args):
-                if arg_idx >= len(summaries):
-                    continue
-                pe = summaries[arg_idx]
-                if pe.is_pure():
-                    continue
-                root = self._assign_target_root(arg)
-                if root is None:
-                    continue
-                arg_path = self._expr_access_path(arg)
-                self._invalidate_root(root, effects=pe, write_path=arg_path)
-            return
-        if not fn_ty.param_muts:
-            return
-        for is_mut, arg in zip(fn_ty.param_muts, args):
-            if not is_mut:
-                continue
-            root = self._assign_target_root(arg)
-            if root is not None:
-                self._invalidate_root(root)
-
-    def _expr_access_path(self, e: A.Expr) -> tuple[str, ...]:
-        """Path from an Ident root down through Field/Index accessors
-        of `e`. `r.a.b` → `("a", "b")`; `r[i]` → `("__index__",)`;
-        bare Ident → `()`."""
-        if isinstance(e, A.Field):
-            return self._expr_access_path(e.target) + (e.name,)
-        if isinstance(e, A.Index):
-            return self._expr_access_path(e.target) + ("__index__",)
-        return ()
-
-    def _assign_target_root(self, target: A.Expr) -> str | None:
-        """Root of an assignment lvalue. `r.field.field2 = x` roots at
-        `r`; `arr[i] = x` roots at `arr`; `x = y` roots at `x`."""
-        if isinstance(target, A.Ident):
-            return target.name
-        if isinstance(target, A.Field):
-            return self._assign_target_root(target.target)
-        if isinstance(target, A.Index):
-            return self._assign_target_root(target.target)
-        return None
 
     def _tc_for(self, f: A.ForStmt) -> None:
         # Resolve element type before we look at the body so errors about
@@ -1832,13 +1157,6 @@ class Checker:
                 f"the handle. Take the tablets as a parameter instead.",
                 y.line, y.col,
             )
-        # Escape analysis for cleanup-bearing yields — mirror the
-        # body-tail check. A yielded borrow of a local binding would
-        # dangle at caller. Rewrite leaves to `copy <leaf>` with an
-        # implicit-copy warning.
-        if not isinstance(expected, (TyUnit, TyDiverge)):
-            if self._return_borrow_escape(y.value) is not None:
-                y.value = self._wrap_escape_sites(y.value)
 
     def _expr_escapes(self, e: A.Expr) -> bool:
         """Would returning `e` hand the caller a handle into a tablets
@@ -1945,9 +1263,6 @@ class Checker:
                             e.line, e.col,
                         )
                     return self.fns[e.name]
-            # Freeze-while-borrow: reject reads of a borrow whose
-            # source has been mut-reached since it was bound.
-            self._check_use_not_invalidated(e.name, e.line, e.col)
             return self._lookup(e.name, e.line, e.col)
         if isinstance(e, A.Unary):     return self._tc_unary(e)
         if isinstance(e, A.Binary):    return self._tc_binary(e)
@@ -2399,11 +1714,6 @@ class Checker:
                 h if not self._has_open_tyvar(h, inst_names) else None
             )
         arg_tys = [self._tc_expr(a, expected=h) for a, h in zip(e.args, arg_hints)]
-        # Freeze-while-borrow: callee's effect summary (if known)
-        # drives precise invalidation; otherwise fall back to the
-        # pessimistic rule of "every mut-annotated arg invalidates
-        # every live borrow rooted at that arg".
-        self._invalidate_mut_call_args(fn, e.args, fn_name=name)
         for i, (at, pty) in enumerate(zip(arg_tys, fn.params)):
             freshened = self._substitute(pty, inst_subst)
             try:

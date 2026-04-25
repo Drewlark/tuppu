@@ -471,12 +471,9 @@ def test_return_nested_struct_field_deep_clones(tmp_path):
     assert out == b"hellox\n"
 
 
-def test_return_field_of_local_struct_implicit_copy(tmp_path, capsys):
-    # Fn body tail is a Field read off a local struct. The struct's
-    # cleanup fires at block exit; the caller would read freed
-    # memory. Phase A: escape analysis rewrites the tail leaf as
-    # `copy r.label` and emits an implicit-copy warning, so the
-    # program compiles and runs correctly.
+def test_return_field_of_local_struct_safe_under_gc(tmp_path, capsys):
+    # Fn body tail is a Field read off a local struct. Under GC the
+    # returned pointer keeps the underlying str alive at the caller.
     src = (
         "tablet Row { label: str }\n"
         "fn build() -> str {\n"
@@ -492,8 +489,6 @@ def test_return_field_of_local_struct_implicit_copy(tmp_path, capsys):
     rc, out = run(src, tmp_path)
     assert rc == 0
     assert out == b"abcdef\n"
-    err = capsys.readouterr().err
-    assert "implicit copy inserted on return value" in err
 
 
 def test_return_field_of_local_struct_copy_works(tmp_path):
