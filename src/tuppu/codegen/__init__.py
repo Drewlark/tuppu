@@ -310,9 +310,10 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         if info is not None:
             return [0, 8]   # head, tail ptrs
         if isinstance(value_ty, (ir.IdentifiedStructType, ir.LiteralStructType)):
+            elements = getattr(value_ty, "elements", None) or ()
             offsets: list[int] = []
             offset = 0
-            for fty in value_ty.elements:
+            for fty in elements:
                 align = self._align_of(fty)
                 offset = (offset + align - 1) // align * align
                 for inner_off in self._type_ptr_offsets(fty):
@@ -2185,7 +2186,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         if not var.is_mut:
             raise CodegenError(f"cannot release step-bound tablets {s.name!r}")
         assert self.builder is not None
-        self.builder.call(info.release, [var.ir_ref])
+        self.builder.call(self._get_tablets_release(info), [var.ir_ref])
         # Remove this variable from its cleanup frame so the auto-
         # release at scope exit doesn't double-free. We walk frames
         # outermost-in since explicit release can target an outer
@@ -2262,9 +2263,10 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             slot, [ir.Constant(I32, 0), ir.Constant(I32, 2)], inbounds=True,
         )
         length = self.builder.load(len_addr)
+        get_fn = self._get_tablets_get(info)
         self._emit_counted_loop(
             length,
-            lambda i: self.builder.call(info.get, [slot, i]),
+            lambda i: self.builder.call(get_fn, [slot, i]),
             f,
         )
 
@@ -2650,7 +2652,9 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             return
         info = self._tablets_info_for(value_ty)
         if info is not None:
-            self._cleanup_frames[-1].append((info.release, slot, name))
+            self._cleanup_frames[-1].append(
+                (self._get_tablets_release(info), slot, name),
+            )
             self._register_gc_root(slot, value_ty)
             return
         if self._is_str_value(value_ty):
@@ -2806,7 +2810,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                     s_ptr, [ir.Constant(I32, 0), ir.Constant(I32, i)],
                     inbounds=True,
                 )
-                b.call(info.release, [field_ptr])
+                b.call(self._get_tablets_release(info), [field_ptr])
                 continue
             if (
                 self._struct_fields_for(fty) is not None
@@ -2987,7 +2991,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                     continue
                 info = self._tablets_info_for(fty)
                 if info is not None:
-                    b.call(info.release, [field_ptr])
+                    b.call(self._get_tablets_release(info), [field_ptr])
                     continue
                 if (
                     self._struct_fields_for(fty) is not None
@@ -3195,7 +3199,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         else:
             info = self._tablets_info_for(val.type)
             if info is not None:
-                release = info.release
+                release = self._get_tablets_release(info)
             elif (
                 self._struct_fields_for(val.type) is not None
                 and self._struct_needs_cleanup(val.type)
@@ -3234,7 +3238,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         else:
             info = self._tablets_info_for(slot_ty)
             if info is not None:
-                self.builder.call(info.release, [slot_ptr])
+                self.builder.call(self._get_tablets_release(info), [slot_ptr])
             elif (
                 self._struct_fields_for(slot_ty) is not None
                 and self._struct_needs_cleanup(slot_ty)
@@ -3371,7 +3375,9 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
             )
             length = self.builder.load(len_addr)
             self._emit_dynamic_bounds_trap(idx_val, length)
-            slot = self.builder.call(info.get_addr, [var.ir_ref, idx_val])
+            slot = self.builder.call(
+                self._get_tablets_get_addr(info), [var.ir_ref, idx_val],
+            )
             return slot, info.elem_ty
         raise CodegenError(
             f"assignment target must be a variable or field chain, "
@@ -4569,9 +4575,10 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
         # trigger collections mid-build.
         if self._cleanup_frames:
             self._cleanup_frames[-1].append(
-                (info.release, slot, ".tbls.lit"),
+                (self._get_tablets_release(info), slot, ".tbls.lit"),
             )
             self._register_gc_root(slot, info.tablets_ty)
+        push_fn = self._get_tablets_push(info)
         for fexpr in e.fields:
             v = self._gen_expr(fexpr)
             if v is None:
@@ -4588,7 +4595,7 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 and self._struct_needs_cleanup(info.elem_ty)
             ):
                 v = self._struct_as_borrow(v, info.elem_ty)
-            self.builder.call(info.push, [slot, v])
+            self.builder.call(push_fn, [slot, v])
         return slot
 
     def _gen_string_lit(self, data: bytes) -> ir.Value:
@@ -4781,7 +4788,9 @@ class Codegen(SexMixin, RatMixin, TabletsMixin, StrsMixin):
                 self.builder.store(target, slot)
                 length = self.builder.extract_value(target, 2)
                 self._emit_dynamic_bounds_trap(idx, length)
-                val = self.builder.call(info.get, [slot, idx])
+                val = self.builder.call(
+                    self._get_tablets_get(info), [slot, idx],
+                )
                 return self._read_borrow(val)
 
         raise CodegenError("indexing is only supported on tables, tablets, and str")

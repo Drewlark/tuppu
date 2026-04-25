@@ -52,7 +52,7 @@ class TabletsMixin:
                 elif self._is_borrow_source_expr(arg_expr):
                     val = self._deep_clone_if_cleanup_bearing(val)
                 # else: fresh-owned rvalue, transfer by default.
-            pushed = self.builder.call(info.push, [ptr, val])
+            pushed = self.builder.call(self._get_tablets_push(info), [ptr, val])
             if deferred_slot is not None:
                 self._zero_transferred_slot(deferred_slot)
             return pushed
@@ -105,7 +105,7 @@ class TabletsMixin:
         )
         length = self.builder.load(len_addr)
         self._emit_dynamic_bounds_trap(idx, length)
-        val = self.builder.call(info.get, [t_ptr, idx])
+        val = self.builder.call(self._get_tablets_get(info), [t_ptr, idx])
         # Reads from a container are borrows — the container owns the
         # bytes; the caller gets a view. Neuter cleanup markers so
         # copying the value (into another struct, another container,
@@ -146,40 +146,68 @@ class TabletsMixin:
     # --- tablets (chained-chunk growable storage) -----------------------
 
     def _get_tablets(self, N: int, elem_ty: ir.Type) -> TabletsInfo:
-        """Return (building once, caching thereafter) the struct types and
-        helper functions for tablets[N]T with the given element type."""
+        """Eagerly register (once, cache thereafter) the type half of
+        `tablets[N]T` — `node_ty` and `tablets_ty`. Helper fn bodies
+        (`push`, `get`, `get_addr`, `release`) defer to their
+        accessor methods, which build-and-cache on first use. Called
+        during struct/seal field resolution; at that point a seal
+        element type may still be opaque, so committing to the
+        chunk descriptor (which encodes `sizeof(T)`) would bake in
+        garbage. Lazy helpers dodge that ordering hazard."""
         key = (N, str(elem_ty))
         existing = self._tablets_types.get(key)
         if existing is not None:
             return existing
 
         suffix = f"{elem_ty}_{N}".replace(" ", "_").replace("{", "").replace("}", "")
-        # Use this Codegen's module context so identified types live
-        # with the module (not leak across compilations via the global
-        # LLVM context). Tablets helpers are cached in self._tablets_types
-        # so we only set the body once per (N, elem_ty).
         node_ty = self.module.context.get_identified_type(f"Node_{suffix}")
         if node_ty.is_opaque:
             node_ty.set_body(
-                ir.ArrayType(elem_ty, N),   # items
-                I64,                         # used
-                node_ty.as_pointer(),        # next
+                ir.ArrayType(elem_ty, N),
+                I64,
+                node_ty.as_pointer(),
             )
         tablets_ty = ir.LiteralStructType([
-            node_ty.as_pointer(),        # head
-            node_ty.as_pointer(),        # tail
-            I64,                         # len
+            node_ty.as_pointer(),
+            node_ty.as_pointer(),
+            I64,
         ])
 
         info = TabletsInfo(
-            N=N, elem_ty=elem_ty, node_ty=node_ty, tablets_ty=tablets_ty,
-            push=self._build_tablets_push(N, elem_ty, node_ty, tablets_ty, suffix),
-            get=self._build_tablets_get(N, elem_ty, node_ty, tablets_ty, suffix),
-            get_addr=self._build_tablets_get_addr(N, elem_ty, node_ty, tablets_ty, suffix),
-            release=self._build_tablets_release(N, elem_ty, node_ty, tablets_ty, suffix),
+            N=N, elem_ty=elem_ty,
+            node_ty=node_ty, tablets_ty=tablets_ty,
+            suffix=suffix,
         )
         self._tablets_types[key] = info
         return info
+
+    def _get_tablets_push(self, info: TabletsInfo) -> ir.Function:
+        if info.push is None:
+            info.push = self._build_tablets_push(
+                info.N, info.elem_ty, info.node_ty, info.tablets_ty, info.suffix,
+            )
+        return info.push
+
+    def _get_tablets_get(self, info: TabletsInfo) -> ir.Function:
+        if info.get is None:
+            info.get = self._build_tablets_get(
+                info.N, info.elem_ty, info.node_ty, info.tablets_ty, info.suffix,
+            )
+        return info.get
+
+    def _get_tablets_get_addr(self, info: TabletsInfo) -> ir.Function:
+        if info.get_addr is None:
+            info.get_addr = self._build_tablets_get_addr(
+                info.N, info.elem_ty, info.node_ty, info.tablets_ty, info.suffix,
+            )
+        return info.get_addr
+
+    def _get_tablets_release(self, info: TabletsInfo) -> ir.Function:
+        if info.release is None:
+            info.release = self._build_tablets_release(
+                info.N, info.elem_ty, info.node_ty, info.tablets_ty, info.suffix,
+            )
+        return info.release
 
     def _build_tablets_push(
         self, N: int, elem_ty: ir.Type,
@@ -469,19 +497,15 @@ class TabletsMixin:
             return info.clone
         info.clone = self._build_tablets_clone(
             info.N, info.elem_ty, info.node_ty, info.tablets_ty,
-            info.push, info.tablets_ty.elements,  # unused, kept for signature shape
+            self._get_tablets_push(info), info.suffix,
         )
         return info.clone
 
     def _build_tablets_clone(
         self, N: int, elem_ty: ir.Type,
         node_ty: ir.IdentifiedStructType, tablets_ty: ir.LiteralStructType,
-        push: ir.Function, _suffix_elements,
+        push: ir.Function, suffix: str,
     ) -> ir.Function:
-        # Recover the suffix from push's name: "__tuppu_tbls_<suffix>_push".
-        push_name = push.name
-        suffix = push_name[len("__tuppu_tbls_"): -len("_push")]
-
         fn = ir.Function(
             self.module,
             ir.FunctionType(tablets_ty, [tablets_ty.as_pointer()]),
