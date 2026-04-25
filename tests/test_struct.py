@@ -692,6 +692,34 @@ def test_wedge_field_assign_through_step_handle(tmp_path):
     assert out == b"1\n"
 
 
+@pytest.mark.xfail(
+    reason=(
+        "codegen bug: `tablet Vec<T> { storage: tablets[N]T }` + "
+        "`mut Vec<T>` param fails to coerce the value type to its "
+        "pointer (`cannot coerce %\"Vec__i64\" to %\"Vec__i64\"*`). "
+        "The generic-struct-wrapping-tablets shape hits a missed "
+        "auto-deref in the mut-struct-param path. Vec-style container "
+        "types are blocked until this lands."
+    ),
+    strict=True,
+    raises=CompileError,
+)
+def test_generic_struct_wrapping_tablets_mut_param(tmp_path):
+    src = (
+        "tablet Vec<T> { storage: tablets[16]T }\n"
+        "fn vec_push<T>(mut v: Vec<T>, x: T) {\n"
+        "  step _ = v.storage.push(x)\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  mut v: Vec<i64>\n"
+        "  vec_push(v, 42)\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b""
+
+
 def test_generic_arity_mismatch_rejected():
     with pytest.raises(CompileError, match="expects 1 type argument"):
         compile_to_ir(
