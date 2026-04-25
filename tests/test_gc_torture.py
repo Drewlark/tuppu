@@ -370,3 +370,177 @@ fn main() -> i32 {
     rc, stdout = run(src, tmp_path, stress)
     assert rc == 0
     assert stdout == b"t1 = 25\nt2 = 99\n"
+
+# --- regression tracking -------------------------------------------------
+
+def test_struct_alignment_gc_offsets(tmp_path, stress):
+    # Exercises the padding bug in `_size_of_ty`. An i8 followed by an i64
+    # and a str pointer forces LLVM to insert alignment padding. If the
+    # GC computes offsets strictly by summing element sizes, it marks
+    # garbage bytes.
+    src = """
+tablet Padded { a: i8, b: i64, c: str }
+fn main() -> i32 {
+  mut store: tablets[4]Padded
+  step _p = store.push(Padded { a: 1, b: 2, c: "aligned" + "!" })
+
+  // Force a collect while the Padded struct sits in the chunk
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 10 {
+    acc = acc + "."
+    i = i + 1
+  }
+
+  println(store[0].c)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"aligned!\n"
+
+
+def test_shadowed_variable_cleanup_eviction(tmp_path, stress):
+    # Stresses `_transfer_cleanup_into_container` traversal direction.
+    # If it iterates outermost-first, the outer `s` loses its cleanup
+    # registration, gets swept by the allocation loop, and causes a UAF.
+    src = """
+fn main() -> i32 {
+  mut store: tablets[4]str
+  step s = "outer" + "_str"
+  {
+    step s = "inner" + "_str"
+    step _ = store.push(s)
+  }
+
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 10 {
+    acc = acc + "."
+    i = i + 1
+  }
+
+  println(s)
+  println(store[0])
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"outer_str\ninner_str\n"
+
+
+def test_anonymous_rvalue_block_tail_uaf(tmp_path, stress):
+    # Exercises the `.rvalue.root` double-free/UAF.
+    # `make_box().s` registers an anonymous cleanup for the Box.
+    # If the block tail doesn't explicitly consume the rvalue cleanup,
+    # the frame pop frees the source bytes immediately before assignment.
+    src = """
+tablet Box { s: str }
+fn make_box() -> Box {
+  Box { s: "heap" + "_string" }
+}
+fn main() -> i32 {
+  step s = {
+     make_box().s
+  }
+
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 10 {
+    acc = acc + "."
+    i = i + 1
+  }
+
+  println(s)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"heap_string\n"
+
+def test_yield_mid_expression_unwind(tmp_path, stress):
+    # Registers a heap-str step, then yields with another heap-str value.
+    # The yield unwinder must sweep the named `leaked` cleanup frame entry
+    # and hand off the anonymous `"escaped" + "!"` temp as the return value
+    # without double-freeing either.
+    src = """
+fn bailout() -> str {
+  step leaked = "leak" + "1"
+  if true { yield "escaped" + "!" }
+  "never"
+}
+
+fn main() -> i32 {
+  println(bailout())
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"escaped!\n"
+
+
+def test_match_implicit_clone_shadow_stack(tmp_path, stress):
+    # Pattern binders on cleanup-bearing payloads implicitly deep-clone
+    # so the scrutinee can be safely mutated inside the arm. This test
+    # ensures the implicit clone is properly registered as a GC root
+    # in the arm's cleanup frame and survives a forced collection.
+    src = """
+seal Msg { S(str), Empty }
+
+fn main() -> i32 {
+  mut m: Msg = S("hello" + "_world")
+  match m {
+    S(text) => {
+      // Force a GC collect inside the arm
+      mut acc: str = ""
+      mut i: i64 = 0
+      while i < 10 {
+        acc = acc + "."
+        i = i + 1
+      }
+      println(text)
+    },
+    Empty => { }
+  }
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"hello_world\n"
+
+
+def test_tablets_circular_wedge_assignment(tmp_path, stress):
+    # Creating a cycle by assigning a wedge into the tablets it belongs to.
+    # While tuppu forbids by-value cycles, wedge cycles are valid. The GC
+    # must be able to trace this without infinite recursion or stack overflows.
+    src = """
+tablet Cell { next: wedge Cell, val: str }
+
+fn main() -> i32 {
+  mut store: tablets[4]Cell
+  step w1 = store.push(Cell { next: lost, val: "a" + "1" })
+  step w2 = store.push(Cell { next: w1, val: "b" + "2" })
+
+  // Close the loop
+  w1.next = w2
+
+  // Force GC
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 10 {
+    acc = acc + "."
+    i = i + 1
+  }
+
+  println(w1.next.val)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"b2\n"
