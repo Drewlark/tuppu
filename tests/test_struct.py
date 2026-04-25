@@ -692,19 +692,12 @@ def test_wedge_field_assign_through_step_handle(tmp_path):
     assert out == b"1\n"
 
 
-@pytest.mark.xfail(
-    reason=(
-        "codegen bug: `tablet Vec<T> { storage: tablets[N]T }` + "
-        "`mut Vec<T>` param fails to coerce the value type to its "
-        "pointer (`cannot coerce %\"Vec__i64\" to %\"Vec__i64\"*`). "
-        "The generic-struct-wrapping-tablets shape hits a missed "
-        "auto-deref in the mut-struct-param path. Vec-style container "
-        "types are blocked until this lands."
-    ),
-    strict=True,
-    raises=CompileError,
-)
 def test_generic_struct_wrapping_tablets_mut_param(tmp_path):
+    # `tablet Vec<T> { storage: tablets[N]T }` with a `mut Vec<T>`
+    # param: the call-site mutability lookup in `_gen_call` has to
+    # key on the monomorphized fn name (`vec_push__i64`), not the
+    # source-level name (`vec_push`), otherwise the struct arg is
+    # evaluated by value and the coercion to Struct* fails.
     src = (
         "tablet Vec<T> { storage: tablets[16]T }\n"
         "fn vec_push<T>(mut v: Vec<T>, x: T) {\n"
@@ -713,11 +706,14 @@ def test_generic_struct_wrapping_tablets_mut_param(tmp_path):
         "fn main() -> i32 {\n"
         "  mut v: Vec<i64>\n"
         "  vec_push(v, 42)\n"
+        "  vec_push(v, 43)\n"
+        "  println(v.storage[0])\n"
+        "  println(v.storage[1])\n"
         "  0\n"
         "}\n"
     )
     _, out, _ = run(src, tmp_path)
-    assert out == b""
+    assert out == b"42\n43\n"
 
 
 def test_generic_arity_mismatch_rejected():

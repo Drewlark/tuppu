@@ -758,9 +758,9 @@ class ExprMixin:
             is_mut_struct_param = (
                 isinstance(expected_ty, ir.PointerType)
                 and self._struct_fields_for(expected_ty.pointee) is not None
-                and self._fn_param_mut.get(name) is not None
-                and i < len(self._fn_param_mut[name])
-                and self._fn_param_mut[name][i]
+                and self._fn_param_mut.get(fn.name) is not None
+                and i < len(self._fn_param_mut[fn.name])
+                and self._fn_param_mut[fn.name][i]
             )
             if is_mut_struct_param:
                 if not isinstance(arg, A.Ident):
@@ -797,7 +797,7 @@ class ExprMixin:
             # no cleanup frame entry — so neutering would pointlessly
             # zero out tablets fields the callee wants to read.
             param_is_mut = False
-            param_mut_list = self._fn_param_mut.get(name)
+            param_mut_list = self._fn_param_mut.get(fn.name)
             if param_mut_list is not None and i < len(param_mut_list):
                 param_is_mut = param_mut_list[i]
             if self._is_str_value(expected_ty):
