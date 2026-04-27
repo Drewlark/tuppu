@@ -321,8 +321,9 @@ class Checker:
         # Order is source order so codegen can assign stable tag indices.
         self.seal_variants: dict[str, tuple[tuple[str, tuple[Ty, ...]], ...]] = {}
         # variant_name → (seal_name, variant_index, declared_field_tys).
-        # Variant names are globally unique for v0.1 — ambiguity would
-        # require qualified syntax we haven't designed yet.
+        # Variant names are globally unique because qualified-variant
+        # syntax (`Seal::Variant`) hasn't been designed yet — ambiguity
+        # would force that decision.
         self.variant_lookup: dict[str, tuple[str, int, tuple[Ty, ...]]] = {}
         # Generics: per-tablet type-parameter names, in declaration order.
         self.struct_type_params: dict[str, tuple[str, ...]] = {}
@@ -469,7 +470,8 @@ class Checker:
                     raise CheckError(
                         f"variant {v.name!r} is already declared in seal "
                         f"{prev_seal!r}; variant names must be globally "
-                        f"unique in v0.1",
+                        f"unique (qualified-variant syntax is not yet "
+                        f"designed)",
                         v.line, v.col,
                     )
                 field_tys = tuple(
@@ -631,16 +633,15 @@ class Checker:
             # (int, bool, unit); anything else would need marshaling
             # inside the C-invoked callback, which we don't have a
             # story for. Nested fn types (fns returning fns) are
-            # rejected at v0.1.
+            # rejected for the same reason.
             if isinstance(ty, TyFn):
                 if all(is_primitive(p) for p in ty.params) and is_primitive(ty.ret):
                     return
                 raise CheckError(
                     f"colophon {c.name!r}: {where} has type {ty}; "
-                    f"callback signatures are primitives-only (int / "
-                    f"bool / unit) at v0.1 — str / struct / wedge / "
-                    f"nested fn aren't marshalable across a C-invoked "
-                    f"callback",
+                    f"callback signatures must be primitives-only (int / "
+                    f"bool / unit) — str / struct / wedge / nested fn "
+                    f"aren't marshalable across a C-invoked callback",
                     c.line, c.col,
                 )
             raise CheckError(
@@ -945,12 +946,14 @@ class Checker:
             return TyTablets(size=t.size, element=inner)
         if isinstance(t, A.TypeBuffer):
             inner = self._resolve_type(t.element, f"{where} element")
-            # v0.1 scope: only byte buffers. Narrowing this avoids
-            # committing to a story for struct-element buffers, which
-            # would intersect with ownership in ways we haven't spec'd.
+            # Buffers carry only u8 today. Lifting the restriction needs
+            # an ownership story for struct / heap-bearing element types
+            # inside a stack-lifetime container — we haven't decided
+            # whether to copy on overwrite, forbid overwrite, or treat
+            # the buffer as a borrow window into something else.
             if not (isinstance(inner, TyInt) and inner.width == 8 and not inner.signed):
                 raise CheckError(
-                    f"{where}: buffer element must be u8 in v0.1, got {inner}",
+                    f"{where}: buffer element must be u8, got {inner}",
                     t.line, t.col,
                 )
             return TyBuffer(size=t.size, element=inner)
@@ -963,7 +966,9 @@ class Checker:
             return TyTablets(size=VARIADIC_CHUNK_SIZE, element=inner)
         if isinstance(t, A.TypeArray):
             raise CheckError(
-                f"{where}: array types are not supported in v0.1",
+                f"{where}: bare array types are not supported — use "
+                f"`tablets[N]T` for a growable arena or `buffer[N]u8` "
+                f"for a stack-lifetime byte buffer",
                 t.line, t.col,
             )
         if isinstance(t, A.TypePointer):
@@ -2150,9 +2155,10 @@ class Checker:
     def _tc_copy(self, e: A.Copy, expected: Ty | None = None) -> Ty:
         """`copy x` has the same type as its operand. At codegen we
         dispatch to `_deep_clone_if_cleanup_bearing`, which is a no-op
-        on scalars/handles/fn-pointers — so `copy` on a plain int is
-        harmless redundancy rather than an error. Future lint could
-        warn, but v0.1 stays permissive."""
+        on scalars / handles / fn-pointers — so `copy` on a plain int
+        is harmless redundancy rather than an error. A future lint
+        could warn on those redundant copies; the type checker stays
+        permissive for now."""
         return self._tc_expr(e.value, expected=expected)
 
     def _tc_cast(self, e: A.Cast) -> Ty:

@@ -8,9 +8,15 @@
 
 ## 0. Status
 
-Draft v0.1. Everything in this document is negotiable. This spec exists to
-give the compiler implementation a fixed target — we iterate on the spec,
-not the code.
+Spec for tuppu **0.4.0** (2026-04-26). Everything in this document is
+negotiable; the spec exists to give the compiler implementation a
+fixed target. The version of record lives in `pyproject.toml`;
+`CHANGELOG.md` tracks what changed each release.
+
+Numbered references in this document to "v0.x" predate the version
+reset and refer to the post-reset numbering: when something is
+described as "deferred to v0.5", that means a future minor release,
+not a past draft.
 
 ## 1. Philosophy
 

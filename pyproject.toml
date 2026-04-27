@@ -1,6 +1,6 @@
 [project]
 name = "tuppu"
-version = "0.0.1"
+version = "0.4.0"
 description = "The Tuppu compiler"
 requires-python = ">=3.12"
 dependencies = [

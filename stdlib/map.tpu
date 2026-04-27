@@ -4,15 +4,14 @@
 //
 // Linear scan keeps the implementation honest and dependency-free
 // (no hash function, no bucket array, no resize logic). For small
-// maps — config tables, environments, attribute bags — it is fast
-// enough and predictable. A hash-table variant living alongside this
-// one is a sensible follow-up once the upstream features it needs
-// (numeric generics for bucket count, a stdlib hash function) land.
+// maps — config tables, environments, attribute bags — it's fast
+// enough and predictable. A hash-table variant alongside this one
+// is the follow-up once numeric generics + a stdlib hash function
+// are in place; both are tracked in LIMITATIONS.md.
 //
-// Removal is not provided in v0.1 — tablets are append-only at the
-// runtime level, so a real `map_delete` would need tombstone slots
-// and a compaction story. Track that as future work and rebuild the
-// map when removal becomes essential.
+// Removal isn't supported yet — tablets are append-only at the
+// runtime level, so a real `map_delete` needs tombstone slots and
+// a compaction story. Rebuild the map if removal becomes essential.
 //
 // Keys are `str`. Comparison goes through `str_eq` from
 // `stdlib/str.tpu`, which is loaded ahead of this file by the

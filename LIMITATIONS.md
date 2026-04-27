@@ -1,0 +1,174 @@
+# Limitations
+
+A consolidated list of things Tuppu doesn't have yet that a serious
+language of this type ought to. The point of this file is **visibility**:
+nothing on this list should be excused with "we're early" anymore —
+either it's intentional and documented here, or it's a bug and gets
+fixed. New limitations land here at the same time they land in code,
+so the list is the source of truth. When something is fixed, delete
+the bullet (and add a CHANGELOG entry).
+
+Format: each section groups by area. Bullets prefix with severity:
+
+- **[blocker]** — actively prevents real programs from being written.
+- **[gap]** — missing feature with a real workflow it would unblock.
+- **[polish]** — nice-to-have that doesn't block anything load-bearing.
+
+## Memory model / GC
+
+- **[gap]** `_neuter_return_if_borrow` in codegen still inserts a
+  defensive deep-clone whenever a function returns a `Field` or
+  `Index` expression. This was a UAF guard pre-GC and is now wasted
+  allocation; the GC keeps the underlying bytes alive automatically.
+  Remove it and add a regression test that confirms the returned
+  pointer survives a forced collection in the caller.
+- **[gap]** No region-allocator for non-escaping `mut tablets` —
+  every push goes through the GC arena even when the lifetime is
+  trivially the function body. A region-allocator for the common
+  case would cut allocation pressure on hot paths (parser arenas,
+  per-frame scratch buffers).
+- **[gap]** No root-elision pass. `wedge T` walks already skip the
+  shadow stack, but `step` bindings of cleanup-bearing values are
+  unconditionally rooted even when their use is provably non-allocating.
+- **[polish]** GC arena never gives memory back to the OS. Long-
+  running programs grow until exit. Mark-sweep can compact + return
+  pages; we don't.
+
+## Type system
+
+- **[blocker]** No numeric generics. Container chunk size is hardcoded
+  per stdlib type (`tablets[16]Node<T>` in `list.tpu`,
+  `tablets[64]T` in `vec.tpu`, `tablets[64]str/T` in `map.tpu`).
+  A user can't write `Vec<T, 16>` vs `Vec<T, 1024>`.
+- **[gap]** Variant names in `seal` declarations must be globally
+  unique. `seal A { X }; seal B { X }` is rejected because the
+  variant lookup is a flat table. Qualified syntax (`A::X`) hasn't
+  been designed.
+- **[gap]** Pattern matching is flat only. No nested patterns
+  (`Some(Circle(r))`), no guards (`Some(x) if x > 0`), no or-patterns
+  (`Some(1) | Some(2)`). Exhaustiveness for nested patterns is
+  subtle and the design lift hasn't happened.
+- **[gap]** Variant fields are positional only. `Circle(rat)` works,
+  `Circle(radius: rat)` doesn't parse.
+- **[gap]** `f32` / `f64` are reserved keywords with no codegen.
+  Casts to / from float types raise a clear "not yet supported"
+  error rather than silently doing the wrong thing, but float
+  arithmetic is genuinely missing.
+- **[gap]** Bare array types (`[N]T`) aren't supported as a type
+  expression. Use `tablets[N]T` for growable, `buffer[N]u8` for
+  stack-lifetime byte-only.
+- **[gap]** No type aliases. `type Bytes = buffer[1024]u8` doesn't
+  exist; users repeat the spelling.
+- **[gap]** No traits / typeclasses. Generic constraints are implicit
+  ("monomorphization will fail if `T` doesn't support `==`"), with
+  errors deferred to instantiation time. Real bounded generics need
+  a constraint syntax.
+
+## Runtime / FFI
+
+- **[gap]** Buffers (`buffer[N]T`) are u8-only. Lifting requires an
+  ownership story for struct / heap-bearing element types inside a
+  stack-lifetime container — not yet decided.
+- **[gap]** Buffers can't be struct fields (stack lifetime would
+  outlive struct field accessors). Adding requires the same
+  decision.
+- **[gap]** Raw pointers (`*T`) can be held and passed but have no
+  user-side dereference, arithmetic, or construction syntax. Adding
+  requires an unsafe-block decision (which functions can do unsafe
+  work, what does the boundary look like).
+- **[gap]** Colophon callbacks are primitives-only. `fn(prim, ...) -> prim`
+  signatures cross the FFI boundary; `str` / struct / wedge / nested
+  fn arguments are rejected because we have no marshaling story for
+  them.
+- **[gap]** Closures don't capture environment. `fn` values pass
+  function pointers only; lambdas with captured variables are
+  pending.
+
+## Strings
+
+- **[gap]** `str_slice` always copies. Zero-copy slice views need a
+  lifetime story we don't have.
+- **[gap]** No mutable / growable string type. `str` is value-
+  semantics-immutable; string building goes through repeated
+  `str_concat` allocations or a `tablets[N]u8` buffer that gets
+  flattened at the end.
+- **[gap]** No format mini-language / f-strings. Build via
+  `str_concat` + `int_to_str` / `rat_to_str` etc.
+- **[polish]** No SSO (small-string optimization). `str` is always
+  `{ptr, len, cap}` (24 bytes). Accessor codegen leaves the door
+  open to switch to a tagged variant later without breaking callers.
+
+## Containers (stdlib)
+
+- **[gap]** `Map<T>` is linear-scan (O(n) lookup). Hash-based
+  variant pending — needs numeric generics for bucket count + a
+  stdlib hash function.
+- **[gap]** `Map<T>` can't remove entries. Tablets are append-only
+  at runtime; a real `map_delete` needs tombstone slots and
+  compaction logic.
+- **[gap]** `Vec<T>` can't pop. Tablets are append-only at runtime;
+  pop would need the tail chunk to track holes or a separate
+  shrink path.
+- **[gap]** No `Vec<T>` map / filter / fold helpers. They need
+  generic fn values across two type parameters which works in
+  principle but isn't tested; once verified, the helpers are
+  trivial.
+
+## Modules / packaging
+
+- **[blocker]** No module / import system. Bundled stdlib is auto-
+  discovered from `stdlib/*.tpu`; user programs are single-file.
+  Multi-file user code requires an `import` story (visibility,
+  circular imports, name resolution).
+- **[gap]** No package manager / external dependency story. Cargo /
+  npm / pip equivalent doesn't exist.
+- **[gap]** No conditional compilation. No `cfg` / feature flags
+  / target-specific code. Everything compiles for the host triple.
+
+## Tooling
+
+- **[gap]** No language server. Editor integrations rely on
+  `./tuppu run` / `./tuppu build` and reading errors out of stderr.
+- **[gap]** No formatter. Tests check `pytest` — the language has
+  no `gofmt` equivalent.
+- **[gap]** No incremental compilation. Every build re-typechecks
+  + re-codegens the whole program (stdlib included).
+- **[polish]** Error messages carry `line:col` but not source
+  context (the offending line, a caret pointer). The spec calls
+  for it; the implementation doesn't.
+- **[polish]** No debugger integration. Compiled binaries have
+  basic LLVM debug info but no Tuppu-aware lldb / gdb pretty-
+  printers.
+
+## Standard library coverage
+
+- **[gap]** No `read_line() -> str`. `read_int` exists; reading
+  whitespace-delimited or newline-delimited strings doesn't.
+- **[gap]** No file I/O. No `open` / `read` / `write` outside of
+  what `print` / `println` provide via libc.
+- **[gap]** No collections beyond `Vec<T>` / `Map<T>` / `Node<T>`.
+  No set, no priority queue, no deque.
+- **[gap]** No date / time. `clock_gettime` would route through
+  colophon but no wrapper exists.
+- **[gap]** No regex.
+- **[gap]** No JSON / serialization.
+
+## Spec / docs gaps
+
+- **[gap]** SPEC.md doesn't yet cover `seal` / `match`. Source of
+  truth is `tests/test_sum.py` and `examples/omens.tpu`.
+- **[gap]** SPEC.md predates the GC migration. Sections describing
+  the "tablets memory model" still talk about explicit `release`
+  even though the GC handles it now.
+- **[polish]** No prose-level "how to write idiomatic Tuppu" guide.
+  README + examples cover the surface; deeper patterns (when to
+  use `wedge` vs by-value, when to use `step` vs `mut`) are
+  implicit.
+
+---
+
+If you're working on a feature and you find a limitation that's
+actually blocking your work, **promote the bullet to a real task,
+file a focused PR, and delete it from this list**. Don't add
+workarounds that pretend the limitation isn't there — that's
+exactly the failure mode CONTRIBUTING.md calls out.

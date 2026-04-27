@@ -33,7 +33,7 @@ pip install -e .
 
 `./tuppu` is a shell wrapper around `python -m tuppu`. The bundled
 stdlib (`stdlib/*.tpu`) is auto-discovered and linked into every
-build — there's no `import` keyword in v0.1.
+build — there's no `import` keyword yet (see `LIMITATIONS.md`).
 
 ## A taste
 
@@ -137,7 +137,7 @@ The full grammar + semantics live in [`SPEC.md`](./SPEC.md).
 | `tablet Foo { ... }` | Product type (struct). Declared at module scope. |
 | `tablets[N]T` | Chunk-chained, pointer-stable, append-only arena of `T`. `N` is the chunk size. Backed by GC-allocated chunks linked by tail pointers. |
 | `wedge T` | Non-owning handle into a `tablets[N]T` slot. Returned by `tablets.push`, dereferenced via `.field` (auto-loads through the pointer). Compares equal to `lost` when null. |
-| `buffer[N]u8` | Fixed-size, stack-allocated, bounds-checked byte buffer. v0.1: `u8` only. Cannot appear as a struct field (stack lifetime). |
+| `buffer[N]u8` | Fixed-size, stack-allocated, bounds-checked byte buffer. `u8` only (see `LIMITATIONS.md`). Cannot appear as a struct field (stack lifetime). |
 | `seal Foo { Variant1, Variant2(T) }` | Sum type. Variants can be nullary or carry payload fields. |
 | `*T` | Raw pointer (FFI-only). Created from `buffer[N]u8` decay; not constructible from owned values. |
 | `fn(T1, T2) -> R` | First-class function value. `step f = some_fn` takes a name-as-value. |

@@ -10,9 +10,9 @@
 // for the life of the vec, so `wedge T` handles into the storage stay
 // valid across further pushes.
 //
-// CHUNK is 64 here as a cache-friendly default. When numeric generics
-// land (v0.2), CHUNK can be lifted to a parameter so `Vec<T, 16>` and
-// `Vec<T, 1024>` are independent monomorphizations.
+// CHUNK is 64 here as a cache-friendly default. Lifting CHUNK into a
+// type parameter (so `Vec<T, 16>` and `Vec<T, 1024>` monomorphize
+// independently) needs numeric generics — see LIMITATIONS.md.
 
 tablet Vec<T> { storage: tablets[64]T }
 
