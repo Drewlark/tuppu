@@ -452,20 +452,18 @@ class Parser:
         return _at(t, A.ExprStmt(expr=expr))
 
     def _check_lvalue(self, expr: A.Expr, start) -> None:
-        """An assignment target must be an Ident, a `.`-chain of Field
-        accesses, or one rooted at a tablets index (`arr[n].field = v`).
-        The index case terminates the walk at the Index node; codegen's
-        `_lvalue_slot` resolves the target mut binding and does the
-        runtime bounds check."""
+        """An assignment target must be a chain of `.`-field and `[]`-
+        index access steps rooted at an Ident. `r.field = v`,
+        `arr[n] = v`, `arr[n].field = v`, `m.values[idx] = v` — all
+        legal. Codegen's `_lvalue_slot` walks the same chain to GEP
+        the slot pointer + emit bounds checks."""
         node = expr
-        while isinstance(node, A.Field):
+        while isinstance(node, (A.Field, A.Index)):
             node = node.target
-        if isinstance(node, A.Index) and isinstance(node.target, A.Ident):
-            return
         if not isinstance(node, A.Ident):
             raise ParseError(
-                "assignment target must be a variable, a `.`-chain "
-                "of fields, or an indexed tablet element",
+                "assignment target must be a variable or a chain of "
+                "field / index accesses rooted at one",
                 start.line, start.col,
             )
 

@@ -1196,48 +1196,39 @@ class StmtMixin:
                 f"tablet has no field {target.name!r}"
             )
         if isinstance(target, A.Index):
-            # lvalue indexing into a mut tablets or buffer: `arr[n] = v`
-            # or `arr[n].field = v`. Resolve the inner binding,
-            # bounds-check the index, and return the slot pointer
-            # (not the loaded value) so Field chains built on top can
-            # GEP through the struct.
-            if not isinstance(target.target, A.Ident):
-                raise CodegenError(
-                    f"lvalue indexing: target must be a mut tablets or "
-                    f"buffer binding, got {type(target.target).__name__}"
-                )
-            var = self._lookup(target.target.name)
-            if not var.is_mut:
-                raise CodegenError(
-                    f"cannot assign into step binding {target.target.name!r}"
-                )
+            # lvalue indexing: `arr[n] = v`, `arr[n].field = v`,
+            # `obj.field[n] = v`, `m.keys[i] = v`, etc. Resolve the
+            # parent (which may itself be a Field / Index chain) to
+            # the pointer-to-container slot, then GEP / call get_addr
+            # on top.
+            parent_ptr, parent_ty = self._lvalue_slot(target.target)
             idx_val = self._gen_expr(target.index)
             if idx_val is None:
                 raise CodegenError("lvalue index has no value")
             idx_val = self._coerce(idx_val, I64)
-            if isinstance(var.value_ty, ir.ArrayType):
-                self._emit_bounds_trap(idx_val, var.value_ty.count)
+            if isinstance(parent_ty, ir.ArrayType):
+                self._emit_bounds_trap(idx_val, parent_ty.count)
                 slot = self.builder.gep(
-                    var.ir_ref,
+                    parent_ptr,
                     [ir.Constant(I32, 0), idx_val],
                     inbounds=True,
                 )
-                return slot, var.value_ty.element
-            info = self._tablets_info_for(var.value_ty)
+                return slot, parent_ty.element
+            info = self._tablets_info_for(parent_ty)
             if info is None:
                 raise CodegenError(
-                    f"lvalue indexing: {target.target.name!r} is not a "
-                    f"tablets or buffer (got {var.value_ty})"
+                    f"lvalue indexing: parent is not a tablets or buffer "
+                    f"(got {parent_ty})"
                 )
             len_addr = self.builder.gep(
-                var.ir_ref,
+                parent_ptr,
                 [ir.Constant(I32, 0), ir.Constant(I32, 2)],
                 inbounds=True,
             )
             length = self.builder.load(len_addr)
             self._emit_dynamic_bounds_trap(idx_val, length)
             slot = self.builder.call(
-                self._get_tablets_get_addr(info), [var.ir_ref, idx_val],
+                self._get_tablets_get_addr(info), [parent_ptr, idx_val],
             )
             return slot, info.elem_ty
         raise CodegenError(

@@ -1,0 +1,68 @@
+// Generic string-keyed map. Stores parallel `keys` / `values`
+// tablets and looks up by linear scan over keys. Insertion order is
+// preserved (iterate by index 0..len-1 for stable order).
+//
+// Linear scan keeps the implementation honest and dependency-free
+// (no hash function, no bucket array, no resize logic). For small
+// maps — config tables, environments, attribute bags — it is fast
+// enough and predictable. A hash-table variant living alongside this
+// one is a sensible follow-up once the upstream features it needs
+// (numeric generics for bucket count, a stdlib hash function) land.
+//
+// Removal is not provided in v0.1 — tablets are append-only at the
+// runtime level, so a real `map_delete` would need tombstone slots
+// and a compaction story. Track that as future work and rebuild the
+// map when removal becomes essential.
+//
+// Keys are `str`. Comparison goes through `str_eq` from
+// `stdlib/str.tpu`, which is loaded ahead of this file by the
+// glob-sorted bundler.
+
+tablet Map<T> {
+  keys:   tablets[64]str,
+  values: tablets[64]T,
+}
+
+// Internal: index of `k`'s slot, or -1 if absent. Used by every
+// public lookup so the search stays in one place.
+fn map_index<T>(m: Map<T>, k: str) -> i64 {
+  mut i: i64 = 0
+  while i < m.keys.len {
+    if str_eq(m.keys[i], k) { yield i }
+    i += 1
+  }
+  -1
+}
+
+// Number of distinct keys in the map. O(1).
+fn map_len<T>(m: Map<T>) -> i64 {
+  m.keys.len
+}
+
+// True iff `k` is present.
+fn map_has<T>(m: Map<T>, k: str) -> bool {
+  map_index(m, k) >= 0
+}
+
+// Lookup with caller-supplied default. Returns the stored value when
+// `k` is present, otherwise `fallback`. The fallback is always
+// evaluated — design tradeoff for a langauge without sum-typed
+// Option in the stdlib yet.
+fn map_get<T>(m: Map<T>, k: str, fallback: T) -> T {
+  step idx: i64 = map_index(m, k)
+  if idx < 0 { yield fallback }
+  m.values[idx]
+}
+
+// Insert or update. If `k` already exists, the existing value slot
+// is overwritten in place. Otherwise a fresh (k, v) pair is appended
+// to the end of both backing tablets. Insertion order is preserved.
+fn map_set<T>(mut m: Map<T>, k: str, v: T) {
+  step idx: i64 = map_index(m, k)
+  if idx >= 0 {
+    m.values[idx] = v
+    yield
+  }
+  step _k = m.keys.push(k)
+  step _v = m.values.push(v)
+}
