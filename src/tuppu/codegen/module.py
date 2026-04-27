@@ -553,6 +553,15 @@ class ModuleMixin:
                 # this the about-to-fire frame cleanup would release
                 # (and tag-zero) the value being returned, leaving the
                 # caller with a moved-from V or a freed str.
+                # NOTE: the pop-latest call below is a heuristic that
+                # depends on an unwritten invariant about this frame's
+                # contents. If you add ANY codegen step here (or above,
+                # between `_gen_expr(fn.body)` and this point) that
+                # registers a `.rvalue.root` cleanup, or change fn body
+                # codegen so sub-expression chokepoints can land in the
+                # outer frame, read the docstring on
+                # `_pop_latest_rvalue_root_cleanup` first — it
+                # enumerates the failure modes and the principled fix.
                 if self._is_cleanup_bearing_ty(coerced.type):
                     self._pop_latest_rvalue_root_cleanup()
                 self._emit_frame_cleanups(self._cleanup_frames[-1])

@@ -414,7 +414,71 @@ class ExprMixin:
         cleanup that would otherwise fire on the value being handed
         back. The corresponding GC root stays pushed (it pops
         normally as part of frame teardown); only the release call
-        is suppressed. Returns True if an entry was removed."""
+        is suppressed. Returns True if an entry was removed.
+
+        ============================================================
+        UNWRITTEN INVARIANT — read before changing `_gen_fn_body`.
+        ============================================================
+        This is a heuristic. It's correct only because, at the moment
+        `_gen_fn_body` calls it, the outer (fn body) frame holds at
+        most ONE entry whose name is `.rvalue.root`, and that entry
+        is the chokepoint spill of the function's return value.
+
+        The current codegen guarantees this because:
+
+          1. Param processing in `_gen_fn_body` registers cleanup
+             entries with the param's NAME (e.g., `"x"`, `"b"`),
+             never `.rvalue.root`. Non-mut cleanup-bearing params
+             only get a GC root, no cleanup entry at all.
+
+          2. `_gen_expr(fn.body)` always recurses through
+             `_gen_block` (since fn bodies parse as `Block`), and
+             `_gen_block` pushes its own frame. Every chokepoint
+             that fires while evaluating the body therefore lands
+             in the BLOCK's frame, not the outer frame, and gets
+             released when the block frame pops.
+
+          3. Once `_gen_expr(fn.body)` returns, the OUTER chokepoint
+             at the end of `_gen_expr` runs exactly once on the
+             returned value. That single chokepoint is the only
+             `.rvalue.root` that survives into the outer frame.
+
+          4. Nothing in `_gen_fn_body` between `_gen_expr(fn.body)`
+             and `_pop_latest_rvalue_root_cleanup()` invokes a
+             chokepoint or otherwise registers a cleanup entry.
+
+        FUTURE CODEGEN CHANGES THAT WOULD BREAK THIS:
+
+          - Allowing a non-`Block` fn body (a bare expression as
+            body, no enclosing Block frame). Body sub-expressions'
+            chokepoints would then land in the outer frame, and
+            the latest entry would no longer reliably be the
+            return value.
+
+          - Inserting any post-body codegen step in `_gen_fn_body`
+            that evaluates a cleanup-bearing expression in the
+            outer frame (e.g., a postlude that builds a result
+            wrapper, an exit-handler hook, structured-effects
+            unwinding, or a `defer`-like construct that runs
+            after the body returns).
+
+          - Multiple-return-value functions, if their result-
+            packing emits chokepointed sub-expressions in the
+            outer frame after the body.
+
+          - Changing the chokepoint to register `.rvalue.root`
+            entries with a name that isn't literally
+            `".rvalue.root"`, without updating this match.
+
+        PRINCIPLED FIX (when one of the above is needed):
+
+        Have `_force_root_cleanup_value` return the slot it
+        registered (or a token identifying the cleanup entry), and
+        have `_gen_fn_body` transfer the return-value cleanup out
+        BY IDENTITY rather than by frame-position. That makes the
+        invariant explicit and decouples this from the fn-body
+        codegen layout.
+        """
         if not self._cleanup_frames:
             return False
         frame = self._cleanup_frames[-1]
