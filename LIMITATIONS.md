@@ -16,6 +16,20 @@ Format: each section groups by area. Bullets prefix with severity:
 
 ## Memory model / GC
 
+- **[blocker]** No LLVM optimization passes can run on the emitted
+  IR. The shadow-stack rooting calls our GC depends on
+  (`__tuppu_gc_push_root(slot, ...)`) look like opaque extern calls
+  to LLVM; standard passes (SROA, mem2reg, instcombine) promote
+  rooted allocas to SSA without realizing the GC needs the address
+  to persist. Even `tail_call_elimination` desyncs the push/pop
+  accounting on recursive calls. Confirmed empirically: any opt
+  level above `-O0` SIGSEGVs the lua interp. The fix is to migrate
+  to LLVM's first-class GC framework — `gc "shadow-stack"` fn
+  attribute + `@llvm.gcroot` intrinsics — so optimizations become
+  GC-aware. Until then, every Tuppu binary ships with whatever the
+  IR generator emits, no inlining, no DCE, no register promotion.
+  This leaves a lot of perf on the table; on hot recursive loops
+  (lua interp, fib) it's the single biggest unlocked win available.
 - **[gap]** No region-allocator for non-escaping `mut tablets` —
   every push goes through the GC arena even when the lifetime is
   trivially the function body. A region-allocator for the common

@@ -86,6 +86,23 @@ def compile_to_ir(source: str) -> str:
 # --- object and link ------------------------------------------------------
 
 def emit_object(ir_text: str, out: Path) -> None:
+    """Lower Tuppu-emitted LLVM IR to a native object file.
+
+    NOTE: no LLVM optimization passes are run on the emitted IR. The
+    standard pipelines (`-O1`+) all include passes that don't know
+    about our shadow-stack GC roots:
+
+      - SROA / mem2reg promote allocas whose uses are loads/stores,
+        but they treat `__tuppu_gc_push_root(slot, ...)` as an opaque
+        extern call and don't track the slot as a persistent address —
+        so a rooted alloca gets promoted, the GC traces freed memory.
+      - tail_call_elimination rewrites recursive calls to reuse the
+        caller's frame, which desyncs our push/pop accounting.
+
+    The fix is to migrate to LLVM's first-class GC framework
+    (`gc "shadow-stack"` fn attribute + `@llvm.gcroot` intrinsics),
+    which makes the optimizer GC-aware. Tracked in LIMITATIONS.md
+    as a [blocker] for any opt-level work."""
     llvm.initialize_native_target()
     llvm.initialize_native_asmprinter()
     ref = llvm.parse_assembly(ir_text)
