@@ -102,6 +102,18 @@ class TypeIVec:
     col:  int = _pos()
 
 @dataclass
+class TypeDVec:
+    """`dvec<T>` — direct vector. Contiguous heap-allocated array of T
+    values stored inline. O(1) random access (one load). Grow
+    invalidates element addresses (memcpy moves inline T bytes), so
+    `push` returns unit rather than a handle. Best for primitive /
+    small T where the per-element heap allocation that ivec needs is
+    wasteful."""
+    element: "TypeExpr"
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
 class TypeFn:
     """First-class function type: `fn(T1, T2) -> U`. No environment —
     these are plain function pointers (capture comes later). Used in
@@ -128,7 +140,7 @@ class TypeApply:
 
 TypeExpr = Union[
     TypeName, TypeArray, TypeTablets, TypeBuffer, TypeVariadicTablets,
-    TypePointer, TypeHandle, TypeIVec, TypeApply, TypeFn,
+    TypePointer, TypeHandle, TypeIVec, TypeDVec, TypeApply, TypeFn,
 ]
 
 

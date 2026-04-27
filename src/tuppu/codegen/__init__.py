@@ -28,6 +28,7 @@ from ._common import (
     TabletsInfo, Variable,
 )
 from .access import AccessMixin
+from .dvec import DVecMixin
 from .expr import ExprMixin
 from .intrinsics import IntrinsicsMixin
 from .ivec import IVecMixin
@@ -42,7 +43,7 @@ from .types import TypesMixin
 
 
 class Codegen(
-    SexMixin, RatMixin, TabletsMixin, IVecMixin, StrsMixin, SealsMixin,
+    SexMixin, RatMixin, TabletsMixin, IVecMixin, DVecMixin, StrsMixin, SealsMixin,
     ExprMixin, StmtMixin, IntrinsicsMixin, AccessMixin, TypesMixin, ModuleMixin,
 ):
     def __init__(self, checker=None) -> None:
@@ -105,6 +106,10 @@ class Codegen(
         # ivec per-T helper-fn cache. Keyed by (str(elem_ty), is_wedge).
         # See ivec.py for layout discussion.
         self._ivec_types: dict = {}
+        # dvec per-T cache (helper fns + per-T storage descriptor).
+        # Keyed by (str(elem_ty), is_wedge); each entry holds a
+        # buffer trace fn that walks inline T slots.
+        self._dvec_types: dict = {}
         # User-defined structs: name -> LLVM struct type + ordered fields.
         # Per-block stack of cleanups (just tablets releases for now).
         # Each entry: (release_fn, ptr, source_name). Pushed at block
@@ -308,6 +313,11 @@ class Codegen(
             # offset 0 is GC-traced (the storage's runtime trace fn
             # walks the per-cap pointer slots), and len/cap are scalar.
             return "__tuppu_ivec"
+        if self._is_dvec_value(value_ty):
+            # Like ivec, the dvec value's descriptor is shared (one
+            # ptr-field at offset 0). The PER-T variation lives on the
+            # buffer's descriptor, not the dvec value's.
+            return "__tuppu_dvec"
         info = self._tablets_info_for(value_ty)
         if info is not None:
             wedge_tag = "_w" if info.elem_is_wedge else ""
@@ -355,6 +365,8 @@ class Codegen(
         if self._is_str_value(value_ty):
             return [0]
         if self._is_ivec_value(value_ty):
+            return [0]   # buf ptr; len/cap are scalar i64
+        if self._is_dvec_value(value_ty):
             return [0]   # buf ptr; len/cap are scalar i64
         info = self._tablets_info_for(value_ty)
         if info is not None:
@@ -849,6 +861,18 @@ class Codegen(
             return cached
         fty = ir.FunctionType(ir.VoidType(), [I8.as_pointer()])
         return ir.Function(self.module, fty, "__tuppu_gc_mark_ptr")
+
+    def _get_gc_data_size(self) -> ir.Function:
+        """`__tuppu_gc_data_size(p) -> size_t` — return the bytes-of-
+        data following p's GC header, or 0 if p isn't a GC allocation.
+        Used by codegen-emitted trace fns that need to recover an
+        allocation's element count without mirroring the header
+        layout."""
+        cached = self.module.globals.get("__tuppu_gc_data_size")
+        if isinstance(cached, ir.Function):
+            return cached
+        fty = ir.FunctionType(I64, [I8.as_pointer()])
+        return ir.Function(self.module, fty, "__tuppu_gc_data_size")
 
     def _get_gc_mark_wedge(self) -> ir.Function:
         """`__tuppu_gc_mark_wedge(ptr)` — interior-pointer mark for

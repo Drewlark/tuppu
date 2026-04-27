@@ -98,6 +98,13 @@ class StmtMixin:
                 self._gen_for_ivec(f, iter_val, iv_info)
                 return
 
+        if self._is_dvec_value(iter_val.type):
+            elem_ty = self._dvec_elem_for_for(f)
+            if elem_ty is not None:
+                dv_info = self._get_dvec(elem_ty)
+                self._gen_for_dvec(f, iter_val, dv_info)
+                return
+
         raise CodegenError(
             f"for: cannot iterate over value of type {iter_val.type}"
         )
@@ -119,6 +126,26 @@ class StmtMixin:
         )
         length = self.builder.load(len_addr)
         get_fn = self._get_ivec_get(info)
+        self._emit_counted_loop(
+            length,
+            lambda i: self.builder.call(get_fn, [slot, i]),
+            f,
+        )
+
+    def _gen_for_dvec(
+        self, f: A.ForStmt, dv_val: ir.Value, info,
+    ) -> None:
+        assert self.builder is not None
+        from ._common import DVEC_STRUCT, DVEC_IDX_LEN
+        slot = self._alloca_entry(DVEC_STRUCT, "for.dv")
+        self.builder.store(dv_val, slot)
+        len_addr = self.builder.gep(
+            slot,
+            [ir.Constant(I32, 0), ir.Constant(I32, DVEC_IDX_LEN)],
+            inbounds=True,
+        )
+        length = self.builder.load(len_addr)
+        get_fn = self._get_dvec_get(info)
         self._emit_counted_loop(
             length,
             lambda i: self.builder.call(get_fn, [slot, i]),
@@ -541,6 +568,12 @@ class StmtMixin:
             # ivec has no manual release — GC handles the storage and
             # per-element heap allocs. We still need to root the slot
             # so the buf pointer stays reachable across collections.
+            self._register_gc_root(slot, value_ty)
+            return
+        if self._is_dvec_value(value_ty):
+            # dvec is the same story as ivec: no release fn, but the
+            # buf pointer needs rooting so the inline T storage stays
+            # reachable across collections.
             self._register_gc_root(slot, value_ty)
             return
         if self._is_str_value(value_ty):
@@ -1261,6 +1294,27 @@ class StmtMixin:
                 self._emit_dynamic_bounds_trap(idx_val, length)
                 slot = self.builder.call(
                     self._get_ivec_get_addr(iv_info),
+                    [parent_ptr, idx_val],
+                )
+                return slot, elem_ty
+            if self._is_dvec_value(parent_ty):
+                from ._common import DVEC_IDX_LEN
+                elem_ty = self._dvec_elem_for_index(target)
+                if elem_ty is None:
+                    raise CodegenError(
+                        "lvalue dvec index: missing element type "
+                        "from typecheck sideband"
+                    )
+                dv_info = self._get_dvec(elem_ty)
+                len_addr = self.builder.gep(
+                    parent_ptr,
+                    [ir.Constant(I32, 0), ir.Constant(I32, DVEC_IDX_LEN)],
+                    inbounds=True,
+                )
+                length = self.builder.load(len_addr)
+                self._emit_dynamic_bounds_trap(idx_val, length)
+                slot = self.builder.call(
+                    self._get_dvec_get_addr(dv_info),
                     [parent_ptr, idx_val],
                 )
                 return slot, elem_ty

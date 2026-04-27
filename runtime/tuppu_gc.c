@@ -340,6 +340,19 @@ void __tuppu_gc_noop_free(void* p) {
     (void)p;
 }
 
+/* Helper for codegen-emitted trace fns that need to know how many
+ * bytes of data live behind a GC-allocated buffer pointer. The
+ * dvec storage trace fn uses this to recover `cap` as
+ * `data_size / sizeof(T)` without having to mirror the header
+ * layout in codegen-emitted IR — keeping the runtime header struct
+ * a private detail of this file. */
+size_t __tuppu_gc_data_size(void* p) {
+    if (!p) return 0;
+    tuppu_hdr_t* hdr = HDR_OF(p);
+    if (hdr->magic != TUPPU_GC_MAGIC) return 0;
+    return hdr->size - HDR_SIZE;
+}
+
 /* ivec storage trace fn. The storage of an `ivec<T>` is a
  * heap-allocated array of `T*` slots — every slot is a pointer to a
  * separately-allocated T. The buffer's header records the total

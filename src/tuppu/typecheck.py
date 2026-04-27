@@ -146,6 +146,16 @@ class TyIVec:
     def __str__(self) -> str: return f"ivec<{self.element}>"
 
 @dataclass(frozen=True)
+class TyDVec:
+    """`dvec<T>` — direct vector: contiguous heap-allocated array of
+    T values inline. Random access is O(1) (one load). Grow moves T
+    bytes, so wedges into individual elements are invalidated; for
+    that reason push returns unit, unlike ivec/tablets which hand
+    back stable handles."""
+    element: "Ty"
+    def __str__(self) -> str: return f"dvec<{self.element}>"
+
+@dataclass(frozen=True)
 class TyStruct:
     """A user-defined tablet (product) type. Nominally typed — equal
     by name only, with an optional tuple of instantiated type args
@@ -361,6 +371,11 @@ class Checker:
         self.ivec_elem_at_call: dict[int, "Ty"] = {}     # Call → elem Ty
         self.ivec_elem_at_index: dict[int, "Ty"] = {}    # Index → elem Ty
         self.ivec_elem_at_for: dict[int, "Ty"] = {}      # ForStmt → elem Ty
+        # Same shape for `dvec<T>` — different runtime layout but the
+        # codegen still needs T at every call/index/iter site.
+        self.dvec_elem_at_call: dict[int, "Ty"] = {}
+        self.dvec_elem_at_index: dict[int, "Ty"] = {}
+        self.dvec_elem_at_for: dict[int, "Ty"] = {}
         # Variadic calls: Call node id → synthesized TabletsLit holding
         # the collected trailing arguments. Codegen consults this to
         # emit the literal once for the last param slot.
@@ -1017,6 +1032,9 @@ class Checker:
         if isinstance(t, A.TypeIVec):
             inner = self._resolve_type(t.element, f"{where} element")
             return TyIVec(element=inner)
+        if isinstance(t, A.TypeDVec):
+            inner = self._resolve_type(t.element, f"{where} element")
+            return TyDVec(element=inner)
         if isinstance(t, A.TypeFn):
             params = tuple(
                 self._resolve_type(p, f"{where} fn-type parameter")
@@ -1142,6 +1160,9 @@ class Checker:
             return iter_ty.element
         if isinstance(iter_ty, TyIVec):
             self.ivec_elem_at_for[id(f)] = iter_ty.element
+            return iter_ty.element
+        if isinstance(iter_ty, TyDVec):
+            self.dvec_elem_at_for[id(f)] = iter_ty.element
             return iter_ty.element
         str_ty = self.structs.get("str")
         if str_ty is not None and iter_ty == str_ty:
@@ -1515,6 +1536,8 @@ class Checker:
             return self._occurs_in(var_name, ty.element)
         if isinstance(ty, TyIVec):
             return self._occurs_in(var_name, ty.element)
+        if isinstance(ty, TyDVec):
+            return self._occurs_in(var_name, ty.element)
         if isinstance(ty, TyStruct):
             return any(self._occurs_in(var_name, a) for a in ty.args)
         if isinstance(ty, TySeal):
@@ -1534,6 +1557,9 @@ class Checker:
         if isinstance(ty, TyIVec):
             inner = self._substitute(ty.element, subst)
             return TyIVec(element=inner)
+        if isinstance(ty, TyDVec):
+            inner = self._substitute(ty.element, subst)
+            return TyDVec(element=inner)
         if isinstance(ty, TyStruct) and ty.args:
             new_args = tuple(self._substitute(a, subst) for a in ty.args)
             return TyStruct(name=ty.name, args=new_args)
@@ -1917,6 +1943,31 @@ class Checker:
                 f"ivec has no method {method!r}", e.line, e.col,
             )
 
+        if isinstance(recv_ty, TyDVec):
+            if method == "push":
+                if len(e.args) != 1:
+                    raise CheckError(
+                        "dvec.push takes one argument", e.line, e.col,
+                    )
+                at = self._tc_expr(e.args[0])
+                if not _coerces_to(at, recv_ty.element):
+                    raise CheckError(
+                        f"dvec.push: value has type {at}, "
+                        f"element type is {recv_ty.element}",
+                        e.line, e.col,
+                    )
+                self.dvec_elem_at_call[id(e)] = recv_ty.element
+                # Unlike ivec / tablets, dvec.push returns unit. Inline
+                # T storage means a grow can memcpy elements to a new
+                # buffer; handing back a wedge to the just-pushed slot
+                # would dangle on the very next push. Users index into
+                # `dv[i]` for read access; that path is freshly
+                # bounds-checked + dereferenced each time.
+                return UNIT
+            raise CheckError(
+                f"dvec has no method {method!r}", e.line, e.col,
+            )
+
         # Struct field that happens to be a fn value — `obj.run(x)` is
         # not a method dispatch but a field-access-then-indirect-call.
         # Resolve the field's type via the struct registry; if it's a
@@ -1960,6 +2011,13 @@ class Checker:
                 return I64
             raise CheckError(
                 f"ivec has no field {e.name!r}; only len",
+                e.line, e.col,
+            )
+        if isinstance(target_ty, TyDVec):
+            if e.name == "len":
+                return I64
+            raise CheckError(
+                f"dvec has no field {e.name!r}; only len",
                 e.line, e.col,
             )
         if isinstance(target_ty, TyBuffer):
@@ -2124,6 +2182,15 @@ class Checker:
                     e.line, e.col,
                 )
             self.ivec_elem_at_index[id(e)] = target_ty.element
+            return target_ty.element
+        if isinstance(target_ty, TyDVec):
+            idx_ty = self._tc_expr(e.index)
+            if not _is_int(idx_ty):
+                raise CheckError(
+                    f"dvec index must be integer, got {idx_ty}",
+                    e.line, e.col,
+                )
+            self.dvec_elem_at_index[id(e)] = target_ty.element
             return target_ty.element
         if isinstance(target_ty, TyBuffer):
             idx_ty = self._tc_expr(e.index)

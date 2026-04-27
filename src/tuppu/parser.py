@@ -400,6 +400,15 @@ class Parser:
             element = self.parse_type()
             self.eat(Tok.GT)
             return _at(t, A.TypeIVec(element=element))
+        if t.kind is Tok.DVEC:
+            # `dvec<T>` — direct vector: contiguous heap-allocated
+            # array of T values inline. O(1) random access (one load),
+            # but grow invalidates T addresses, so push returns unit.
+            self.advance()
+            self.eat(Tok.LT)
+            element = self.parse_type()
+            self.eat(Tok.GT)
+            return _at(t, A.TypeDVec(element=element))
         if t.kind is Tok.LBRACKET:
             self.advance()
             size = self.eat(Tok.INT, "array size (integer)").value

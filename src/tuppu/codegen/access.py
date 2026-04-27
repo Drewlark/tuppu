@@ -33,6 +33,8 @@ class AccessMixin:
                 return self._gen_tablets_field(var, e.name)
             if var is not None and self._is_ivec_value(var.value_ty):
                 return self._gen_ivec_field(var, e.name)
+            if var is not None and self._is_dvec_value(var.value_ty):
+                return self._gen_dvec_field(var, e.name)
             if var is not None and isinstance(var.value_ty, ir.ArrayType):
                 if e.name == "len":
                     return ir.Constant(I64, var.value_ty.count)
@@ -60,6 +62,13 @@ class AccessMixin:
                 return self.builder.extract_value(target, IVEC_IDX_LEN)
             raise CodegenError(
                 f"ivec has no field {e.name!r}; only len"
+            )
+        if self._is_dvec_value(target.type):
+            if e.name == "len":
+                from ._common import DVEC_IDX_LEN
+                return self.builder.extract_value(target, DVEC_IDX_LEN)
+            raise CodegenError(
+                f"dvec has no field {e.name!r}; only len"
             )
         # Tablet handle: auto-deref. The handle is a pointer to the
         # underlying struct; GEP into it to the field slot, then load.
@@ -338,6 +347,11 @@ class AccessMixin:
                     if elem_ty is not None:
                         iv_info = self._get_ivec(elem_ty)
                         return self._gen_ivec_index(iv_info, var, e.index)
+                if self._is_dvec_value(var.value_ty):
+                    elem_ty = self._dvec_elem_for_index(e)
+                    if elem_ty is not None:
+                        dv_info = self._get_dvec(elem_ty)
+                        return self._gen_dvec_index(dv_info, var, e.index)
                 if isinstance(var.value_ty, ir.ArrayType):
                     # Buffer indexing — GEP + bounds-trap + load.
                     idx = self._gen_expr(e.index)

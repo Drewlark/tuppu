@@ -619,6 +619,13 @@ class ExprMixin:
                             return self._gen_ivec_method(
                                 iv_info, var, e.callee.name, e.args,
                             )
+                    if self._is_dvec_value(var.value_ty):
+                        elem_ty = self._dvec_elem_for_call(e)
+                        if elem_ty is not None:
+                            dv_info = self._get_dvec(elem_ty)
+                            return self._gen_dvec_method(
+                                dv_info, var, e.callee.name, e.args,
+                            )
             elif isinstance(e.callee.target, A.Field):
                 try:
                     slot_ptr, slot_ty = self._lvalue_slot(e.callee.target)
@@ -643,6 +650,17 @@ class ExprMixin:
                             )
                             return self._gen_ivec_method(
                                 iv_info, inner, e.callee.name, e.args,
+                            )
+                    if self._is_dvec_value(slot_ty):
+                        elem_ty = self._dvec_elem_for_call(e)
+                        if elem_ty is not None:
+                            dv_info = self._get_dvec(elem_ty)
+                            inner = Variable(
+                                is_mut=True, ir_ref=slot_ptr,
+                                value_ty=slot_ty,
+                            )
+                            return self._gen_dvec_method(
+                                dv_info, inner, e.callee.name, e.args,
                             )
 
             # Struct field holding a fn-value: `obj.run(x)` loads the

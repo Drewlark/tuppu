@@ -74,6 +74,23 @@ IVEC_IDX_CAP = 2
 # of 1→2→4→8 to keep small ivecs off the GC's small-object pile.
 IVEC_INITIAL_CAP = 8
 
+# dvec value layout — `{ buf: i8*, len: i64, cap: i64 }`. Like ivec,
+# the LLVM struct is shared across every `dvec<T>`; per-T differences
+# (slot size, trace logic) live in helper fns and the per-T storage
+# descriptor. Buffer holds T values inline at byte offset
+# `i * sizeof(T)`. Grow path memcpy's the inline T bytes — wedges
+# into individual slots are invalidated.
+DVEC_STRUCT = ir.LiteralStructType([
+    I8.as_pointer(),  # buf: i8* (byte-addressed; we GEP-by-offset
+                      # and bitcast to T* per-slot)
+    I64,              # len
+    I64,              # cap
+])
+DVEC_IDX_BUF = 0
+DVEC_IDX_LEN = 1
+DVEC_IDX_CAP = 2
+DVEC_INITIAL_CAP = 8
+
 INT_WIDTH: dict[str, int] = {
     "i8": 8, "i16": 16, "i32": 32, "i64": 64,
     "u8": 8, "u16": 16, "u32": 32, "u64": 64,
@@ -134,6 +151,26 @@ class IVecInfo:
     elem_ty: ir.Type
     suffix: str
     elem_is_wedge: bool = False
+    push: ir.Function | None = None
+    get: ir.Function | None = None
+    get_addr: ir.Function | None = None
+
+
+@dataclass
+class DVecInfo:
+    """Per-T monomorphized helper fns + buffer descriptor for
+    `dvec<T>`. The struct LLVM type is shared (`DVEC_STRUCT`); the
+    buffer's GC type descriptor and trace fn vary per T because the
+    buffer holds inline T values whose layout the GC must walk.
+
+    `desc` is the buffer's `tuppu_type_t` global, holding a per-T
+    trace fn that loops `(allocation_size - HDR_SIZE) / sizeof(T)`
+    slots and recurses through T's standard tracing path."""
+    elem_ty: ir.Type
+    suffix: str
+    elem_is_wedge: bool = False
+    desc: ir.GlobalVariable | None = None
+    trace_fn: ir.Function | None = None
     push: ir.Function | None = None
     get: ir.Function | None = None
     get_addr: ir.Function | None = None

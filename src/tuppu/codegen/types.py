@@ -13,7 +13,7 @@ from ._common import (
     CodegenError, Variable,
     I1, I8, I16, I32, I64,
     INT_WIDTH, RAT, SEX, SEX_MAX_DIGITS,
-    IVEC_STRUCT,
+    IVEC_STRUCT, DVEC_STRUCT,
 )
 
 
@@ -89,6 +89,11 @@ class TypesMixin:
             elem_is_wedge = isinstance(t.element, A.TypeHandle)
             self._get_ivec(elem, elem_is_wedge=elem_is_wedge)
             return IVEC_STRUCT
+        if isinstance(t, A.TypeDVec):
+            elem = self._lower_type(t.element)
+            elem_is_wedge = isinstance(t.element, A.TypeHandle)
+            self._get_dvec(elem, elem_is_wedge=elem_is_wedge)
+            return DVEC_STRUCT
         if isinstance(t, A.TypeFn):
             param_tys = [self._lower_type(p) for p in t.params]
             ret_ty = (
@@ -328,7 +333,7 @@ class TypesMixin:
         paths where we have checker-resolved types, not AST nodes."""
         from ..typecheck import (
             TyInt, TyBool, TyRat, TyDish, TyUnit, TyHandle, TyTablets,
-            TyIVec, TyStruct, TySeal, TyVar,
+            TyIVec, TyDVec, TyStruct, TySeal, TyVar,
         )
         if isinstance(ty, TyVar):
             # Inside a generic fn specialization, a TyVar that survived
@@ -363,6 +368,12 @@ class TypesMixin:
                 self._lower_ty(ty.element), elem_is_wedge=elem_is_wedge,
             )
             return IVEC_STRUCT
+        if isinstance(ty, TyDVec):
+            elem_is_wedge = isinstance(ty.element, TyHandle)
+            self._get_dvec(
+                self._lower_ty(ty.element), elem_is_wedge=elem_is_wedge,
+            )
+            return DVEC_STRUCT
         if isinstance(ty, TyStruct):
             if ty.args:
                 arg_tys = tuple(self._lower_ty(a) for a in ty.args)

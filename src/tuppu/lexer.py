@@ -44,6 +44,7 @@ class Tok(Enum):
     TABLETS = auto()
     BUFFER = auto()      # emitted by `buffer` keyword — fixed-size byte buffer
     IVEC = auto()        # emitted by `ivec` keyword — indirect vector (array of pointers)
+    DVEC = auto()        # emitted by `dvec` keyword — direct vector (contiguous T values)
     RELEASE = auto()
     STRUCT = auto()      # emitted by `tablet` keyword — product type decl
     WEDGE = auto()       # emitted by `wedge` keyword — handle type (tablet ref)
@@ -122,9 +123,15 @@ KEYWORDS: dict[str, Tok] = {
     # `ivec<T>` is an indirect vector — contiguous heap-allocated array of
     # pointers to per-element T allocations. O(1) random access (two
     # loads), pointer-stable T values (resize moves only the pointer
-    # array). Cousin: `dvec<T>` (planned) for direct contiguous T storage,
-    # better for primitive T at the cost of pointer-instability.
+    # array). Cousin: `dvec<T>` for direct contiguous T storage, better
+    # for primitive T at the cost of pointer-instability.
     "ivec": Tok.IVEC,
+    # `dvec<T>` is a direct vector — contiguous heap-allocated array of
+    # T values inline. O(1) random access (one load), but T's address
+    # is invalidated by grow (memcpy moves inline T bytes), so push
+    # does not hand back a handle. Pick over ivec for primitive /
+    # small T where the per-element heap allocation is wasteful.
+    "dvec": Tok.DVEC,
     # `wedge T` is a handle into some `tablets[N]T` — cuneiform is
     # "wedge-writing", so a wedge is the atom of a Mesopotamian mark:
     # a single small reference to something larger.

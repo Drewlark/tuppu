@@ -13,6 +13,24 @@ narrative.
 
 ### Added
 
+- **`dvec<T>` — direct vector (Rust-Vec / std::vector shape).**
+  Contiguous heap-allocated array of T values stored inline. O(1)
+  random access via a single load (`buf + i*sizeof(T)`). Grow
+  memcpys the inline T bytes, which invalidates wedges into
+  individual elements — so `dvec.push` returns unit (no handle to
+  dangle on the next push). Methods: `dv.push(x)`, `dv[i]`,
+  `dv[i] = x`, `dv.len`, `for x in dv`. Each `dvec<T>` carries its
+  own per-T buffer descriptor; the trace fn calls
+  `__tuppu_gc_data_size(buf)` (new runtime helper) to recover cap
+  dynamically and walks T-typed slots through `_emit_trace_mark_calls`,
+  so composite T (struct holding str / wedges / nested seals)
+  traces correctly. Pick `dvec<T>` over `ivec<T>` for primitive /
+  small T where ivec's per-element heap allocation is wasteful.
+  16 new tests in `test_dvec.py` cover the same shapes as ivec —
+  push/get, growth, set-via-index, str payload, struct-with-str
+  payload, dvec-returned-from-fn, plus the unit-returning-push
+  invariant. The auto-select wrapper that picks ivec vs dvec by
+  `sizeof(T)` (FIX_PLAN.md design 3) is the planned next step.
 - **`ivec<T>` — indirect vector (real Vec, MVP).** Contiguous heap-
   allocated array of pointers to per-element T allocations. O(1)
   random access (two loads — one into the pointer array, one through
@@ -29,12 +47,9 @@ narrative.
   trace fn (`__tuppu_ivec_trace` in `runtime/tuppu_gc.c`) walks
   `(allocation_size - HDR_SIZE) / 8` slots — derived from the
   buffer's GC header so a single shared descriptor handles every
-  cap. Counterpart `dvec<T>` (direct contiguous storage, NOT
-  pointer-stable, better for primitive T) is the planned next step;
-  the eventual auto-select wrapper picks one based on `sizeof(T)`.
-  16 new tests in `test_ivec.py` cover push/get round-trip, growth
-  across cap doublings, pointer-stability under stress (push 502
-  Items, deref pre-grow wedge), str payload, struct payload with
+  cap. 16 new tests in `test_ivec.py` cover push/get round-trip,
+  growth across cap doublings, pointer-stability under stress (push
+  502 Items, deref pre-grow wedge), str payload, struct payload with
   cleanup-bearing fields, set-via-index, and ivec-returned-from-fn
   survival under caller GC pressure.
 - **Smart wedges: GC traces through `wedge T` fields.** Closes a
