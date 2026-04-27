@@ -63,6 +63,8 @@ class ModuleMixin:
                 pass  # already handled in phase 0
             elif isinstance(decl, A.SealDecl):
                 pass  # already handled in phase 0c
+            elif isinstance(decl, A.AliasDecl):
+                pass  # transparent — resolved on-demand in _lower_type
             else:
                 raise CodegenError(
                     f"unsupported top-level: {type(decl).__name__}"

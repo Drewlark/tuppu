@@ -314,6 +314,11 @@ class Checker:
         self.tables: dict[str, TyTable] = {}
         self.structs: dict[str, TyStruct] = {}
         self.struct_fields: dict[str, tuple[tuple[str, Ty], ...]] = {}
+        # Type aliases — `type Bytes = buffer[1024]u8`. Stored as the
+        # raw AST TypeExpr; resolved on demand inside `_resolve_type`
+        # so the alias target can itself reference user structs / seals
+        # / other aliases declared anywhere in the program.
+        self.type_aliases: dict[str, A.TypeExpr] = {}
         # Seals (sum types) — registered alongside structs in phase 0.
         self.seals: dict[str, TySeal] = {}
         self.seal_type_params: dict[str, tuple[str, ...]] = {}
@@ -388,11 +393,16 @@ class Checker:
     def check(self) -> None:
         # Phase 0a: collect struct + seal names so type bodies can refer
         # to each other and to user types regardless of source order.
+        # Aliases register their target AST eagerly; the target gets
+        # resolved lazily on first use so it can name struct / seal /
+        # alias siblings declared later in the file.
         for d in self.prog.decls:
             if isinstance(d, A.StructDecl):
                 self._register_struct_name(d)
             elif isinstance(d, A.SealDecl):
                 self._register_seal_name(d)
+            elif isinstance(d, A.AliasDecl):
+                self._register_alias(d)
         # Phase 0b: resolve fields (structs) and variants (seals) now
         # that all user type names are in scope.
         for d in self.prog.decls:
@@ -423,6 +433,24 @@ class Checker:
 
     # --- registration ------------------------------------------------
 
+    def _register_alias(self, a: A.AliasDecl) -> None:
+        if a.name in PRIM_TYPES:
+            raise CheckError(
+                f"type alias {a.name!r}: name shadows a built-in type",
+                a.line, a.col,
+            )
+        if a.name in self.structs or a.name in self.seals:
+            raise CheckError(
+                f"type alias {a.name!r}: name collides with an existing "
+                f"tablet or seal",
+                a.line, a.col,
+            )
+        if a.name in self.type_aliases:
+            raise CheckError(
+                f"duplicate type alias {a.name!r}", a.line, a.col,
+            )
+        self.type_aliases[a.name] = a.target
+
     def _register_struct_name(self, s: A.StructDecl) -> None:
         if s.name in PRIM_TYPES:
             raise CheckError(
@@ -431,6 +459,12 @@ class Checker:
         if s.name in self.structs:
             raise CheckError(
                 f"duplicate tablet {s.name!r}", s.line, s.col,
+            )
+        if s.name in self.type_aliases:
+            raise CheckError(
+                f"tablet {s.name!r}: name collides with an existing "
+                f"type alias",
+                s.line, s.col,
             )
         self.structs[s.name] = TyStruct(name=s.name)
         self.struct_type_params[s.name] = tuple(s.type_params)
@@ -887,6 +921,12 @@ class Checker:
             # in scope as fresh type variables.
             if t.name in self._active_type_vars:
                 return self._active_type_vars[t.name]
+            if t.name in self.type_aliases:
+                # Aliases are transparent: resolve the target in the
+                # alias's stead. Cycles surface as RecursionError —
+                # cheap detection but the user gets a stack trace
+                # rather than a clean diagnostic. Improve later.
+                return self._resolve_type(self.type_aliases[t.name], where)
             if t.name in self.structs:
                 # Using a generic tablet's name without type args is
                 # only valid if the tablet is non-generic.

@@ -75,11 +75,16 @@ def test_duplicate_function_across_files_errors(tmp_path):
         compile_files_to_binary([a, b, main], tmp_path / "build", name="prog")
 
 
-def test_parse_error_includes_filename(tmp_path):
+def test_parse_error_attributes_filename(tmp_path):
+    # The driver attaches `e.path = <source label>` on lex/parse
+    # errors so the CLI can render source context. The bare error
+    # message keeps the line:col format; the path is on the side.
     from tuppu.parser import ParseError
     bad = write(tmp_path, "broken.tpu", "fn main() -> i32 { 1 + }\n")
-    with pytest.raises(ParseError, match="broken.tpu"):
+    with pytest.raises(ParseError) as exc:
         compile_files_to_binary([bad], tmp_path / "build", name="prog")
+    assert getattr(exc.value, "path", None) is not None
+    assert "broken.tpu" in exc.value.path
 
 
 # --- CLI tests --------------------------------------------------------------
@@ -114,3 +119,32 @@ def test_cli_build_multiple_files(tmp_path):
     r = _cli(["build", str(a), str(b), "-o", str(out)])
     assert r.returncode == 0, r.stderr.decode()
     assert subprocess.run([str(out)]).returncode == 42
+
+
+def test_cli_check_succeeds_on_valid_program(tmp_path):
+    src = write(tmp_path, "ok.tpu", "fn main() -> i32 { 0 }\n")
+    r = _cli(["check", str(src), "--no-stdlib"])
+    assert r.returncode == 0
+    assert b"ok" in r.stderr
+
+
+def test_cli_check_reports_lex_errors_with_source_context(tmp_path):
+    src = write(tmp_path, "bad.tpu", "fn main() -> i32 {\n  step x = $bad\n  0\n}\n")
+    r = _cli(["check", str(src), "--no-stdlib"])
+    assert r.returncode == 2
+    err = r.stderr.decode()
+    # Path:line:col header
+    assert "bad.tpu:2:12" in err
+    # Source line printed verbatim
+    assert "step x = $bad" in err
+    # Caret pointer on its own line
+    assert "^" in err
+
+
+def test_cli_check_reports_parse_errors_with_source_context(tmp_path):
+    src = write(tmp_path, "broken.tpu", "fn main() -> i32 {\n  step x = (\n  0\n}\n")
+    r = _cli(["check", str(src), "--no-stdlib"])
+    assert r.returncode == 2
+    err = r.stderr.decode()
+    assert "broken.tpu:" in err
+    assert "^" in err

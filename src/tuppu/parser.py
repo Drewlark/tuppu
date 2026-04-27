@@ -104,11 +104,13 @@ class Parser:
                 decls.append(self.parse_colophon())
             elif self.check(Tok.GLOSS):
                 decls.append(self.parse_gloss())
+            elif self.check(Tok.TYPE_ALIAS):
+                decls.append(self.parse_type_alias())
             else:
                 t = self.peek()
                 raise ParseError(
                     f"expected 'fn', 'table', 'tablet', 'seal', 'colophon', "
-                    f"or 'gloss' at top level, got {t.kind.name}",
+                    f"'gloss', or 'type' at top level, got {t.kind.name}",
                     t.line, t.col,
                 )
             self.skip_newlines()
@@ -210,6 +212,17 @@ class Parser:
         self.eat(Tok.COLON)
         ty = self.parse_type()
         return _at(start, A.Param(name=name, type=ty, is_mut=is_mut))
+
+    def parse_type_alias(self) -> A.AliasDecl:
+        """`type Name = TypeExpr` — declares a transparent alias.
+        No type-parameter list yet (would need first-class tuples /
+        higher-kinded handling for the common cases users actually
+        want)."""
+        start = self.eat(Tok.TYPE_ALIAS)
+        name = self.eat(Tok.IDENT, "alias name").value
+        self.eat(Tok.EQ)
+        target = self.parse_type()
+        return _at(start, A.AliasDecl(name=name, target=target))
 
     def parse_struct_decl(self) -> A.StructDecl:
         start = self.eat(Tok.STRUCT)

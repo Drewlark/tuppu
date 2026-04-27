@@ -52,6 +52,7 @@ class Tok(Enum):
     COLOPHON = auto()    # reserved; no semantics yet (see NEXT.md)
     GLOSS = auto()       # emitted by `gloss` keyword — operator overload decl
     COPY = auto()        # emitted by `copy` keyword — deep-clone prefix op
+    TYPE_ALIAS = auto()  # emitted by `type` keyword — alias decl
 
     # type keywords (value: str — "i64", "bool", etc.)
     TYPE_KW = auto()
@@ -146,6 +147,10 @@ KEYWORDS: dict[str, Tok] = {
     # rule — when a borrow would cross a mut-reaching call, `copy`
     # makes the cost visible in source.
     "copy": Tok.COPY,
+    # `type Bytes = buffer[1024]u8` declares a type alias. Aliases are
+    # transparent — the alias name is interchangeable with its target
+    # at every use site, no nominal-type wrapping.
+    "type": Tok.TYPE_ALIAS,
     "true": Tok.TRUE,
     "false": Tok.FALSE,
 }

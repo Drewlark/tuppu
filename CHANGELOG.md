@@ -11,6 +11,24 @@ narrative.
 
 ## [Unreleased]
 
+### Added
+
+- **`type Name = TypeExpr` aliases.** Transparent — every use site
+  resolves the alias's target. Works with primitives, tablets, seals,
+  generic struct types (`type Counts = tablets[64]i64`), and chains
+  through other aliases. Cannot collide with existing tablet / seal /
+  primitive names. No type-parameter list yet.
+- **`tuppu check` subcommand.** Parses + typechecks without emitting
+  IR or linking. Fast feedback loop for "did I write valid Tuppu?"
+  Skips most of a build's wall time and surfaces the same errors.
+- **Source context in lex / parse errors.** Errors now show the
+  offending source line + a caret pointer beneath the column, in the
+  gcc/clang-style. `tuppu: foo.tpu:4:12: <message>` followed by the
+  line and a `^`. CompileError gained an optional `path` attribute
+  the driver attaches; `format_error(e, source_text)` does the
+  rendering. Typecheck and codegen errors don't yet carry a path,
+  see LIMITATIONS.md.
+
 ### Removed
 
 - **`_neuter_return_if_borrow` and its call site in `_gen_yield`.**

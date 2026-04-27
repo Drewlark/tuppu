@@ -29,6 +29,10 @@ pip install -e .
 # Build a binary you can keep:
 ./tuppu build examples/fib.tpu -o fib
 ./fib
+
+# Or just typecheck without compiling — fast feedback for
+# "did I write valid Tuppu?":
+./tuppu check examples/hello.tpu
 ```
 
 `./tuppu` is a shell wrapper around `python -m tuppu`. The bundled
@@ -160,7 +164,7 @@ GC-tracked allocation.
 fn       step     mut       if       elif      else
 while    for      in        yield    true      false      as
 table    tablet   tablets   wedge    lost      release
-seal     colophon copy
+seal     colophon copy      type     buffer    match
 ```
 
 | Keyword | Role |
@@ -184,6 +188,9 @@ seal     colophon copy
 | `seal` | Sum type declaration. Variants follow in `{ }`. |
 | `colophon` | Extern (FFI) function declaration. |
 | `copy` | Force a deep clone of a value. Rarely needed under GC; preserved for explicit-clone semantics. |
+| `type` | Type alias declaration: `type Bytes = buffer[1024]u8`. Transparent at every use site. |
+| `buffer` | Type expression for a fixed-size, stack-allocated, bounds-checked buffer (`u8`-only today). |
+| `match` | Pattern-match expression over a `seal` value. Arms `Variant(b1, b2) => expr,` with optional `_` wildcard. |
 
 ## Standard library
 

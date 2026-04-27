@@ -492,7 +492,23 @@ class ColophonDecl:
     col:  int = _pos()
 
 
-Decl = Union[FnDecl, TableDecl, StructDecl, SealDecl, ColophonDecl, GlossDecl]
+@dataclass
+class AliasDecl:
+    """A type alias: `type Bytes = buffer[1024]u8`. The alias name
+    refers to the underlying type expression at every use site;
+    aliases never form a new nominal type (so an `alias` of a tablet
+    unifies with the tablet itself and any other alias of it). Type
+    params are deferred to a future pass — `type Pair<T> = (T, T)`
+    would need first-class tuples we don't have yet."""
+    name: str
+    target: TypeExpr
+    line: int = _pos()
+    col:  int = _pos()
+
+
+Decl = Union[
+    FnDecl, TableDecl, StructDecl, SealDecl, ColophonDecl, GlossDecl, AliasDecl,
+]
 
 @dataclass
 class Program:

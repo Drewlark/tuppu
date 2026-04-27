@@ -65,8 +65,6 @@ Format: each section groups by area. Bullets prefix with severity:
 - **[gap]** Bare array types (`[N]T`) aren't supported as a type
   expression. Use `tablets[N]T` for growable, `buffer[N]u8` for
   stack-lifetime byte-only.
-- **[gap]** No type aliases. `type Bytes = buffer[1024]u8` doesn't
-  exist; users repeat the spelling.
 - **[gap]** No traits / typeclasses. Generic constraints are implicit
   ("monomorphization will fail if `T` doesn't support `==`"), with
   errors deferred to instantiation time. Real bounded generics need
@@ -141,9 +139,12 @@ Format: each section groups by area. Bullets prefix with severity:
   no `gofmt` equivalent.
 - **[gap]** No incremental compilation. Every build re-typechecks
   + re-codegens the whole program (stdlib included).
-- **[polish]** Error messages carry `line:col` but not source
-  context (the offending line, a caret pointer). The spec calls
-  for it; the implementation doesn't.
+- **[gap]** Lex / parse errors render with source context (line +
+  caret pointer), but typecheck and codegen errors don't yet — they
+  fall back to bare `line:col: message` format because the AST doesn't
+  carry the source-file label down to those passes. Wiring the label
+  through (either as a per-decl attribute or via a checker-side label
+  stack) would unify the rendering.
 - **[polish]** No debugger integration. Compiled binaries have
   basic LLVM debug info but no Tuppu-aware lldb / gdb pretty-
   printers.

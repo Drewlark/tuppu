@@ -40,6 +40,12 @@ class TypesMixin:
                 return self._struct_types[t.name]
             if t.name in self._seal_types:
                 return self._seal_types[t.name]
+            # Type aliases resolve transparently: lower the target.
+            if (
+                self._checker is not None
+                and t.name in self._checker.type_aliases
+            ):
+                return self._lower_type(self._checker.type_aliases[t.name])
             raise CodegenError(f"type {t.name!r} not supported in this stage")
         if isinstance(t, A.TypeApply):
             arg_tys = tuple(self._lower_type(a) for a in t.args)
