@@ -1,0 +1,18 @@
+tablet Big { x0: i64, x1: i64, x2: i64, x3: i64, x4: i64, x5: i64, x6: i64, x7: i64, x8: i64, x9: i64, x10: i64, x11: i64, x12: i64, x13: i64, x14: i64, x15: i64, x16: i64, x17: i64, x18: i64, x19: i64, x20: i64, x21: i64, x22: i64, x23: i64, x24: i64, x25: i64, x26: i64, x27: i64, x28: i64, x29: i64, x30: i64, x31: i64, x32: i64, x33: i64, x34: i64, x35: i64, x36: i64, x37: i64, x38: i64, x39: i64, x40: i64, x41: i64, x42: i64, x43: i64, x44: i64, x45: i64, x46: i64, x47: i64, x48: i64, x49: i64, x50: i64, x51: i64, x52: i64, x53: i64, x54: i64, x55: i64, x56: i64, x57: i64, x58: i64, x59: i64, x60: i64, x61: i64, x62: i64, x63: i64, x64: i64, x65: i64, x66: i64, x67: i64, x68: i64, x69: i64, x70: i64, x71: i64, x72: i64, x73: i64, x74: i64, x75: i64, x76: i64, x77: i64, x78: i64, x79: i64, x80: i64, x81: i64, x82: i64, x83: i64, x84: i64, x85: i64, x86: i64, x87: i64, x88: i64, x89: i64, x90: i64, x91: i64, x92: i64, x93: i64, x94: i64, x95: i64, x96: i64, x97: i64, x98: i64, x99: i64, x100: i64, x101: i64, x102: i64, x103: i64, x104: i64, x105: i64, x106: i64, x107: i64, x108: i64, x109: i64, x110: i64, x111: i64, x112: i64, x113: i64, x114: i64, x115: i64, x116: i64, x117: i64, x118: i64, x119: i64, x120: i64, x121: i64, x122: i64, x123: i64, x124: i64, x125: i64, x126: i64, x127: i64 }
+
+fn make_big(seed: i64) -> Big {
+  Big { x0: seed + 0, x1: seed + 1, x2: seed + 2, x3: seed + 3, x4: seed + 4, x5: seed + 5, x6: seed + 6, x7: seed + 7, x8: seed + 8, x9: seed + 9, x10: seed + 10, x11: seed + 11, x12: seed + 12, x13: seed + 13, x14: seed + 14, x15: seed + 15, x16: seed + 16, x17: seed + 17, x18: seed + 18, x19: seed + 19, x20: seed + 20, x21: seed + 21, x22: seed + 22, x23: seed + 23, x24: seed + 24, x25: seed + 25, x26: seed + 26, x27: seed + 27, x28: seed + 28, x29: seed + 29, x30: seed + 30, x31: seed + 31, x32: seed + 32, x33: seed + 33, x34: seed + 34, x35: seed + 35, x36: seed + 36, x37: seed + 37, x38: seed + 38, x39: seed + 39, x40: seed + 40, x41: seed + 41, x42: seed + 42, x43: seed + 43, x44: seed + 44, x45: seed + 45, x46: seed + 46, x47: seed + 47, x48: seed + 48, x49: seed + 49, x50: seed + 50, x51: seed + 51, x52: seed + 52, x53: seed + 53, x54: seed + 54, x55: seed + 55, x56: seed + 56, x57: seed + 57, x58: seed + 58, x59: seed + 59, x60: seed + 60, x61: seed + 61, x62: seed + 62, x63: seed + 63, x64: seed + 64, x65: seed + 65, x66: seed + 66, x67: seed + 67, x68: seed + 68, x69: seed + 69, x70: seed + 70, x71: seed + 71, x72: seed + 72, x73: seed + 73, x74: seed + 74, x75: seed + 75, x76: seed + 76, x77: seed + 77, x78: seed + 78, x79: seed + 79, x80: seed + 80, x81: seed + 81, x82: seed + 82, x83: seed + 83, x84: seed + 84, x85: seed + 85, x86: seed + 86, x87: seed + 87, x88: seed + 88, x89: seed + 89, x90: seed + 90, x91: seed + 91, x92: seed + 92, x93: seed + 93, x94: seed + 94, x95: seed + 95, x96: seed + 96, x97: seed + 97, x98: seed + 98, x99: seed + 99, x100: seed + 100, x101: seed + 101, x102: seed + 102, x103: seed + 103, x104: seed + 104, x105: seed + 105, x106: seed + 106, x107: seed + 107, x108: seed + 108, x109: seed + 109, x110: seed + 110, x111: seed + 111, x112: seed + 112, x113: seed + 113, x114: seed + 114, x115: seed + 115, x116: seed + 116, x117: seed + 117, x118: seed + 118, x119: seed + 119, x120: seed + 120, x121: seed + 121, x122: seed + 122, x123: seed + 123, x124: seed + 124, x125: seed + 125, x126: seed + 126, x127: seed + 127 }
+}
+
+fn main() -> i32 {
+  mut v: dvec<Big>
+  mut i: i64 = 0
+  while i < 200000 {
+    v.push(make_big(i))
+    i = i + 1
+  }
+  println(v.len)
+  println(v[0].x0)
+  println(v[199999].x0)
+  0
+}

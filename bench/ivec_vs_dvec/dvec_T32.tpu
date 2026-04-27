@@ -1,0 +1,18 @@
+tablet Big { x0: i64, x1: i64, x2: i64, x3: i64, x4: i64, x5: i64, x6: i64, x7: i64, x8: i64, x9: i64, x10: i64, x11: i64, x12: i64, x13: i64, x14: i64, x15: i64, x16: i64, x17: i64, x18: i64, x19: i64, x20: i64, x21: i64, x22: i64, x23: i64, x24: i64, x25: i64, x26: i64, x27: i64, x28: i64, x29: i64, x30: i64, x31: i64 }
+
+fn make_big(seed: i64) -> Big {
+  Big { x0: seed + 0, x1: seed + 1, x2: seed + 2, x3: seed + 3, x4: seed + 4, x5: seed + 5, x6: seed + 6, x7: seed + 7, x8: seed + 8, x9: seed + 9, x10: seed + 10, x11: seed + 11, x12: seed + 12, x13: seed + 13, x14: seed + 14, x15: seed + 15, x16: seed + 16, x17: seed + 17, x18: seed + 18, x19: seed + 19, x20: seed + 20, x21: seed + 21, x22: seed + 22, x23: seed + 23, x24: seed + 24, x25: seed + 25, x26: seed + 26, x27: seed + 27, x28: seed + 28, x29: seed + 29, x30: seed + 30, x31: seed + 31 }
+}
+
+fn main() -> i32 {
+  mut v: dvec<Big>
+  mut i: i64 = 0
+  while i < 200000 {
+    v.push(make_big(i))
+    i = i + 1
+  }
+  println(v.len)
+  println(v[0].x0)
+  println(v[199999].x0)
+  0
+}
