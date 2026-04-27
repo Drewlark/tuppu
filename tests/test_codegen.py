@@ -102,8 +102,21 @@ def test_bool_not(tmp_path):
 # --- IR-level sanity checks (fast; no binary build) -------------------------
 
 def test_ir_contains_module_triple():
+    # Triple is taken from the host machine — Tuppu doesn't pin one.
+    # Assert the IR carries SOME `target triple = "..."` line for the
+    # current platform rather than hardcoding arm64-apple-darwin (CI
+    # and Linux dev hosts are x86_64-unknown-linux-gnu).
+    import platform
     ir = compile_to_ir("fn main() -> i32 { 0 }")
-    assert "arm64-apple-darwin" in ir
+    machine = platform.machine().lower()
+    system = platform.system().lower()
+    if system == "darwin" and machine in ("arm64", "aarch64"):
+        assert "arm64-apple-darwin" in ir
+    elif system == "linux":
+        assert "linux" in ir
+        assert machine in ir or machine.replace("aarch64", "arm64") in ir
+    else:
+        assert 'target triple = "' in ir
 
 
 def test_ir_has_trunc_for_i64_to_i32():
