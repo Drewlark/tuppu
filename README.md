@@ -116,6 +116,75 @@ opinionated picks:
 
 The full grammar + semantics live in [`SPEC.md`](./SPEC.md).
 
+## Types
+
+### Primitive scalars
+
+| Type | Notes |
+|---|---|
+| `i8` `i16` `i32` `i64` | Two's-complement signed integers. Signed overflow is UB (LLVM `nsw`). |
+| `u8` `u16` `u32` `u64` | Unsigned integers. Overflow wraps. |
+| `bool` | Single bit. `true` / `false`. |
+| `f32` `f64` | IEEE 754 (declared in the grammar; runtime support is partial). |
+| `rat` | Exact rational `{num: i64, den: i64}`, always reduced. Construct via `rat(n, d)` or as the result of a sexagesimal literal. |
+| `sex` (alias `dish`) | Babylonian-faithful sexagesimal: a fixed-width digit sequence with explicit radix and sign. Auto-promotes to `rat` for arithmetic. |
+| `str` | `{ptr: *u8, len: i64, cap: i64}`. `cap == 0` means a borrow into static / foreign bytes; `cap > 0` means GC-owned. |
+
+### Composite types
+
+| Type | Shape | Notes |
+|---|---|---|
+| `tablet Foo { ... }` | Product type (struct). Declared at module scope. |
+| `tablets[N]T` | Chunk-chained, pointer-stable, append-only arena of `T`. `N` is the chunk size. Backed by GC-allocated chunks linked by tail pointers. |
+| `wedge T` | Non-owning handle into a `tablets[N]T` slot. Returned by `tablets.push`, dereferenced via `.field` (auto-loads through the pointer). Compares equal to `lost` when null. |
+| `buffer[N]u8` | Fixed-size, stack-allocated, bounds-checked byte buffer. v0.1: `u8` only. Cannot appear as a struct field (stack lifetime). |
+| `seal Foo { Variant1, Variant2(T) }` | Sum type. Variants can be nullary or carry payload fields. |
+| `*T` | Raw pointer (FFI-only). Created from `buffer[N]u8` decay; not constructible from owned values. |
+| `fn(T1, T2) -> R` | First-class function value. `step f = some_fn` takes a name-as-value. |
+| `Foo<T>` / `tablets[N]T<U>` | Generics. Parameterized `tablet` or `seal` declarations are monomorphized at use sites. |
+
+### Memory model in one paragraph
+
+Heap allocations live in a mark-sweep GC arena (`runtime/tuppu_gc.c`).
+Each `mut` binding gets an alloca slot that's traced through type
+descriptors emitted by codegen. `tablets[N]T` chunks are themselves
+heap allocations linked through pointers; pushing never moves
+existing elements, which is why `wedge T` handles stay valid for the
+arena's lifetime. There is no `malloc` / `free` in user code — every
+`str + str`, `tablets.push`, and `Variant(payload)` lowers to a
+GC-tracked allocation.
+
+## Keywords
+
+```
+fn       step     mut       if       elif      else
+while    for      in        yield    true      false      as
+table    tablet   tablets   wedge    lost      release
+seal     colophon copy
+```
+
+| Keyword | Role |
+|---|---|
+| `fn` | Function declaration. `fn name<T>(args) -> Ret { body }`. |
+| `step` | Single-assignment binding. Lowers to one SSA value, no alloca. |
+| `mut` | Alloca-backed mutable binding or function parameter. |
+| `if` / `elif` / `else` | Branching. Expression-typed when both arms produce a value. |
+| `while` | Pre-test loop. Body type is unit. |
+| `for x in iter` | Iterate over a `tablets`, `str` (yielding `u8`), or `table`. |
+| `in` | The iter keyword in `for`. |
+| `yield` | Early return from a function body. Optional value. |
+| `true` / `false` | `bool` literals. |
+| `as` | Cast. `(x as i64)`, `(p as *u8)`, etc. |
+| `table` | Compile-time lookup table declaration. Values baked into the binary. |
+| `tablet` | Product type declaration. |
+| `tablets[N]T` | Type expression for an arena of `T`. |
+| `wedge T` | Type expression for a non-owning handle. |
+| `lost` | The null `wedge T` literal. |
+| `release` | Manually release a `tablets` (compatibility shim — the GC handles it now). |
+| `seal` | Sum type declaration. Variants follow in `{ }`. |
+| `colophon` | Extern (FFI) function declaration. |
+| `copy` | Force a deep clone of a value. Rarely needed under GC; preserved for explicit-clone semantics. |
+
 ## Standard library
 
 Bundled `.tpu` files in `stdlib/`, all written in pure Tuppu (no

@@ -194,6 +194,150 @@ fn main() -> i32 {
     assert out == b"ABC\n"
 
 
+def test_rhs_push_into_same_tablets_as_target(tmp_path, stress):
+    # The hairy ordering case I worried about in the GC writeup:
+    # `b.vals[i] = f(b)` where f pushes into b.vals. The lvalue slot
+    # pointer is computed BEFORE the RHS call. f's pushes might
+    # allocate a fresh chunk (chunk size is small here to force it),
+    # but tablets are pointer-stable — the existing chunks never
+    # move, so the pre-computed slot pointer is still valid when the
+    # store finally lands.
+    #
+    # If chunk allocation ever broke pointer stability, this test
+    # surfaces it loudly: the i-th slot would either disappear or
+    # contain garbage instead of the expected RHS value.
+    src = """
+tablet B { vals: tablets[2]i64 }
+
+fn fill_then_compute(mut b: B) -> i64 {
+  step _a = b.vals.push(100)
+  step _b = b.vals.push(200)
+  step _c = b.vals.push(300)
+  step _d = b.vals.push(400)
+  42
+}
+
+fn main() -> i32 {
+  mut b: B
+  step _x = b.vals.push(1)
+  step _y = b.vals.push(2)
+  // chunk size is 2 — slot 0 is in the first chunk; the RHS pushes
+  // four more values, forcing two new chunks to be allocated. The
+  // pre-computed pointer to slot 0 must stay valid.
+  b.vals[0] = fill_then_compute(b)
+  println(b.vals[0])
+  println(b.vals[1])
+  println(b.vals.len)
+  0
+}
+"""
+    rc, out = run(src, tmp_path, stress)
+    assert rc == 0
+    assert out == b"42\n2\n6\n"
+
+
+def test_rhs_push_str_into_same_tablets_as_target(tmp_path, stress):
+    # Same shape but with heap-bearing str payload: the RHS pushes
+    # several heap strings into the target tablets, forcing both
+    # chunk allocation AND GC-traced cleanup-frame entries before
+    # the store. If the slot pointer dangled after a push-allocated
+    # chunk, this either crashes under stress mode or prints garbage.
+    src = """
+tablet Bag { entries: tablets[2]str }
+
+fn flood(mut b: Bag) -> str {
+  step _a = b.entries.push("alpha" + "_a")
+  step _b = b.entries.push("beta"  + "_b")
+  step _c = b.entries.push("gamma" + "_c")
+  step _d = b.entries.push("delta" + "_d")
+  "winner" + "!"
+}
+
+fn main() -> i32 {
+  mut bag: Bag
+  step _x = bag.entries.push("seed_x")
+  step _y = bag.entries.push("seed_y")
+  bag.entries[0] = flood(bag)
+  println(bag.entries[0])
+  println(bag.entries[1])
+  println(bag.entries.len)
+  0
+}
+"""
+    rc, out = run(src, tmp_path, stress)
+    assert rc == 0
+    assert out == b"winner!\nseed_y\n6\n"
+
+
+def test_field_index_overwrite_under_gc_pressure(tmp_path, stress):
+    # Pound the new lvalue path: a Map-shaped struct gets its
+    # heap-bearing values[i] slot overwritten in a long loop while
+    # str_concat allocates fresh heap on every iteration. If the
+    # parent_ptr produced by the recursive _lvalue_slot walk is at
+    # all sketchy under GC pressure, this surfaces it.
+    src = """
+tablet Bag { entries: tablets[32]str }
+
+fn main() -> i32 {
+  mut bag: Bag
+  step _a = bag.entries.push("init" + "_a")
+  step _b = bag.entries.push("init" + "_b")
+  step _c = bag.entries.push("init" + "_c")
+
+  mut i: i64 = 0
+  while i < 100 {
+    bag.entries[0] = "round" + int_to_str(i)
+    bag.entries[1] = "iter"  + int_to_str(i)
+    bag.entries[2] = "step"  + int_to_str(i)
+    i += 1
+  }
+
+  println(bag.entries[0])
+  println(bag.entries[1])
+  println(bag.entries[2])
+  println(bag.entries.len)
+  0
+}
+"""
+    rc, out = run(src, tmp_path, stress)
+    assert rc == 0
+    assert out == b"round99\niter99\nstep99\n3\n"
+
+
+def test_field_index_assign_through_mut_param_under_gc(tmp_path, stress):
+    # Same pattern, but the writes happen through a mut struct param —
+    # which exercises the parent-pointer path most consequentially
+    # (the parent_ptr is the parameter pointer, not a local alloca).
+    src = """
+tablet Bag { entries: tablets[32]str }
+
+fn rotate(mut b: Bag, i: i64) {
+  b.entries[0] = "a" + int_to_str(i)
+  b.entries[1] = "b" + int_to_str(i)
+  b.entries[2] = "c" + int_to_str(i)
+}
+
+fn main() -> i32 {
+  mut bag: Bag
+  step _a = bag.entries.push("seed_a")
+  step _b = bag.entries.push("seed_b")
+  step _c = bag.entries.push("seed_c")
+  mut i: i64 = 0
+  while i < 50 {
+    rotate(bag, i)
+    i += 1
+  }
+  println(bag.entries[0])
+  println(bag.entries[1])
+  println(bag.entries[2])
+  0
+}
+"""
+    rc, out = run(src, tmp_path, stress)
+    assert rc == 0
+    assert out == b"a49\nb49\nc49\n"
+
+
 def test_generic_struct_field_index_assign(tmp_path, stress):
     # The Map<T> shape: a generic struct wrapping `tablets[N]T` whose
     # mut method writes into the field by index. Combines the lvalue
