@@ -548,6 +548,13 @@ class ModuleMixin:
                 # (see `_gen_block`). No second neuter here; cloning
                 # twice would leave the first clone's heap bytes
                 # unrooted across the second clone's allocation.
+                # Transfer ownership of the return value to the caller
+                # by dropping the chokepoint's cleanup entry — without
+                # this the about-to-fire frame cleanup would release
+                # (and tag-zero) the value being returned, leaving the
+                # caller with a moved-from V or a freed str.
+                if self._is_cleanup_bearing_ty(coerced.type):
+                    self._pop_latest_rvalue_root_cleanup()
                 self._emit_frame_cleanups(self._cleanup_frames[-1])
                 self._emit_all_gc_root_pops_for_early_return()
                 self.builder.ret(coerced)

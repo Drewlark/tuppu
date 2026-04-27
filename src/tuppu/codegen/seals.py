@@ -240,9 +240,13 @@ class SealsMixin:
                             arg.name,
                         )
                         if not transferred:
-                            coerced = self._deep_clone_if_cleanup_bearing(coerced)
+                            coerced = self._deep_clone_if_cleanup_bearing(
+                                coerced, for_transfer=True,
+                            )
                     elif self._is_borrow_source_expr(arg):
-                        coerced = self._deep_clone_if_cleanup_bearing(coerced)
+                        coerced = self._deep_clone_if_cleanup_bearing(
+                            coerced, for_transfer=True,
+                        )
                     # else: fresh-owned rvalue is already rooted by the
                     # `_gen_expr` chokepoint; no extra spill here.
                 field_ptr = self.builder.gep(
