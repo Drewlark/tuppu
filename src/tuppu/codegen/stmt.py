@@ -388,7 +388,9 @@ class StmtMixin:
         if total > 0 and self.builder is not None:
             self._emit_gc_pop_roots(total)
 
-    def _deep_clone_if_cleanup_bearing(self, val: ir.Value) -> ir.Value:
+    def _deep_clone_if_cleanup_bearing(
+        self, val: ir.Value, *, for_transfer: bool = False,
+    ) -> ir.Value:
         """Deep-clone `val` if it's a cleanup-bearing type — str, a
         user struct whose fields recursively require cloning, a
         tablets value, or a seal carrying cleanup-bearing payload.
@@ -396,11 +398,22 @@ class StmtMixin:
         happens, the fresh heap bytes are routed through the same
         chokepoint as Call results — spilled to a rooted slot so a
         subsequent allocating op can't reclaim them before the
-        consumer stores or transfers the value."""
+        consumer stores or transfers the value.
+
+        `for_transfer=True` is set by call sites that are about to
+        hand the cloned value off to a long-lived container (a
+        tablets / ivec / dvec push, a seal variant payload, a struct
+        field, an assignment lvalue). The clone is still GC-rooted
+        for the duration of the push (which may allocate and
+        collect), but no cleanup entry is registered in the current
+        frame — the container takes over ownership, so a frame-exit
+        release would double-free what the container holds."""
         assert self.builder is not None
         if self._is_str_value(val.type):
             cloned = self.builder.call(self._get_str_clone(), [val])
-            return self._force_root_cleanup_value(cloned)
+            return self._force_root_cleanup_value(
+                cloned, for_transfer=for_transfer,
+            )
         if (
             self._struct_fields_for(val.type) is not None
             and self._struct_needs_cleanup(val.type)
@@ -408,7 +421,9 @@ class StmtMixin:
             cloned = self.builder.call(
                 self._get_struct_clone(val.type), [val],
             )
-            return self._force_root_cleanup_value(cloned)
+            return self._force_root_cleanup_value(
+                cloned, for_transfer=for_transfer,
+            )
         info = self._tablets_info_for(val.type)
         if info is not None:
             # Tablets clone takes a pointer; spill the SSA to a temp.
@@ -417,7 +432,9 @@ class StmtMixin:
             cloned = self.builder.call(
                 self._get_tablets_clone(info), [src_slot],
             )
-            return self._force_root_cleanup_value(cloned)
+            return self._force_root_cleanup_value(
+                cloned, for_transfer=for_transfer,
+            )
         if (
             self._seal_key_for_ty(val.type) is not None
             and self._seal_needs_cleanup(val.type)
@@ -425,7 +442,9 @@ class StmtMixin:
             cloned = self.builder.call(
                 self._get_seal_clone(val.type), [val],
             )
-            return self._force_root_cleanup_value(cloned)
+            return self._force_root_cleanup_value(
+                cloned, for_transfer=for_transfer,
+            )
         return val
 
     def _emit_all_cleanups_for_early_return(self) -> None:
@@ -1088,7 +1107,9 @@ class StmtMixin:
             return f"{name}__{arg_tag}"
         return "anon_seal"
 
-    def _force_root_cleanup_value(self, val: ir.Value) -> ir.Value:
+    def _force_root_cleanup_value(
+        self, val: ir.Value, *, for_transfer: bool = False,
+    ) -> ir.Value:
         """Chokepoint primitive. Unconditionally spill+root a
         cleanup-bearing rvalue — used at PRODUCTION sites (Call /
         Binary str-concat / Copy) so consumers don't need to re-root.
@@ -1100,7 +1121,26 @@ class StmtMixin:
         emission (clone/release/trace) sets `_in_helper_emission`
         so clone results don't pollute the outer caller's cleanup
         frame — the helper roots its own dst slot at entry to keep
-        sequential field clones alive across reallocs."""
+        sequential field clones alive across reallocs.
+
+        `for_transfer=True` is set when the caller is about to hand
+        this value off to a long-lived container in the same
+        statement (a push, a struct field, a seal payload, an
+        assignment). The slot is still GC-rooted so allocations
+        between here and the transfer point can't reclaim it, but
+        no cleanup entry is registered — the container will own the
+        value once the transfer completes, and a frame-exit release
+        would corrupt what the container now holds.
+
+        Side effect: stores the registered cleanup slot (or None if
+        no cleanup was registered) in `self._last_rvalue_root_slot`.
+        `_gen_fn_body` reads this to transfer the return value's
+        cleanup out of the outer frame by slot identity. Always reset
+        on entry so the field reflects ONLY this call's outcome."""
+        # Reset first — any early-return path below leaves the field
+        # at None, so callers see "no cleanup was registered here"
+        # rather than a stale value from an earlier chokepoint.
+        self._last_rvalue_root_slot = None
         if getattr(self, "_in_helper_emission", False):
             return val
         if not self._cleanup_frames:
@@ -1131,10 +1171,11 @@ class StmtMixin:
                 release = self._get_seal_release(val.type)
             else:
                 release = None
-        if release is not None:
+        if release is not None and not for_transfer:
             self._cleanup_frames[-1].append(
                 (release, slot, ".rvalue.root"),
             )
+            self._last_rvalue_root_slot = slot
         self._register_gc_root(slot, val.type)
         return val
 
@@ -1183,9 +1224,13 @@ class StmtMixin:
                     a.value.name,
                 )
                 if not transferred:
-                    coerced = self._deep_clone_if_cleanup_bearing(coerced)
+                    coerced = self._deep_clone_if_cleanup_bearing(
+                        coerced, for_transfer=True,
+                    )
             elif self._is_borrow_source_expr(a.value):
-                coerced = self._deep_clone_if_cleanup_bearing(coerced)
+                coerced = self._deep_clone_if_cleanup_bearing(
+                    coerced, for_transfer=True,
+                )
         self.builder.store(coerced, slot_ptr)
 
     def _lvalue_slot(self, target: A.Expr) -> tuple[ir.Value, ir.Type]:

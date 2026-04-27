@@ -1,0 +1,42 @@
+// Build-and-read an ivec<BigStruct> M times. ~256 B element.
+tablet BigStruct {
+  a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64,
+  i: i64, j: i64, k: i64, l: i64, m: i64, n: i64, o: i64, p: i64,
+  q: i64, r: i64, s: i64, t: i64, u: i64, v: i64, w: i64, x: i64,
+  y: i64, z: i64, A: i64, B: i64, C: i64, D: i64, E: i64, F: i64
+}
+
+fn fresh(i: i64) -> BigStruct {
+  BigStruct {
+    a: i, b: i, c: i, d: i, e: i, f: i, g: i, h: i,
+    i: i, j: i, k: i, l: i, m: i, n: i, o: i, p: i,
+    q: i, r: i, s: i, t: i, u: i, v: i, w: i, x: i,
+    y: i, z: i, A: i, B: i, C: i, D: i, E: i, F: i
+  }
+}
+
+fn build_ivec(k: i64) -> i64 {
+  mut v: ivec<BigStruct>
+  mut i: i64 = 0
+  while i < k {
+    step _h: wedge BigStruct = v.push(fresh(i))
+    i += 1
+  }
+  mut sum: i64 = 0
+  mut j: i64 = 0
+  while j < v.len { sum += v[j].a + v[j].F  j += 1 }
+  sum
+}
+
+fn main() -> i32 {
+  step M: i64 = 1000
+  step K: i64 = 1000
+  mut total: i64 = 0
+  mut i: i64 = 0
+  while i < M {
+    total += build_ivec(K)
+    i += 1
+  }
+  println("ivec total = ", total)
+  0
+}

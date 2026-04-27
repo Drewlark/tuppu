@@ -119,6 +119,14 @@ class Codegen(
         # Parallel to _cleanup_frames: count of GC roots pushed into
         # the innermost frame, popped at frame exit.
         self._gc_root_counts: list[int] = []
+        # Tracks the slot the most recent `_force_root_cleanup_value`
+        # call registered (or None if it didn't register one — borrow
+        # source, helper-fn emission, no descriptor). Reset on entry to
+        # the chokepoint so the value after a `_gen_expr` call reflects
+        # ONLY that call's outermost chokepoint, never a stale earlier
+        # one. `_gen_fn_body` reads this to transfer the return value's
+        # cleanup out by slot identity rather than by frame-position.
+        self._last_rvalue_root_slot: ir.Value | None = None
         self._struct_types: dict[str, ir.LiteralStructType] = {}
         self._struct_fields: dict[str, list[tuple[str, ir.Type]]] = {}
         # Per-struct set of field indices declared as `wedge T` at the
@@ -365,7 +373,10 @@ class Codegen(
         if self._is_str_value(value_ty):
             return [0]
         if self._is_ivec_value(value_ty):
-            return [0]   # buf ptr; len/cap are scalar i64
+            # buf at 0 (leaf bytes — kept alive but not traced through),
+            # head_node at 24, tail_node at 32. The chunks reached
+            # through head/tail trace their own per-T slot contents.
+            return [0, 24, 32]
         if self._is_dvec_value(value_ty):
             return [0]   # buf ptr; len/cap are scalar i64
         info = self._tablets_info_for(value_ty)

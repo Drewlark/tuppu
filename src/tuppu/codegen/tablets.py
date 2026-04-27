@@ -46,11 +46,15 @@ class TabletsMixin:
                         arg_expr.name, defer_zero=True,
                     )
                     if res is False:
-                        val = self._deep_clone_if_cleanup_bearing(val)
+                        val = self._deep_clone_if_cleanup_bearing(
+                            val, for_transfer=True,
+                        )
                     else:
                         deferred_slot = res  # type: ignore[assignment]
                 elif self._is_borrow_source_expr(arg_expr):
-                    val = self._deep_clone_if_cleanup_bearing(val)
+                    val = self._deep_clone_if_cleanup_bearing(
+                        val, for_transfer=True,
+                    )
                 # else: fresh-owned rvalue, transfer by default.
             pushed = self.builder.call(self._get_tablets_push(info), [ptr, val])
             if deferred_slot is not None:

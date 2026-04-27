@@ -1,0 +1,18 @@
+tablet Big { x0: i64, x1: i64, x2: i64, x3: i64 }
+
+fn make_big(seed: i64) -> Big {
+  Big { x0: seed + 0, x1: seed + 1, x2: seed + 2, x3: seed + 3 }
+}
+
+fn main() -> i32 {
+  mut v: dvec<Big>
+  mut i: i64 = 0
+  while i < 200000 {
+    v.push(make_big(i))
+    i = i + 1
+  }
+  println(v.len)
+  println(v[0].x0)
+  println(v[199999].x0)
+  0
+}

@@ -392,9 +392,13 @@ class DVecMixin:
                         arg_expr.name,
                     )
                     if not res:
-                        v = self._deep_clone_if_cleanup_bearing(v)
+                        v = self._deep_clone_if_cleanup_bearing(
+                            v, for_transfer=True,
+                        )
                 elif self._is_borrow_source_expr(arg_expr):
-                    v = self._deep_clone_if_cleanup_bearing(v)
+                    v = self._deep_clone_if_cleanup_bearing(
+                        v, for_transfer=True,
+                    )
             self.builder.call(self._get_dvec_push(info), [ptr, v])
             return None
         raise CodegenError(f"dvec has no method {method!r}")

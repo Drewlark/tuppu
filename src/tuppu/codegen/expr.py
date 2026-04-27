@@ -79,7 +79,17 @@ class ExprMixin:
         else:
             raise CodegenError(f"expression not supported yet: {type(e).__name__}")
         if val is not None:
-            self._force_root_cleanup_value(val)
+            # Borrow-source reads (Ident, Field, Index, StringLit) alias
+            # into storage someone else owns — the caller, an enclosing
+            # mut binding, a string literal in `.rodata`. Routing them
+            # through the cleanup-frame would re-walk that storage at
+            # scope exit, and for tablets / structs / seals carrying
+            # cleanup-bearing fields the walk is destructive (it
+            # releases each element, zeroing seal tags through chunks
+            # the caller still owns). Spill+root for GC reachability,
+            # but skip the cleanup entry — `for_transfer=True`.
+            for_transfer = self._is_borrow_source_expr(e)
+            self._force_root_cleanup_value(val, for_transfer=for_transfer)
         return val
 
     def _gen_copy(self, e: A.Copy) -> ir.Value | None:
@@ -268,13 +278,19 @@ class ExprMixin:
             # source's cleanup may run here and free the original
             # bytes. Cloning into a caller-owned value sidesteps both
             # the UAF-via-local-cleanup case and the double-free-via-
-            # container-walk case.
+            # container-walk case. `for_transfer=True` keeps the clone
+            # GC-rooted across the about-to-fire frame cleanups, but
+            # skips registering the clone for that very same release
+            # walk — the caller takes ownership on return, so a local
+            # release would zero the value being handed back.
             if (
                 not self._is_terminated()
                 and tail_val is not None
                 and isinstance(b.tail, (A.Field, A.Index))
             ):
-                tail_val = self._deep_clone_if_cleanup_bearing(tail_val)
+                tail_val = self._deep_clone_if_cleanup_bearing(
+                    tail_val, for_transfer=True,
+                )
             # Emit cleanups for this frame on fall-through (not on early
             # return — yield emits its own chain before the ret).
             if not self._is_terminated():
@@ -389,6 +405,25 @@ class ExprMixin:
             if fname == entry_name:
                 frame.pop(i)
                 return
+
+    def _transfer_cleanup_by_slot(self, slot: ir.Value) -> bool:
+        """Drop the cleanup entry whose spill slot is exactly `slot`,
+        searching from the innermost frame outward. Used to transfer
+        ownership of a chokepoint-rooted value (typically a function's
+        return value) without depending on its position in the frame.
+
+        The slot identity comes from `self._last_rvalue_root_slot`,
+        which `_force_root_cleanup_value` sets at registration time —
+        so this is a tight pairing: the caller knows exactly which
+        cleanup it's removing, regardless of what other entries got
+        added before or after. The associated GC root stays pushed;
+        only the release call is suppressed."""
+        for frame in reversed(self._cleanup_frames):
+            for i, (_fn, ptr, _name) in enumerate(frame):
+                if ptr is slot:
+                    frame.pop(i)
+                    return True
+        return False
 
     def _frame_has_entry(self, name: str) -> bool:
         if not self._cleanup_frames:

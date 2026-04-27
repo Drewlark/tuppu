@@ -1,21 +1,31 @@
-"""ivec codegen — `ivec<T>` is a contiguous heap-allocated array of
-pointers to per-element T allocations. Different shape from
-`tablets[N]T`: contiguous instead of chunk-chained, one T per heap
-object instead of N-per-chunk, O(1) random access (two loads — one
-into the pointer array, one through the slot pointer).
+"""ivec codegen — `ivec<T>` is a contiguous slot-pointer array backed
+by a chunk-chain of `Node_<T>_K` arenas. The `buf` array gives O(1)
+random access; chunks (reused from the tablets infrastructure) hold
+the actual T values K-at-a-time, amortizing one heap allocation
+across K pushes.
 
 Layout shared across every T (`IVEC_STRUCT`):
-    { buf: i8**, len: i64, cap: i64 }
+    { buf: i8**, len: i64, cap: i64, head_node: i8*, tail_node: i8* }
 
-Storage allocation goes through `__tuppu_gc_alloc(cap*8,
-&__tuppu_ivec_storage_desc)` — the runtime descriptor's trace fn
-walks `cap` pointer slots regardless of T (each slot is just an i8*).
+Slot storage:
+  * `head_node` / `tail_node` are the chunk chain. Each chunk is a
+    `Node_<T>_K` (same shape tablets uses): K inline T slots plus
+    `used` and `next`. Allocations go through
+    `__tuppu_gc_alloc(sizeof(Node), &chunk_desc)` so the per-T chunk
+    descriptor traces inside every T slot — strs, nested vecs, seals,
+    and wedges all reach correctly.
+  * `buf` is a leaf-byte allocation (`__tuppu_gc_alloc_bytes`); its
+    contents are interior pointers into chunks. The GC keeps `buf`
+    alive (it's a normal `mark_ptr` target) but does NOT trace
+    through it — the chunks are kept alive independently via the
+    `head_node` / `tail_node` chain. That avoids the soundness hazard
+    of mark_ptr on interior pointers (which can't tell an interior
+    pointer from a stale start pointer except by the magic byte) and
+    the cost of walking N slot pointers per collection.
 
-Per-element heap allocation goes through `__tuppu_gc_alloc(sizeof(T),
-T's descriptor or NULL for leaf T)` so the GC traces inside T
-correctly. With smart wedges, taking a `wedge T` to an ivec slot
-remains valid across grows — only the pointer array moves, not the
-T allocations themselves.
+Wedges into `iv[i]` stay valid across both `buf` grows and further
+pushes: `buf` may relocate, but each slot's address is a fixed offset
+inside its chunk and chunks never move once allocated.
 """
 from __future__ import annotations
 
@@ -26,7 +36,8 @@ from ._common import (
     CodegenError, IVecInfo,
     I1, I8, I32, I64,
     IVEC_STRUCT, IVEC_IDX_BUF, IVEC_IDX_LEN, IVEC_IDX_CAP,
-    IVEC_INITIAL_CAP,
+    IVEC_IDX_HEAD, IVEC_IDX_TAIL,
+    IVEC_INITIAL_CAP, IVEC_CHUNK_K,
 )
 
 
@@ -68,26 +79,14 @@ class IVecMixin:
 
     # --- storage allocator + grow --------------------------------------
 
-    def _get_ivec_storage_desc(self) -> ir.GlobalVariable:
-        """Reference the runtime's static `__tuppu_ivec_storage_desc`
-        as an extern global. The runtime trace fn walks
-        `(allocation_size - HDR_SIZE) / sizeof(void*)` slots, so we
-        don't need a per-cap descriptor at codegen time."""
-        existing = self.module.globals.get("__tuppu_ivec_storage_desc")
-        if existing is not None:
-            return existing
-        desc = ir.GlobalVariable(
-            self.module, self._type_desc_ty, "__tuppu_ivec_storage_desc",
-        )
-        # External — defined in runtime/tuppu_gc.c. No initializer here.
-        return desc
-
     def _emit_ivec_grow(
         self, b: ir.IRBuilder, iv_ptr: ir.Value, new_cap: ir.Value,
     ) -> None:
-        """Allocate a new buffer of `new_cap * 8` bytes, copy old
-        contents (if any), update the ivec's buf and cap. Old buffer
-        becomes orphan and gets swept on the next collection."""
+        """Allocate a new buf of `new_cap * 8` bytes as leaf bytes
+        (the chunk chain keeps slot targets alive; buf contents need
+        no tracing), copy old slot pointers if any, update the ivec's
+        buf and cap. The old buf becomes orphan and gets swept on the
+        next collection."""
         ZERO_I32 = ir.Constant(I32, 0)
         BUF_I32  = ir.Constant(I32, IVEC_IDX_BUF)
         CAP_I32  = ir.Constant(I32, IVEC_IDX_CAP)
@@ -98,11 +97,7 @@ class IVecMixin:
         old_cap = b.load(cap_addr)
 
         new_size_bytes = b.mul(new_cap, ir.Constant(I64, 8))
-        desc = self._get_ivec_storage_desc()
-        raw = b.call(
-            self._get_gc_alloc_typed(),
-            [new_size_bytes, b.bitcast(desc, I8.as_pointer())],
-        )
+        raw = b.call(self._get_gc_alloc_bytes(), [new_size_bytes])
         new_buf = b.bitcast(raw, I8.as_pointer().as_pointer())
 
         # If there's existing data, memcpy it into the new buffer.
@@ -166,16 +161,28 @@ class IVecMixin:
 
     def _build_ivec_push(self, info: IVecInfo) -> ir.Function:
         """Push a T into an ivec. Steps:
-          1. If len == cap, grow the buffer (initial cap = 8, double
-             from there).
-          2. Allocate a fresh T on the heap with T's descriptor (so
-             the GC traces inside T correctly).
-          3. Store `val` into the heap slot.
-          4. Save the slot pointer at `buf[len]`.
-          5. len++.
-        Returns a `T*` pointing at the heap slot — usable as a
-        `wedge T` since smart wedges trace through it."""
+          1. If `len == cap`, grow the slot-pointer buf (leaf bytes).
+          2. If the tail chunk is null or full (`used == K`),
+             allocate a fresh chunk via the per-T chunk descriptor
+             and link it into the chain.
+          3. Compute the slot address inside the tail chunk, store
+             `val` into it, and bump the chunk's `used`.
+          4. Save the slot pointer at `buf[len]` and bump `iv.len`.
+          5. Return the slot pointer — usable as a `wedge T`. The
+             chunk that owns the slot is reachable from the ivec's
+             head/tail pointers, so the wedge stays valid for as
+             long as either the ivec or the wedge itself is rooted.
+        """
         elem_ty = info.elem_ty
+        K = IVEC_CHUNK_K
+        # Reuse tablets infrastructure for chunks: same Node_T layout
+        # ([K x T] items, used: i64, next: *Node), same per-T chunk
+        # descriptor with all the seal/wedge dispatch already wired.
+        tinfo = self._get_tablets(K, elem_ty, elem_is_wedge=info.elem_is_wedge)
+        node_ty = tinfo.node_ty
+        node_ptr_ty = node_ty.as_pointer()
+        null_node = ir.Constant(node_ptr_ty, None)
+
         fn = ir.Function(
             self.module,
             ir.FunctionType(
@@ -192,19 +199,29 @@ class IVecMixin:
         BUF_I32  = ir.Constant(I32, IVEC_IDX_BUF)
         LEN_I32  = ir.Constant(I32, IVEC_IDX_LEN)
         CAP_I32  = ir.Constant(I32, IVEC_IDX_CAP)
+        HEAD_I32 = ir.Constant(I32, IVEC_IDX_HEAD)
+        TAIL_I32 = ir.Constant(I32, IVEC_IDX_TAIL)
 
-        entry     = fn.append_basic_block("entry")
-        need_grow = fn.append_basic_block("grow")
+        entry      = fn.append_basic_block("entry")
+        need_grow  = fn.append_basic_block("grow.buf")
         after_grow = fn.append_basic_block("after.grow")
-        do_insert = fn.append_basic_block("insert")
+        check_full = fn.append_basic_block("check.full")
+        need_chunk = fn.append_basic_block("need.chunk")
+        link_head  = fn.append_basic_block("link.head")
+        link_tail  = fn.append_basic_block("link.tail")
+        do_insert  = fn.append_basic_block("insert")
 
         b = ir.IRBuilder(entry)
-        len_addr = b.gep(iv_ptr, [ZERO_I32, LEN_I32], inbounds=True)
-        cap_addr = b.gep(iv_ptr, [ZERO_I32, CAP_I32], inbounds=True)
+        len_addr  = b.gep(iv_ptr, [ZERO_I32, LEN_I32],  inbounds=True)
+        cap_addr  = b.gep(iv_ptr, [ZERO_I32, CAP_I32],  inbounds=True)
+        head_addr = b.gep(iv_ptr, [ZERO_I32, HEAD_I32], inbounds=True)
+        tail_addr = b.gep(iv_ptr, [ZERO_I32, TAIL_I32], inbounds=True)
+
+        # 1. Grow buf (slot-pointer cache) if full.
         cur_len = b.load(len_addr)
         cur_cap = b.load(cap_addr)
-        is_full = b.icmp_signed("==", cur_len, cur_cap)
-        b.cbranch(is_full, need_grow, do_insert)
+        is_full_buf = b.icmp_signed("==", cur_len, cur_cap)
+        b.cbranch(is_full_buf, need_grow, check_full)
 
         b.position_at_end(need_grow)
         cap_is_zero = b.icmp_signed("==", cur_cap, ir.Constant(I64, 0))
@@ -215,28 +232,91 @@ class IVecMixin:
         b.branch(after_grow)
 
         b.position_at_end(after_grow)
+        b.branch(check_full)
+
+        # 2. Need new chunk if tail is null or its `used == K`.
+        b.position_at_end(check_full)
+        tail_i8 = b.load(tail_addr)
+        tail = b.bitcast(tail_i8, node_ptr_ty)
+        tail_is_null = b.icmp_signed("==", tail, null_node)
+        # Two-step dispatch — branch on null first to avoid
+        # dereferencing a null tail's `used` field.
+        check_used = fn.append_basic_block("check.used")
+        b.cbranch(tail_is_null, need_chunk, check_used)
+
+        b.position_at_end(check_used)
+        used_addr_existing = b.gep(
+            tail, [ZERO_I32, ir.Constant(I32, 1)], inbounds=True,
+        )
+        used_existing = b.load(used_addr_existing)
+        is_chunk_full = b.icmp_signed("==", used_existing, ir.Constant(I64, K))
+        b.cbranch(is_chunk_full, need_chunk, do_insert)
+
+        # need.chunk: alloc a fresh Node_T via the per-T chunk
+        # descriptor, init `used = 0` and `next = null`, then link
+        # into the chain. gc_alloc_typed may collect; the new chunk
+        # is rooted as soon as it's stored into head_node / tail_node
+        # (both are listed in IVEC_STRUCT's ptr_offsets).
+        b.position_at_end(need_chunk)
+        size_ptr = b.gep(null_node, [ir.Constant(I32, 1)], inbounds=False)
+        node_size = b.ptrtoint(size_ptr, I64)
+        chunk_desc = self._get_chunk_type_desc(
+            K, elem_ty, node_ty, elem_is_wedge=info.elem_is_wedge,
+        )
+        raw_chunk = b.call(
+            self._get_gc_alloc_typed(),
+            [node_size, b.bitcast(chunk_desc, I8.as_pointer())],
+        )
+        new_chunk = b.bitcast(raw_chunk, node_ptr_ty)
+        b.store(
+            ir.Constant(I64, 0),
+            b.gep(new_chunk, [ZERO_I32, ir.Constant(I32, 1)], inbounds=True),
+        )
+        b.store(
+            null_node,
+            b.gep(new_chunk, [ZERO_I32, ir.Constant(I32, 2)], inbounds=True),
+        )
+        # Link: empty chain → set head; non-empty → splice onto old
+        # tail's next. Both branches end at do_insert with the new
+        # chunk as the live tail.
+        was_empty = b.icmp_signed("==", tail, null_node)
+        b.cbranch(was_empty, link_head, link_tail)
+
+        b.position_at_end(link_head)
+        new_chunk_i8 = b.bitcast(new_chunk, I8.as_pointer())
+        b.store(new_chunk_i8, head_addr)
+        b.store(new_chunk_i8, tail_addr)
         b.branch(do_insert)
 
-        # Insert path. Allocate the per-element heap slot, store val
-        # into it, and write the slot pointer at buf[len].
-        b.position_at_end(do_insert)
-        elem_size = ir.Constant(I64, self._size_of(elem_ty))
-        elem_desc = self._get_type_desc(elem_ty)
-        if elem_desc is None:
-            desc_arg = ir.Constant(I8.as_pointer(), None)
-        else:
-            desc_arg = b.bitcast(elem_desc, I8.as_pointer())
-        raw_slot = b.call(
-            self._get_gc_alloc_typed(),
-            [elem_size, desc_arg],
+        b.position_at_end(link_tail)
+        old_tail_next_addr = b.gep(
+            tail, [ZERO_I32, ir.Constant(I32, 2)], inbounds=True,
         )
-        slot_typed = b.bitcast(raw_slot, elem_ty.as_pointer())
-        b.store(val, slot_typed)
+        b.store(new_chunk, old_tail_next_addr)
+        new_chunk_i8b = b.bitcast(new_chunk, I8.as_pointer())
+        b.store(new_chunk_i8b, tail_addr)
+        b.branch(do_insert)
 
+        # 3. Insert into the live tail chunk: write val at
+        #    items[used], bump used, then mirror the slot pointer
+        #    into buf[len] and bump len.
+        b.position_at_end(do_insert)
+        cur_tail = b.bitcast(b.load(tail_addr), node_ptr_ty)
+        used_addr = b.gep(
+            cur_tail, [ZERO_I32, ir.Constant(I32, 1)], inbounds=True,
+        )
+        cur_used = b.load(used_addr)
+        slot_typed = b.gep(
+            cur_tail,
+            [ZERO_I32, ZERO_I32, cur_used],
+            inbounds=True,
+        )
+        b.store(val, slot_typed)
+        b.store(b.add(cur_used, ir.Constant(I64, 1)), used_addr)
+
+        # 4. Cache slot pointer in buf[len] for O(1) random access.
         cur_len2 = b.load(len_addr)
         cur_buf = b.load(b.gep(iv_ptr, [ZERO_I32, BUF_I32], inbounds=True))
-        # buf is i8** — index gives an i8*-slot; bitcast to T**-slot
-        # so we can store our typed slot pointer.
         slot_in_buf_i8 = b.gep(cur_buf, [cur_len2], inbounds=True)
         slot_in_buf_typed = b.bitcast(
             slot_in_buf_i8, elem_ty.as_pointer().as_pointer(),
@@ -339,9 +419,13 @@ class IVecMixin:
                         arg_expr.name,
                     )
                     if not res:
-                        v = self._deep_clone_if_cleanup_bearing(v)
+                        v = self._deep_clone_if_cleanup_bearing(
+                            v, for_transfer=True,
+                        )
                 elif self._is_borrow_source_expr(arg_expr):
-                    v = self._deep_clone_if_cleanup_bearing(v)
+                    v = self._deep_clone_if_cleanup_bearing(
+                        v, for_transfer=True,
+                    )
             return self.builder.call(self._get_ivec_push(info), [ptr, v])
         raise CodegenError(f"ivec has no method {method!r}")
 

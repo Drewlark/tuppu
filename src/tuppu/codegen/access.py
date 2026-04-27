@@ -262,9 +262,13 @@ class AccessMixin:
                         fexpr.name,
                     )
                     if not transferred:
-                        fv = self._deep_clone_if_cleanup_bearing(fv)
+                        fv = self._deep_clone_if_cleanup_bearing(
+                            fv, for_transfer=True,
+                        )
                 elif self._is_borrow_source_expr(fexpr):
-                    fv = self._deep_clone_if_cleanup_bearing(fv)
+                    fv = self._deep_clone_if_cleanup_bearing(
+                        fv, for_transfer=True,
+                    )
                 # else: fresh rvalue already rooted by the `_gen_expr`
                 # chokepoint when `fexpr` was evaluated.
             value = self.builder.insert_value(value, self._coerce(fv, fty), i)

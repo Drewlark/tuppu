@@ -797,3 +797,197 @@ fn main() -> i32 {
     rc, stdout = run(src, tmp_path, stress)
     assert rc == 0
     assert stdout == b"99\n"
+
+
+# --- return-value cleanup-frame transfer ---------------------------------
+#
+# Probes for the chokepoint / fn-body-exit ownership transfer: a fn
+# returning a cleanup-bearing value must hand the heap bytes to the
+# caller without the about-to-fire frame cleanup zeroing or freeing
+# them. Each shape below historically broke the original heuristic
+# transfer or was at risk of breaking a future variant of it.
+
+
+def test_yield_with_cleanup_bearing_return(tmp_path, stress):
+    # Multiple yield paths plus a fall-through tail, all returning a
+    # str rvalue. Yields run their own cleanup chain before the ret;
+    # fall-through goes through the slot-identity transfer. Both must
+    # hand the str across unmolested.
+    src = """
+fn pick(n: i64) -> str {
+  if n < 0 { yield "negative" + "" }
+  if n == 0 { yield "zero" + "" }
+  "positive" + ""
+}
+
+fn main() -> i32 {
+  println(pick(-5))
+  println(pick(0))
+  println(pick(42))
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 { acc = acc + "."  i = i + 1 }
+  println(pick(-1))
+  println(pick(0))
+  println(pick(1))
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == (
+        b"negative\nzero\npositive\n"
+        b"negative\nzero\npositive\n"
+    )
+
+
+def test_step_bound_if_then_return_step(tmp_path, stress):
+    # `step a = if cond { make() } else { other() }; a`. Each branch
+    # registers its own .rvalue.root in the inner if-block frame; the
+    # `step` consumes via _maybe_register_cleanup with the binding
+    # name, not .rvalue.root; the tail Ident triggers
+    # _transfer_ownership_out so `a` exits clean. The slot-identity
+    # transfer at fn exit must target the body's outer chokepoint
+    # spill, ignoring all of the above.
+    src = """
+fn make_a() -> str { "alpha" + "_made" }
+fn make_b() -> str { "beta"  + "_made" }
+
+fn pick_str(flag: bool) -> str {
+  step a: str = if flag { make_a() } else { make_b() }
+  a
+}
+
+fn main() -> i32 {
+  println(pick_str(true))
+  println(pick_str(false))
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 { acc = acc + "."  i = i + 1 }
+  println(pick_str(true))
+  println(pick_str(false))
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == (
+        b"alpha_made\nbeta_made\n"
+        b"alpha_made\nbeta_made\n"
+    )
+
+
+def test_nested_if_as_fn_body_tail(tmp_path, stress):
+    # Body tail is a nested if-expression directly producing a str
+    # rvalue from each branch. The outer chokepoint that produces the
+    # transferable slot must be the if-expression's, not any branch's.
+    src = """
+fn pick(n: i64) -> str {
+  if n < 0 {
+    "neg" + ""
+  } else if n == 0 {
+    "zero" + ""
+  } else {
+    "pos" + ""
+  }
+}
+
+fn main() -> i32 {
+  println(pick(-1))
+  println(pick(0))
+  println(pick(1))
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 { acc = acc + "."  i = i + 1 }
+  println(pick(-2))
+  println(pick(0))
+  println(pick(99))
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"neg\nzero\npos\nneg\nzero\npos\n"
+
+
+def test_intermediate_cleanup_then_unrelated_return(tmp_path, stress):
+    # `step held = ...; finisher()`. The block's frame contains both
+    # `held`'s cleanup AND finisher()'s .rvalue.root chokepoint
+    # spill. Both fire when the inner block frame pops — but the SSA
+    # value flowing out is independent of the spill slot's bytes.
+    # Then the OUTER chokepoint registers .rvalue.root for the
+    # returned str in the fn body frame; the slot-identity transfer
+    # picks that one, not held's (different name) and not the inner
+    # finisher's (already released and frame popped).
+    src = """
+fn make_left() -> str  { "L_" + "side" }
+fn make_right() -> str { "R_" + "side" }
+fn finisher() -> str   { "fin" + "ish" }
+
+fn flow(b: bool) -> str {
+  step held: str = if b { make_left() } else { make_right() }
+  finisher()
+}
+
+fn main() -> i32 {
+  println(flow(true))
+  println(flow(false))
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 { acc = acc + "x"  i = i + 1 }
+  println(flow(true))
+  println(flow(false))
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"finish\nfinish\nfinish\nfinish\n"
+
+
+def test_fresh_seal_with_str_payload_returned_from_fn(tmp_path, stress):
+    # Fresh-owned seal as fn return value. seal_release zeroes the
+    # tag of whatever slot it's called on, so if the return-value
+    # cleanup ever fires before ret, the caller observes VNull
+    # instead of the actual variant. Stress mode forces a collection
+    # on every alloc — exercises the GC-rooting half of the chokepoint
+    # in tandem with the cleanup-transfer half.
+    src = """
+seal V {
+  VNull,
+  VInt(i64),
+  VStr(str),
+}
+
+fn make_v_str(s: str) -> V { VStr(s + "_tail") }
+fn make_v_int(n: i64) -> V { VInt(n) }
+
+fn pick(b: bool) -> V {
+  if b { make_v_str("alpha") } else { make_v_int(7) }
+}
+
+fn show(v: V) {
+  match v {
+    VNull   => println("null"),
+    VInt(n) => println("int ", n),
+    VStr(s) => println("str ", s),
+  }
+}
+
+fn main() -> i32 {
+  show(pick(true))
+  show(pick(false))
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 { acc = acc + "."  i = i + 1 }
+  show(pick(true))
+  show(pick(false))
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == (
+        b"str alpha_tail\nint 7\n"
+        b"str alpha_tail\nint 7\n"
+    )
