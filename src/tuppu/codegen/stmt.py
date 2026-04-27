@@ -1130,7 +1130,17 @@ class StmtMixin:
         between here and the transfer point can't reclaim it, but
         no cleanup entry is registered — the container will own the
         value once the transfer completes, and a frame-exit release
-        would corrupt what the container now holds."""
+        would corrupt what the container now holds.
+
+        Side effect: stores the registered cleanup slot (or None if
+        no cleanup was registered) in `self._last_rvalue_root_slot`.
+        `_gen_fn_body` reads this to transfer the return value's
+        cleanup out of the outer frame by slot identity. Always reset
+        on entry so the field reflects ONLY this call's outcome."""
+        # Reset first — any early-return path below leaves the field
+        # at None, so callers see "no cleanup was registered here"
+        # rather than a stale value from an earlier chokepoint.
+        self._last_rvalue_root_slot = None
         if getattr(self, "_in_helper_emission", False):
             return val
         if not self._cleanup_frames:
@@ -1165,6 +1175,7 @@ class StmtMixin:
             self._cleanup_frames[-1].append(
                 (release, slot, ".rvalue.root"),
             )
+            self._last_rvalue_root_slot = slot
         self._register_gc_root(slot, val.type)
         return val
 

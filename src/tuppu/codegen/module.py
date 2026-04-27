@@ -525,6 +525,13 @@ class ModuleMixin:
                         is_mut=False, ir_ref=arg, value_ty=arg.type,
                     )
 
+            # Clear any chokepoint slot left over from a prior fn's
+            # codegen. _force_root_cleanup_value resets on every call,
+            # so the field is fresh once the body's outermost
+            # chokepoint fires — but if the body diverges before any
+            # chokepoint runs, we want a None read here, not a stale
+            # slot from a sibling function.
+            self._last_rvalue_root_slot = None
             value = self._gen_expr(fn.body)
 
             if self._is_terminated():
@@ -552,18 +559,15 @@ class ModuleMixin:
                 # by dropping the chokepoint's cleanup entry — without
                 # this the about-to-fire frame cleanup would release
                 # (and tag-zero) the value being returned, leaving the
-                # caller with a moved-from V or a freed str.
-                # NOTE: the pop-latest call below is a heuristic that
-                # depends on an unwritten invariant about this frame's
-                # contents. If you add ANY codegen step here (or above,
-                # between `_gen_expr(fn.body)` and this point) that
-                # registers a `.rvalue.root` cleanup, or change fn body
-                # codegen so sub-expression chokepoints can land in the
-                # outer frame, read the docstring on
-                # `_pop_latest_rvalue_root_cleanup` first — it
-                # enumerates the failure modes and the principled fix.
-                if self._is_cleanup_bearing_ty(coerced.type):
-                    self._pop_latest_rvalue_root_cleanup()
+                # caller with a moved-from V or a freed str. The slot
+                # identity comes from the chokepoint's side channel
+                # (`_last_rvalue_root_slot`), so additional codegen
+                # steps that register cleanups in this frame don't
+                # interfere — we transfer the specific entry the body
+                # chokepoint produced, by pointer identity.
+                return_slot = self._last_rvalue_root_slot
+                if return_slot is not None:
+                    self._transfer_cleanup_by_slot(return_slot)
                 self._emit_frame_cleanups(self._cleanup_frames[-1])
                 self._emit_all_gc_root_pops_for_early_return()
                 self.builder.ret(coerced)
