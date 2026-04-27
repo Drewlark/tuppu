@@ -40,9 +40,9 @@ tablet Holder { values: tablets[16]i64 }
 
 fn main() -> i32 {
   mut h: Holder
-  step _a = h.values.push(10)
-  step _b = h.values.push(20)
-  step _c = h.values.push(30)
+  h.values.push(10)
+  h.values.push(20)
+  h.values.push(30)
   h.values[1] = 99
   println(h.values[0])
   println(h.values[1])
@@ -63,9 +63,9 @@ tablet Inbox { msgs: tablets[16]str }
 
 fn main() -> i32 {
   mut x: Inbox
-  step _a = x.msgs.push("first" + "_msg")
-  step _b = x.msgs.push("second" + "_msg")
-  step _c = x.msgs.push("third" + "_msg")
+  x.msgs.push("first" + "_msg")
+  x.msgs.push("second" + "_msg")
+  x.msgs.push("third" + "_msg")
   x.msgs[1] = "replaced" + "!"
   println(x.msgs[0])
   println(x.msgs[1])
@@ -88,7 +88,7 @@ tablet Row { label: str, count: i64 }
 
 fn main() -> i32 {
   mut t: tablets[8]Row
-  step _r = t.push(Row { label: "alpha", count: 1 })
+  t.push(Row { label: "alpha", count: 1 })
   t[0].count = 42
   t[0].label = "beta"
   println(t[0].label)
@@ -111,9 +111,9 @@ tablet Outer { inner: Inner, name: str }
 
 fn main() -> i32 {
   mut o: Outer = Outer { inner: Inner { values: tablets[16]i64 { } }, name: "root" }
-  step _a = o.inner.values.push(1)
-  step _b = o.inner.values.push(2)
-  step _c = o.inner.values.push(3)
+  o.inner.values.push(1)
+  o.inner.values.push(2)
+  o.inner.values.push(3)
   o.inner.values[1] = 88
   println(o.name)
   println(o.inner.values[0])
@@ -136,8 +136,8 @@ tablet Bag { entries: tablets[16]Entry }
 
 fn main() -> i32 {
   mut b: Bag
-  step _a = b.entries.push(Entry { name: "alice", count: 0 })
-  step _b = b.entries.push(Entry { name: "bob", count: 0 })
+  b.entries.push(Entry { name: "alice", count: 0 })
+  b.entries.push(Entry { name: "bob", count: 0 })
   b.entries[0].count = 5
   b.entries[1].count = 9
   println(b.entries[0].name)
@@ -160,8 +160,8 @@ tablet H { vs: tablets[8]i64 }
 
 fn main() -> i32 {
   mut h: H
-  step _a = h.vs.push(10)
-  step _b = h.vs.push(20)
+  h.vs.push(10)
+  h.vs.push(20)
   h.vs[0] += 5
   h.vs[1] -= 3
   println(h.vs[0])
@@ -210,17 +210,17 @@ def test_rhs_push_into_same_tablets_as_target(tmp_path, stress):
 tablet B { vals: tablets[2]i64 }
 
 fn fill_then_compute(mut b: B) -> i64 {
-  step _a = b.vals.push(100)
-  step _b = b.vals.push(200)
-  step _c = b.vals.push(300)
-  step _d = b.vals.push(400)
+  b.vals.push(100)
+  b.vals.push(200)
+  b.vals.push(300)
+  b.vals.push(400)
   42
 }
 
 fn main() -> i32 {
   mut b: B
-  step _x = b.vals.push(1)
-  step _y = b.vals.push(2)
+  b.vals.push(1)
+  b.vals.push(2)
   // chunk size is 2 — slot 0 is in the first chunk; the RHS pushes
   // four more values, forcing two new chunks to be allocated. The
   // pre-computed pointer to slot 0 must stay valid.
@@ -246,17 +246,17 @@ def test_rhs_push_str_into_same_tablets_as_target(tmp_path, stress):
 tablet Bag { entries: tablets[2]str }
 
 fn flood(mut b: Bag) -> str {
-  step _a = b.entries.push("alpha" + "_a")
-  step _b = b.entries.push("beta"  + "_b")
-  step _c = b.entries.push("gamma" + "_c")
-  step _d = b.entries.push("delta" + "_d")
+  b.entries.push("alpha" + "_a")
+  b.entries.push("beta"  + "_b")
+  b.entries.push("gamma" + "_c")
+  b.entries.push("delta" + "_d")
   "winner" + "!"
 }
 
 fn main() -> i32 {
   mut bag: Bag
-  step _x = bag.entries.push("seed_x")
-  step _y = bag.entries.push("seed_y")
+  bag.entries.push("seed_x")
+  bag.entries.push("seed_y")
   bag.entries[0] = flood(bag)
   println(bag.entries[0])
   println(bag.entries[1])
@@ -280,10 +280,9 @@ tablet Bag { entries: tablets[32]str }
 
 fn main() -> i32 {
   mut bag: Bag
-  step _a = bag.entries.push("init" + "_a")
-  step _b = bag.entries.push("init" + "_b")
-  step _c = bag.entries.push("init" + "_c")
-
+  bag.entries.push("init" + "_a")
+  bag.entries.push("init" + "_b")
+  bag.entries.push("init" + "_c")
   mut i: i64 = 0
   while i < 100 {
     bag.entries[0] = "round" + int_to_str(i)
@@ -319,9 +318,9 @@ fn rotate(mut b: Bag, i: i64) {
 
 fn main() -> i32 {
   mut bag: Bag
-  step _a = bag.entries.push("seed_a")
-  step _b = bag.entries.push("seed_b")
-  step _c = bag.entries.push("seed_c")
+  bag.entries.push("seed_a")
+  bag.entries.push("seed_b")
+  bag.entries.push("seed_c")
   mut i: i64 = 0
   while i < 50 {
     rotate(bag, i)
@@ -351,9 +350,9 @@ fn cache_set<T>(mut c: Cache<T>, i: i64, v: T) {
 
 fn main() -> i32 {
   mut c: Cache<i64>
-  step _a = c.items.push(0)
-  step _b = c.items.push(0)
-  step _c = c.items.push(0)
+  c.items.push(0)
+  c.items.push(0)
+  c.items.push(0)
   cache_set(c, 0, 11)
   cache_set(c, 1, 22)
   cache_set(c, 2, 33)

@@ -11,6 +11,29 @@ narrative.
 
 ## [Unreleased]
 
+### Removed
+
+- **`_neuter_return_if_borrow` and its call site in `_gen_yield`.**
+  This was a UAF guard pre-GC that deep-cloned the return value of
+  every fn whose body tail (or `yield`) was a `Field` or `Index`
+  expression. Under the GC, the returned value's type descriptor
+  (e.g. str.ptr → byte buffer) keeps the underlying allocation
+  reachable from the caller's binding, so the clone was wasted
+  allocation. Four new GC torture tests pin the behavior under
+  `TUPPU_GC_STRESS=1`: returning a Field of a local struct, an
+  Index of a local tablets, a Field through a match arm, and a
+  nested Field-of-Field — each followed by ~100 allocations in
+  the caller before the value is read.
+
+### Changed
+
+- **`step _ = expr` is no longer the idiom for discarding a return.**
+  Bare expression-statements have always worked (`local.push(x)` is
+  a valid statement); the `step _ = ...` wrapper added nothing the
+  bare form didn't, but had been cargo-culted across stdlib, examples,
+  and tests. Swept ~57 occurrences. README + CONTRIBUTING note the
+  preferred form.
+
 ## [0.4.0] — 2026-04-26
 
 This is the first release after the version reset. Earlier history

@@ -54,7 +54,7 @@ tablet Tree { label: str, left: wedge Tree, right: wedge Tree }
 fn inorder(t: wedge Tree, mut out: tablets[64]str) {
   if t == lost { yield }
   inorder(t.left, out)
-  step _push = out.push(copy t.label)
+  out.push(copy t.label)
   inorder(t.right, out)
 }
 
@@ -123,13 +123,13 @@ fn main() -> i32 {
   mut groups: tablets[4]tablets[4]tablets[4]str
   mut g1: tablets[4]tablets[4]str
   mut row1: tablets[4]str
-  step _a = row1.push("alpha")
-  step _b = row1.push("beta")
-  step _r1 = g1.push(row1)
+  row1.push("alpha")
+  row1.push("beta")
+  g1.push(row1)
   mut row2: tablets[4]str
-  step _c = row2.push("gamma")
-  step _r2 = g1.push(row2)
-  step _g = groups.push(g1)
+  row2.push("gamma")
+  g1.push(row2)
+  groups.push(g1)
   println(groups[0][0][0])
   println(groups[0][0][1])
   println(groups[0][1][0])
@@ -152,11 +152,10 @@ tablet Inbox { name: str, msgs: tablets[8]Msg }
 fn main() -> i32 {
   mut inboxes: tablets[4]Inbox
   mut box1: Inbox = Inbox { name: "alice", msgs: tablets[8]Msg { } }
-  step _m1 = box1.msgs.push(Text("hi"))
-  step _m2 = box1.msgs.push(Empty)
-  step _m3 = box1.msgs.push(Text("bye"))
-  step _i = inboxes.push(box1)
-
+  box1.msgs.push(Text("hi"))
+  box1.msgs.push(Empty)
+  box1.msgs.push(Text("bye"))
+  inboxes.push(box1)
   step who = inboxes[0].name
   println(who)
   for m in inboxes[0].msgs {
@@ -280,7 +279,7 @@ fn main() -> i32 {
   mut store: tablets[64]Row
   mut i: i64 = 0
   while i < 50 {
-    step _p = store.push(Row { label: "r" + int_to_str(i), n: i })
+    store.push(Row { label: "r" + int_to_str(i), n: i })
     i = i + 1
   }
   // Pull row 7 out, clone via the by-value pass through `copy_row`,
@@ -351,16 +350,14 @@ fn run_tape(t: Tape) -> i64 {
 fn main() -> i32 {
   mut tapes: tablets[8]Tape
   mut t1: Tape = Tape { name: "t" + "1", ops: tablets[16]Op { } }
-  step _o1 = t1.ops.push(OAdd(10))
-  step _o2 = t1.ops.push(OMul(3))
-  step _o3 = t1.ops.push(OSub(5))
-  step _t1 = tapes.push(t1)
-
+  t1.ops.push(OAdd(10))
+  t1.ops.push(OMul(3))
+  t1.ops.push(OSub(5))
+  tapes.push(t1)
   mut t2: Tape = Tape { name: "t" + "2", ops: tablets[16]Op { } }
-  step _o4 = t2.ops.push(OAdd(100))
-  step _o5 = t2.ops.push(OSub(1))
-  step _t2 = tapes.push(t2)
-
+  t2.ops.push(OAdd(100))
+  t2.ops.push(OSub(1))
+  tapes.push(t2)
   for tape in tapes {
     println(tape.name, " = ", run_tape(tape))
   }
@@ -382,8 +379,7 @@ def test_struct_alignment_gc_offsets(tmp_path, stress):
 tablet Padded { a: i8, b: i64, c: str }
 fn main() -> i32 {
   mut store: tablets[4]Padded
-  step _p = store.push(Padded { a: 1, b: 2, c: "aligned" + "!" })
-
+  store.push(Padded { a: 1, b: 2, c: "aligned" + "!" })
   // Force a collect while the Padded struct sits in the chunk
   mut acc: str = ""
   mut i: i64 = 0
@@ -429,6 +425,129 @@ fn main() -> i32 {
     rc, stdout = run(src, tmp_path, stress)
     assert rc == 0
     assert stdout == b"outer_str\ninner_str\n"
+
+
+def test_field_return_survives_caller_gc_pressure(tmp_path, stress):
+    # Returning a Field expression from a local struct: the caller
+    # forces multiple GC cycles before reading the result. The GC
+    # must keep the returned str's bytes alive via the str type
+    # descriptor (str.ptr → heap byte buffer), even though the local
+    # struct that originally owned the field is gone.
+    src = """
+tablet Row { label: str }
+
+fn build() -> str {
+  step r: Row = Row { label: "abc" + "def" }
+  r.label
+}
+
+fn main() -> i32 {
+  step s = build()
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 {
+    acc = acc + "."
+    i = i + 1
+  }
+  println(s)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"abcdef\n"
+
+
+def test_index_return_from_local_tablets_survives_gc(tmp_path, stress):
+    # Returning a tablets-Index value: the local tablets is unreachable
+    # after the function returns, but the str at slot 0 still has a
+    # live byte-buffer that the caller's binding keeps rooted.
+    src = """
+fn build() -> str {
+  mut local: tablets[4]str
+  local.push("first" + "_str")
+  local.push("second" + "_str")
+  local[0]
+}
+
+fn main() -> i32 {
+  step s = build()
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 {
+    acc = acc + "."
+    i = i + 1
+  }
+  println(s)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"first_str\n"
+
+
+def test_field_return_from_match_arm_survives_gc(tmp_path, stress):
+    # The Field return is inside a match arm; the arm's binding goes
+    # out of scope along with the local scrutinee at fn return, but
+    # the returned str must stay alive in the caller through GC.
+    src = """
+seal Pick { First, Second }
+tablet Row { label: str }
+
+fn pick(p: Pick) -> str {
+  step r: Row = Row { label: "winner" + "!" }
+  match p {
+    First => r.label,
+    Second => "other",
+  }
+}
+
+fn main() -> i32 {
+  step s = pick(First)
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 {
+    acc = acc + "."
+    i = i + 1
+  }
+  println(s)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"winner!\n"
+
+
+def test_nested_field_return_survives_gc(tmp_path, stress):
+    # Returning a Field-of-Field — outer.inner.label. Both the outer
+    # and inner structs are local; only the str's byte buffer must
+    # survive in the caller.
+    src = """
+tablet Inner { label: str }
+tablet Outer { inner: Inner }
+
+fn build() -> str {
+  step o: Outer = Outer { inner: Inner { label: "deep" + "_str" } }
+  o.inner.label
+}
+
+fn main() -> i32 {
+  step s = build()
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 {
+    acc = acc + "."
+    i = i + 1
+  }
+  println(s)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"deep_str\n"
 
 
 def test_anonymous_rvalue_block_tail_uaf(tmp_path, stress):

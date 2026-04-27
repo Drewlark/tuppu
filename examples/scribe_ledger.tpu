@@ -5,7 +5,7 @@
 // One day's grain offerings: (item_name, amount) pairs accumulated
 // into the roll plus a per-item tally on the side.
 fn record(mut roll: Vec<str>, mut tally: Map<i64>, item: str, amount: i64) {
-  step _ = vec_push(roll, item)
+  vec_push(roll, item)
   step prev: i64 = map_get(tally, item, 0)
   map_set(tally, item, prev + amount)
 }

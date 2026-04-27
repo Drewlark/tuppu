@@ -17,8 +17,8 @@
 tablet Vec<T> { storage: tablets[64]T }
 
 // Append `x` to the end. Returns a wedge into the new slot — the
-// caller can ignore it (a la `step _ = vec_push(v, x)`) or hold onto
-// it as a stable handle.
+// caller can ignore it (write `vec_push(v, x)` as a bare statement)
+// or hold onto it as a stable handle (`step h = vec_push(v, x)`).
 fn vec_push<T>(mut v: Vec<T>, x: T) -> wedge T {
   v.storage.push(x)
 }

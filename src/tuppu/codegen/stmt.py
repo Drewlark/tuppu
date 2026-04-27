@@ -238,12 +238,15 @@ class StmtMixin:
         if val is None:
             raise CodegenError("yield value diverged")
         coerced = self._coerce(val, ret_ty)
-        coerced = self._neuter_return_if_borrow(coerced, y.value)
-        # Unwind every live cleanup frame (inner-to-outer) before the
-        # ret. The return value has already been captured into `coerced`
-        # so it doesn't matter if the cleanup invalidates heap memory
-        # — escape analysis rejects programs that return handles into
-        # soon-released tablets.
+        # Pre-GC, this site deep-cloned cleanup-bearing Field/Index
+        # returns to dodge UAF: the local source struct would be
+        # released at frame pop, freeing bytes the caller had just
+        # received. Under the current GC that's no longer a hazard —
+        # the returned value's type descriptor (e.g. str.ptr → byte
+        # buffer) keeps the underlying allocation reachable from the
+        # caller's binding. The wedge-handle escape rule is what
+        # still rules out genuinely dangling returns; everything
+        # else just rides the shadow stack.
         self._emit_all_cleanups_for_early_return()
         self.builder.ret(coerced)
 
@@ -262,20 +265,6 @@ class StmtMixin:
         ):
             return self._struct_as_borrow(val, val.type)
         return val
-
-    def _neuter_return_if_borrow(
-        self, val: ir.Value, expr: "A.Expr",
-    ) -> ir.Value:
-        """When a fn returns a cleanup-bearing value that the callee
-        doesn't own — a Field read off a struct, an Index into a
-        container, etc. — deep-clone so the caller receives
-        independently-owned bytes. Cloning sidesteps both double-free
-        and UAF risks. Users who want to avoid the alloc can return a
-        wedge / handle instead, or return an Ident of a locally-bound
-        struct (which transfers ownership cleanly)."""
-        if not isinstance(expr, (A.Field, A.Index)):
-            return val
-        return self._deep_clone_if_cleanup_bearing(val)
 
     def _register_gc_root(self, slot: ir.Value, value_ty: ir.Type) -> None:
         """If `value_ty` has traceable pointer fields, emit a

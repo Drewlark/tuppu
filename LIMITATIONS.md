@@ -16,12 +16,6 @@ Format: each section groups by area. Bullets prefix with severity:
 
 ## Memory model / GC
 
-- **[gap]** `_neuter_return_if_borrow` in codegen still inserts a
-  defensive deep-clone whenever a function returns a `Field` or
-  `Index` expression. This was a UAF guard pre-GC and is now wasted
-  allocation; the GC keeps the underlying bytes alive automatically.
-  Remove it and add a regression test that confirms the returned
-  pointer survives a forced collection in the caller.
 - **[gap]** No region-allocator for non-escaping `mut tablets` —
   every push goes through the GC arena even when the lifetime is
   trivially the function body. A region-allocator for the common

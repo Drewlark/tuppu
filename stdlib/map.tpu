@@ -62,6 +62,6 @@ fn map_set<T>(mut m: Map<T>, k: str, v: T) {
     m.values[idx] = v
     yield
   }
-  step _k = m.keys.push(k)
-  step _v = m.values.push(v)
+  m.keys.push(k)
+  m.values.push(v)
 }
