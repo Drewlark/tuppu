@@ -494,3 +494,95 @@ fn main() -> i32 {
     rc, stdout = run(src, tmp_path, stress)
     assert rc == 0
     assert stdout == b"9000\n9063\n9064\n9199\n100\n"
+
+
+# --- arena-specific properties: chunk descriptor & wedge-keeps-chunk -----
+
+
+def test_ivec_of_wedge_dispatches_through_mark_wedge(tmp_path, stress):
+    # ivec<wedge T>: each chunk slot is an interior pointer into a
+    # separate tablets storage. The chunk descriptor must thread
+    # elem_is_wedge=True so per-slot tracing routes through
+    # __tuppu_gc_mark_wedge. mark_ptr would silently fail on the
+    # interior pointer (no TUPPU_GC_MAGIC at HDR_OF), and under stress
+    # the source tablets' chunks would be swept while the ivec still
+    # references them.
+    src = """
+tablet Item { v: i64 }
+
+fn main() -> i32 {
+  mut store: tablets[8]Item
+  step h0 = store.push(Item { v: 100 })
+  step h1 = store.push(Item { v: 200 })
+  step h2 = store.push(Item { v: 300 })
+
+  mut iv: ivec<wedge Item>
+  iv.push(h0)
+  iv.push(h1)
+  iv.push(h2)
+
+  // Allocation churn so collections fire and have to walk the ivec
+  // chunk's wedge slots correctly via mark_wedge.
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 { acc = acc + "."  i = i + 1 }
+
+  println(iv[0].v)
+  println(iv[1].v)
+  println(iv[2].v)
+  println(iv.len)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"100\n200\n300\n3\n"
+
+
+def test_arena_wedge_outlives_source_ivec(tmp_path, stress):
+    # The marquee arena property in the GC-only case: after the ivec
+    # value goes out of scope, a wedge into one of its chunks is the
+    # ONLY path keeping that chunk alive. The collector must reach
+    # the chunk via mark_wedge on the wedge's shadow-stack root, not
+    # via the ivec's head_node / tail_node (those are gone). My
+    # earlier "wedge stable across pushes" test kept the ivec alive
+    # in the same scope; this one returns just the wedge, runs heavy
+    # churn in the caller, and dereferences. Proves chunks survive
+    # through the wedge alone.
+    src = """
+tablet Item { v: i64 }
+
+fn build_and_pluck() -> wedge Item {
+  mut iv: ivec<Item>
+  iv.push(Item { v: 11 })
+  iv.push(Item { v: 22 })
+  step h: wedge Item = iv.push(Item { v: 33 })
+  // Push past the chunk boundary so the held wedge is no longer
+  // in the most-recent chunk being filled — exercises the
+  // chunk-chain trace through earlier nodes too.
+  mut i: i64 = 0
+  while i < 100 {
+    iv.push(Item { v: i })
+    i = i + 1
+  }
+  h
+}
+
+fn main() -> i32 {
+  step pluck: wedge Item = build_and_pluck()
+  // Caller-side allocation churn — every alloc fires a collection
+  // under stress, and the only path to `pluck`'s chunk is via
+  // mark_wedge on the returned handle.
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 200 {
+    acc = acc + "x"
+    i = i + 1
+  }
+  println(pluck.v)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"33\n"
