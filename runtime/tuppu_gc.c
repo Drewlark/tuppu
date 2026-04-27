@@ -62,6 +62,7 @@ typedef struct tuppu_type {
 } tuppu_type_t;
 
 void __tuppu_gc_mark_ptr(void* p);
+void __tuppu_gc_mark_wedge(void* p);
 
 void* __tuppu_gc_alloc(size_t obj_size, const tuppu_type_t* type);
 void* __tuppu_gc_alloc_bytes(size_t n);
@@ -163,6 +164,37 @@ static void trace_struct(char* obj, const tuppu_type_t* type) {
  * internal mark_ptr. */
 void __tuppu_gc_mark_ptr(void* p) {
     mark_ptr(p);
+}
+
+/* Mark a wedge — an interior pointer into some GC allocation (most
+ * commonly a tablets chunk slot). The pointer almost certainly does
+ * NOT land at the start of an object, so we can't use the magic-byte
+ * check directly. Walk live_list and find the chunk whose
+ * [obj_start, obj_end) range contains `p`, then mark that chunk via
+ * the standard mark_ptr path so its descriptor's `next` traversal
+ * keeps the rest of the forward chain alive too.
+ *
+ * Linear scan is the simplest correct implementation. If wedge-heavy
+ * workloads (lua_interp's AST, JSON traversal) show this on a
+ * profile, upgrade to a sorted-array-with-binary-search index built
+ * at the start of each mark cycle. Don't pre-optimize: most programs
+ * have <1k live allocations and the linear walk is cheap. */
+void __tuppu_gc_mark_wedge(void* p) {
+    if (!p) return;
+    for (tuppu_hdr_t* h = live_list; h; h = h->next) {
+        char* obj = (char*)OBJ_OF(h);
+        char* end = obj + (h->size - HDR_SIZE);
+        if ((char*)p >= obj && (char*)p < end) {
+            mark_ptr(obj);
+            return;
+        }
+    }
+    /* Not in any live GC allocation. Either a static address (string
+     * literal pointer) or a stale wedge into already-freed memory.
+     * The first is harmless; the second indicates a soundness bug
+     * elsewhere — but we don't have enough context here to diagnose,
+     * so we treat unknown wedges as "nothing to mark" rather than
+     * crashing. */
 }
 
 static void mark_ptr(void* p) {
@@ -307,3 +339,35 @@ void* __tuppu_gc_alloc_bytes(size_t n) {
 void __tuppu_gc_noop_free(void* p) {
     (void)p;
 }
+
+/* ivec storage trace fn. The storage of an `ivec<T>` is a
+ * heap-allocated array of `T*` slots — every slot is a pointer to a
+ * separately-allocated T. The buffer's header records the total
+ * allocation size; `(size - HDR_SIZE) / sizeof(void*)` recovers the
+ * cap. We walk every cap slot (calloc-zeroed for unused slots, so
+ * unused entries are NULL — mark_ptr's null check makes this a no-op
+ * for them).
+ *
+ * Note we trace `cap` slots rather than `len`, because the buffer
+ * doesn't carry `len` (that lives on the parent ivec struct).
+ * Tracing past `len` is harmless under the calloc-zero invariant. */
+static void __tuppu_ivec_trace(char* buf) {
+    tuppu_hdr_t* hdr = HDR_OF(buf);
+    size_t n = (hdr->size - HDR_SIZE) / sizeof(void*);
+    void** slots = (void**)buf;
+    for (size_t i = 0; i < n; i++) {
+        mark_ptr(slots[i]);
+    }
+}
+
+/* Static descriptor for ivec storage buffers. Codegen passes this
+ * descriptor to `__tuppu_gc_alloc` when allocating or growing the
+ * pointer array — the trace fn handles per-cap iteration without
+ * needing a per-(T, cap) descriptor at codegen time. */
+const tuppu_type_t __tuppu_ivec_storage_desc = {
+    .name        = "ivec_storage",
+    .size        = 0,             /* variable; runtime reads from header */
+    .n_ptrs      = 0,
+    .ptr_offsets = NULL,
+    .trace       = __tuppu_ivec_trace,
+};

@@ -30,6 +30,7 @@ from ._common import (
 from .access import AccessMixin
 from .expr import ExprMixin
 from .intrinsics import IntrinsicsMixin
+from .ivec import IVecMixin
 from .module import ModuleMixin
 from .rat import RatMixin
 from .seals import SealsMixin
@@ -41,7 +42,7 @@ from .types import TypesMixin
 
 
 class Codegen(
-    SexMixin, RatMixin, TabletsMixin, StrsMixin, SealsMixin,
+    SexMixin, RatMixin, TabletsMixin, IVecMixin, StrsMixin, SealsMixin,
     ExprMixin, StmtMixin, IntrinsicsMixin, AccessMixin, TypesMixin, ModuleMixin,
 ):
     def __init__(self, checker=None) -> None:
@@ -101,6 +102,9 @@ class Codegen(
         self._tables: dict[str, tuple[ir.GlobalVariable, int, int, ir.Type]] = {}
         # Tablets monomorphizations: key is (N, str(elem_type)).
         self._tablets_types: dict[tuple[int, str], "TabletsInfo"] = {}
+        # ivec per-T helper-fn cache. Keyed by (str(elem_ty), is_wedge).
+        # See ivec.py for layout discussion.
+        self._ivec_types: dict = {}
         # User-defined structs: name -> LLVM struct type + ordered fields.
         # Per-block stack of cleanups (just tablets releases for now).
         # Each entry: (release_fn, ptr, source_name). Pushed at block
@@ -112,6 +116,14 @@ class Codegen(
         self._gc_root_counts: list[int] = []
         self._struct_types: dict[str, ir.LiteralStructType] = {}
         self._struct_fields: dict[str, list[tuple[str, ir.Type]]] = {}
+        # Per-struct set of field indices declared as `wedge T` at the
+        # source level. LLVM type-level info loses the distinction
+        # between `wedge T` and `*T` (both lower to `T*`); we keep it
+        # here so the GC trace fn emitter knows which pointer slots
+        # need interior-pointer marking via `__tuppu_gc_mark_wedge`
+        # vs. regular `__tuppu_gc_mark_ptr`. Mirrored by
+        # `_struct_mono_wedge_idxs` for monomorphizations.
+        self._struct_wedge_idxs: dict[str, set[int]] = {}
         # Seal (sum type) state. `_seal_types` keys are seal names for
         # non-generic seals and `(name, arg_tys)` tuples for concrete
         # monomorphizations. Each seal value is laid out as
@@ -132,6 +144,13 @@ class Codegen(
         # on demand via `_get_monomorph_struct` / `_get_monomorph_fn`.
         self._struct_monomorphs: dict[tuple, ir.IdentifiedStructType] = {}
         self._struct_mono_fields: dict[tuple, list[tuple[str, ir.Type]]] = {}
+        # Wedge field indices for monomorphized structs — see
+        # `_struct_wedge_idxs` for rationale.
+        self._struct_mono_wedge_idxs: dict[tuple, set[int]] = {}
+        # Per-seal, per-variant set of payload field indices declared
+        # as `wedge T`. Keyed by (seal_key, variant_idx). Mirrors the
+        # struct-side wedge tracking; consumed by the seal trace fn.
+        self._seal_wedge_idxs: dict[tuple, set[int]] = {}
         self._fn_monomorphs: dict[tuple, ir.Function] = {}
         # Current generic-body type-arg substitution, source-param name
         # → concrete LLVM type. Set by `_emit_fn_specialization` while
@@ -274,15 +293,31 @@ class Codegen(
         """Stable string key identifying a type for descriptor
         caching. Returns None for types that don't need GC tracing
         (scalars, pointers, fn values, seals with only scalar
-        payloads)."""
+        payloads).
+
+        A type needs a descriptor if it carries cleanup-bearing fields
+        (str / tablets / nested struct/seal-with-cleanup) OR if it
+        carries a wedge anywhere in its layout — wedges aren't
+        cleanup-bearing themselves (they're non-owning) but the GC
+        still needs to mark through them via interior-pointer lookup
+        to keep the pointed-into chunk alive."""
         if self._is_str_value(value_ty):
             return "__tuppu_str"
+        if self._is_ivec_value(value_ty):
+            # All ivec values share one descriptor — the buf pointer at
+            # offset 0 is GC-traced (the storage's runtime trace fn
+            # walks the per-cap pointer slots), and len/cap are scalar.
+            return "__tuppu_ivec"
         info = self._tablets_info_for(value_ty)
         if info is not None:
-            return f"__tuppu_tbls_{info.elem_ty}_{info.N}".replace(" ", "_")
+            wedge_tag = "_w" if info.elem_is_wedge else ""
+            return f"__tuppu_tbls_{info.elem_ty}_{info.N}{wedge_tag}".replace(" ", "_")
         if isinstance(value_ty, ir.IdentifiedStructType):
             if self._seal_key_for_ty(value_ty) is not None:
-                if not self._seal_needs_cleanup(value_ty):
+                if not (
+                    self._seal_needs_cleanup(value_ty)
+                    or self._contains_wedge_anywhere(value_ty)
+                ):
                     return None
                 return f"__tuppu_seal_{value_ty.name}"
             # Plain structs: only produce a desc when there's something
@@ -290,7 +325,10 @@ class Codegen(
             # this, so keeping them agreed prevents push/pop counter
             # drift (alloca a rooted slot but skip the push, vs. pop
             # expecting a push that never happened).
-            if self._struct_needs_cleanup(value_ty):
+            if (
+                self._struct_needs_cleanup(value_ty)
+                or self._contains_wedge_anywhere(value_ty)
+            ):
                 return f"__tuppu_struct_{value_ty.name}"
             return None
         return None
@@ -316,6 +354,8 @@ class Codegen(
         """
         if self._is_str_value(value_ty):
             return [0]
+        if self._is_ivec_value(value_ty):
+            return [0]   # buf ptr; len/cap are scalar i64
         info = self._tablets_info_for(value_ty)
         if info is not None:
             return [0, 8]   # head, tail ptrs
@@ -368,29 +408,41 @@ class Codegen(
 
     def _get_chunk_type_desc(
         self, N: int, elem_ty: ir.Type, node_ty: ir.IdentifiedStructType,
+        elem_is_wedge: bool = False,
     ) -> ir.GlobalVariable:
         """Emit (or return cached) `tuppu_type_t` for a tablets chunk.
         Chunks allocate via `__tuppu_gc_alloc(size, &chunk_desc)` so
         GC marks through them. Element types that recursively hold a
-        seal field (whose payload layout is tag-dispatched) get a
+        seal or wedge field — and tablets-of-wedge themselves — get a
         per-chunk trace fn that walks each slot via the same
         alignment-aware composition as the struct trace fns. Plain
-        elements stick to a flat ptr_offsets table."""
-        key = f"__tuppu_chunk_{elem_ty}_{N}".replace(" ", "_")
+        elements stick to a flat ptr_offsets table.
+
+        `elem_is_wedge` reflects the source-level `tablets[N]wedge T`
+        case: each chunk slot holds a single interior pointer that
+        must be dispatched through `__tuppu_gc_mark_wedge` rather than
+        a flat ptr_offsets entry (which would always emit mark_ptr)."""
+        wedge_tag = "_w" if elem_is_wedge else ""
+        key = f"__tuppu_chunk_{elem_ty}_{N}{wedge_tag}".replace(" ", "_")
         cached = self._type_descs.get(key)
         if cached is not None:
             return cached
         size = N * self._size_of(elem_ty) + 16
-        # If the element type's layout includes any seal-with-cleanup
-        # field (directly or nested), the flat ptr-offsets approach
-        # can't see the variant-dependent payload ptrs. Emit a chunk
-        # trace fn that loops over slots and recurses through the
-        # element's full tracing logic.
-        needs_trace = self._contains_seal_anywhere(elem_ty)
+        # If the element layout transitively includes a seal-with-
+        # cleanup field, a wedge field, or this tablets is itself a
+        # tablets-of-wedge, the flat ptr-offsets approach can't model
+        # the dispatch correctly. Emit a chunk trace fn that loops
+        # over slots and recurses through the element's full tracing
+        # logic, with mark_wedge for wedge slots.
+        needs_trace = (
+            elem_is_wedge
+            or self._contains_seal_anywhere(elem_ty)
+            or self._contains_wedge_anywhere(elem_ty)
+        )
         if needs_trace:
             offsets: list[int] = []
             trace_fn: ir.Function | None = self._get_chunk_trace_fn(
-                key, N, elem_ty, node_ty,
+                key, N, elem_ty, node_ty, elem_is_wedge=elem_is_wedge,
             )
         else:
             offsets = self._chunk_ptr_offsets(N, elem_ty)
@@ -435,13 +487,19 @@ class Codegen(
     def _get_chunk_trace_fn(
         self, key: str, N: int, elem_ty: ir.Type,
         node_ty: ir.IdentifiedStructType,
+        elem_is_wedge: bool = False,
     ) -> ir.Function:
         """Per-chunk trace fn for chunks whose element layout includes
-        a seal (or anything else flat ptr_offsets can't express).
+        a seal, a wedge, or whose element is itself a wedge T.
         Walks all N slots — the chunk header's `used` field tells the
         runtime how many to mind, but unused slots are calloc-zero, so
         marking them is a safe no-op via mark_ptr's null check. Also
-        marks the `next` chunk pointer."""
+        marks the `next` chunk pointer.
+
+        When `elem_is_wedge`, each slot holds a `wedge T` (interior
+        pointer); we dispatch through `_emit_trace_mark_calls` with
+        `is_wedge_field=True` so the slot value gets routed through
+        mark_wedge."""
         fn_name = f"{key}_trace"
         cached = self.module.globals.get(fn_name)
         if isinstance(cached, ir.Function):
@@ -453,7 +511,10 @@ class Codegen(
         base = fn.args[0]  # i8* to chunk start
         elem_size = self._size_of(elem_ty)
         for i in range(N):
-            self._emit_trace_mark_calls(b, base, i * elem_size, elem_ty)
+            self._emit_trace_mark_calls(
+                b, base, i * elem_size, elem_ty,
+                is_wedge_field=elem_is_wedge,
+            )
         # Mark the `next` chunk pointer at offset N*elem_size + 8
         # (alignment-padded past `used: i64`).
         items_end = N * elem_size
@@ -477,9 +538,13 @@ class Codegen(
             return cached
         # Seals dispatch tracing via a per-seal fn because a flat
         # ptr_offsets table can't express the tag-dependent payload
-        # layout. Structs that transitively contain a seal field need
-        # the same escape hatch so GC can recurse into the seal's
-        # trace fn. Everything else gets a flat ptr_offsets table.
+        # layout. Structs that transitively contain a seal or a wedge
+        # field need the same escape hatch — seals so GC can recurse
+        # into the seal's trace fn, wedges so the trace fn can route
+        # them through mark_wedge instead of mark_ptr (flat
+        # ptr_offsets always uses mark_ptr, which would silently
+        # collect the chunk a wedge points into). Everything else
+        # gets a flat ptr_offsets table.
         is_seal = (
             isinstance(value_ty, ir.IdentifiedStructType)
             and self._seal_key_for_ty(value_ty) is not None
@@ -490,7 +555,10 @@ class Codegen(
             trace_fn = self._get_seal_trace_fn(value_ty)
         elif (
             isinstance(value_ty, ir.IdentifiedStructType)
-            and self._struct_contains_seal(value_ty)
+            and (
+                self._struct_contains_seal(value_ty)
+                or self._contains_wedge_anywhere(value_ty)
+            )
         ):
             trace_fn = self._get_struct_trace_fn(value_ty)
         else:
@@ -581,11 +649,15 @@ class Codegen(
                 arm = fn.append_basic_block(f"trace.{vname}")
                 switch.add_case(ir.Constant(I8, idx), arm)
                 b.position_at_end(arm)
+                wedge_idxs = self._seal_wedge_idxs.get((seal_key, idx), set())
                 fld_off = 0
-                for fty in payload_ty.elements:
+                for fi, fty in enumerate(payload_ty.elements):
                     align = self._align_of(fty)
                     fld_off = (fld_off + align - 1) // align * align
-                    self._emit_trace_mark_calls(b, payload_base, fld_off, fty)
+                    self._emit_trace_mark_calls(
+                        b, payload_base, fld_off, fty,
+                        is_wedge_field=(fi in wedge_idxs),
+                    )
                     fld_off += self._size_of(fty)
                 b.branch(merge_bb)
         b.position_at_end(merge_bb)
@@ -598,13 +670,32 @@ class Codegen(
         base: ir.Value,
         offset: int,
         field_ty: ir.Type,
+        is_wedge_field: bool = False,
     ) -> None:
         """Emit the IR that marks every GC-reachable pointer inside
         `field_ty` at `base + offset`. Nested seals dispatch into
         their own trace fn; structs that (transitively) contain a
-        seal also dispatch via a struct trace fn so the tag-based
-        recursion chains through. Everything else falls back to a
-        flat ptr_offsets walk. Scalars are no-ops."""
+        seal or wedge also dispatch via a struct trace fn so the
+        tag-/wedge-aware recursion chains through. Everything else
+        falls back to a flat ptr_offsets walk. Scalars are no-ops.
+
+        `is_wedge_field` is set by the caller (a struct/seal/chunk
+        trace fn) when the parent declared this slot as `wedge T`.
+        In that case the slot holds a single interior pointer; we
+        load it and call mark_wedge so the GC can find the chunk
+        the wedge points into. Without this flag, wedge slots would
+        fall through the flat ptr_offsets path and get mark_ptr'd —
+        which only handles object-start pointers (chunk's HDR has
+        the magic byte; an interior wedge does not), so the chunk
+        would be silently swept. That was the v0.4.1 soundness bug."""
+        if is_wedge_field:
+            field_i8 = b.gep(
+                base, [ir.Constant(I64, offset)], inbounds=True,
+            )
+            ptr_ptr = b.bitcast(field_i8, I8.as_pointer().as_pointer())
+            wedge_ptr = b.load(ptr_ptr)
+            b.call(self._get_gc_mark_wedge(), [wedge_ptr])
+            return
         if isinstance(field_ty, ir.IdentifiedStructType):
             seal_key = self._seal_key_for_ty(field_ty)
             if seal_key is not None:
@@ -615,7 +706,10 @@ class Codegen(
                     )
                     b.call(inner_fn, [sub_ptr])
                 return
-            if self._struct_contains_seal(field_ty):
+            if (
+                self._struct_contains_seal(field_ty)
+                or self._contains_wedge_anywhere(field_ty)
+            ):
                 inner_fn = self._get_struct_trace_fn(field_ty)
                 sub_ptr = b.gep(
                     base, [ir.Constant(I64, offset)], inbounds=True,
@@ -623,10 +717,14 @@ class Codegen(
                 b.call(inner_fn, [sub_ptr])
                 return
         # Literal struct (e.g. variant payload tuple) that contains a
-        # seal field still needs recursion — walk fields one by one
-        # so nested seal fields re-enter the dispatch.
+        # seal or wedge field still needs recursion — walk fields one
+        # by one so nested seal/wedge fields re-enter the dispatch.
         if isinstance(field_ty, ir.LiteralStructType):
-            if any(self._contains_seal_anywhere(el) for el in field_ty.elements):
+            if any(
+                self._contains_seal_anywhere(el)
+                or self._contains_wedge_anywhere(el)
+                for el in field_ty.elements
+            ):
                 inner_off = 0
                 for el in field_ty.elements:
                     align = self._align_of(el)
@@ -676,13 +774,50 @@ class Codegen(
                 return True
         return False
 
+    def _contains_wedge_anywhere(self, ty: ir.Type) -> bool:
+        """Does `ty` anywhere in its layout hold a `wedge T` slot the
+        parent's trace fn needs to dispatch via mark_wedge? Returns
+        True for direct wedge fields and for sub-fields whose own type
+        recursively contains wedges (so the parent must call into the
+        inner type's trace fn rather than using flat ptr_offsets that
+        would mark wedges as object-start pointers).
+
+        Returns False for tablets-of-wedge — the chunk descriptor
+        handles its own wedge slots, so a parent struct holding a
+        `tablets[N]wedge T` field can still use flat offsets for
+        head/tail."""
+        if isinstance(ty, ir.IdentifiedStructType):
+            seal_key = self._seal_key_for_ty(ty)
+            if seal_key is not None:
+                variants = self._seal_variants.get(seal_key, [])
+                for vi, (_vn, payload) in enumerate(variants):
+                    if self._seal_wedge_idxs.get((seal_key, vi)):
+                        return True
+                    for el in payload.elements:
+                        if self._contains_wedge_anywhere(el):
+                            return True
+                return False
+            if self._struct_wedge_idxs_for(ty):
+                return True
+            fields = self._struct_fields_for(ty) or []
+            for _name, fty in fields:
+                if self._contains_wedge_anywhere(fty):
+                    return True
+            return False
+        if isinstance(ty, ir.LiteralStructType):
+            return any(self._contains_wedge_anywhere(el) for el in ty.elements)
+        if isinstance(ty, ir.ArrayType):
+            return self._contains_wedge_anywhere(ty.element)
+        return False
+
     def _get_struct_trace_fn(self, struct_ty: ir.Type) -> ir.Function:
         """Emit (or return cached) a trace fn for a struct whose
         layout can't be expressed as a flat ptr_offsets table —
-        today, structs that transitively hold a seal-with-cleanup
-        field. The fn walks each field and recurses via
+        structs that transitively hold a seal-with-cleanup field or
+        a `wedge T` field. The fn walks each field and recurses via
         `_emit_trace_mark_calls`, which handles seals by calling
-        their own trace fn in turn."""
+        their own trace fn in turn and dispatches wedge fields via
+        mark_wedge."""
         assert isinstance(struct_ty, ir.IdentifiedStructType)
         fn_name = f"__tuppu_struct_{struct_ty.name}_trace"
         cached = self.module.globals.get(fn_name)
@@ -694,11 +829,14 @@ class Codegen(
         b = ir.IRBuilder(entry)
         base = fn.args[0]
         fields = self._struct_fields_for(struct_ty) or []
+        wedge_idxs = self._struct_wedge_idxs_for(struct_ty)
         offset = 0
-        for _name, fty in fields:
+        for fi, (_name, fty) in enumerate(fields):
             align = self._align_of(fty)
             offset = (offset + align - 1) // align * align
-            self._emit_trace_mark_calls(b, base, offset, fty)
+            self._emit_trace_mark_calls(
+                b, base, offset, fty, is_wedge_field=(fi in wedge_idxs),
+            )
             offset += self._size_of(fty)
         b.ret_void()
         return fn
@@ -711,6 +849,20 @@ class Codegen(
             return cached
         fty = ir.FunctionType(ir.VoidType(), [I8.as_pointer()])
         return ir.Function(self.module, fty, "__tuppu_gc_mark_ptr")
+
+    def _get_gc_mark_wedge(self) -> ir.Function:
+        """`__tuppu_gc_mark_wedge(ptr)` — interior-pointer mark for
+        wedge fields. The runtime walks the live-list to find the
+        chunk whose `[start, end)` contains the wedge, then marks
+        that chunk via the standard mark_ptr path so its descriptor
+        keeps the rest of the forward chain alive. Trace fns dispatch
+        here for any field declared as `wedge T` at the source level
+        (LLVM type alone can't tell `wedge T` from `*T`)."""
+        cached = self.module.globals.get("__tuppu_gc_mark_wedge")
+        if isinstance(cached, ir.Function):
+            return cached
+        fty = ir.FunctionType(ir.VoidType(), [I8.as_pointer()])
+        return ir.Function(self.module, fty, "__tuppu_gc_mark_wedge")
 
     def _emit_gc_push_root(self, slot: ir.Value, value_ty: ir.Type) -> bool:
         """Emit a `__tuppu_gc_push_root(slot, type_desc)` call if the

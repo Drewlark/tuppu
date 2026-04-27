@@ -43,6 +43,7 @@ class Tok(Enum):
     TABLE = auto()
     TABLETS = auto()
     BUFFER = auto()      # emitted by `buffer` keyword — fixed-size byte buffer
+    IVEC = auto()        # emitted by `ivec` keyword — indirect vector (array of pointers)
     RELEASE = auto()
     STRUCT = auto()      # emitted by `tablet` keyword — product type decl
     WEDGE = auto()       # emitted by `wedge` keyword — handle type (tablet ref)
@@ -118,6 +119,12 @@ KEYWORDS: dict[str, Tok] = {
     # `buffer[N]T` is a fixed-size, stack-allocated byte buffer, chiefly
     # for FFI. Not a tablets — no chain, no growth, no release.
     "buffer": Tok.BUFFER,
+    # `ivec<T>` is an indirect vector — contiguous heap-allocated array of
+    # pointers to per-element T allocations. O(1) random access (two
+    # loads), pointer-stable T values (resize moves only the pointer
+    # array). Cousin: `dvec<T>` (planned) for direct contiguous T storage,
+    # better for primitive T at the cost of pointer-instability.
+    "ivec": Tok.IVEC,
     # `wedge T` is a handle into some `tablets[N]T` — cuneiform is
     # "wedge-writing", so a wedge is the atom of a Mesopotamian mark:
     # a single small reference to something larger.

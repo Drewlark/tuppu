@@ -663,3 +663,137 @@ fn main() -> i32 {
     rc, stdout = run(src, tmp_path, stress)
     assert rc == 0
     assert stdout == b"b2\n"
+
+
+# --- smart wedges: wedge escapes keep the source arena alive --------------
+#
+# The v0.4.1 soundness bug: a wedge that escaped via a wrapping struct or
+# seal payload kept no GC trace back to its source arena. Under stress the
+# arena got swept while the caller still held the wedge, producing silent
+# zero-reads. The fix is interior-pointer marking via __tuppu_gc_mark_wedge,
+# emitted by trace fns for any field declared as `wedge T`. Each test below
+# escapes a wedge through a different wrapper shape and reads the wedge
+# after heavy collection pressure; under the bug, all of them read 0.
+
+
+def test_wedge_in_struct_returned_survives_gc(tmp_path, stress):
+    src = """
+tablet Tree { value: i64 }
+tablet Box { handle: wedge Tree }
+
+fn make() -> Box {
+  mut nodes: tablets[16]Tree
+  step h = nodes.push(Tree { value: 42 })
+  Box { handle: h }
+}
+
+fn main() -> i32 {
+  step b = make()
+  // Force collection pressure unrelated to the boxed wedge.
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 {
+    acc = acc + "x"
+    i = i + 1
+  }
+  println(b.handle.value)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"42\n"
+
+
+def test_wedge_in_seal_payload_returned_survives_gc(tmp_path, stress):
+    src = """
+tablet Cell { value: i64 }
+seal Holder { Empty, Some(wedge Cell) }
+
+fn make() -> Holder {
+  mut cells: tablets[16]Cell
+  step h = cells.push(Cell { value: 7 })
+  Some(h)
+}
+
+fn main() -> i32 {
+  step holder = make()
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 {
+    acc = acc + "y"
+    i = i + 1
+  }
+  match holder {
+    Empty => println(0),
+    Some(h) => println(h.value),
+  }
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"7\n"
+
+
+def test_tablets_of_wedge_returned_survives_gc(tmp_path, stress):
+    # tablets[N]wedge T — each chunk slot is a wedge into another arena.
+    # The chunk descriptor must dispatch each slot through mark_wedge.
+    src = """
+tablet Item { v: i64 }
+
+fn build() -> tablets[8]wedge Item {
+  mut store: tablets[16]Item
+  mut handles: tablets[8]wedge Item
+  handles.push(store.push(Item { v: 11 }))
+  handles.push(store.push(Item { v: 22 }))
+  handles.push(store.push(Item { v: 33 }))
+  handles
+}
+
+fn main() -> i32 {
+  mut hs = build()
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 {
+    acc = acc + "z"
+    i = i + 1
+  }
+  for h in hs { println(h.v) }
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"11\n22\n33\n"
+
+
+def test_wedge_in_nested_struct_returned_survives_gc(tmp_path, stress):
+    # Wedge two levels deep: outer struct holds an inner struct that holds
+    # the wedge. Trace fn must recurse through the inner struct's fields.
+    src = """
+tablet Leaf { tag: i64 }
+tablet Inner { ref: wedge Leaf }
+tablet Outer { inner: Inner }
+
+fn make() -> Outer {
+  mut leaves: tablets[8]Leaf
+  step h = leaves.push(Leaf { tag: 99 })
+  Outer { inner: Inner { ref: h } }
+}
+
+fn main() -> i32 {
+  step o = make()
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 {
+    acc = acc + "q"
+    i = i + 1
+  }
+  println(o.inner.ref.tag)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"99\n"

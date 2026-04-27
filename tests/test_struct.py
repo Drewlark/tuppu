@@ -502,43 +502,51 @@ def test_recursive_tablet_without_indirection_rejected():
         )
 
 
-# --- escape check: no returning local-rooted handles -----------------------
+# --- smart wedges: returning a handle into a local arena is sound ----------
+#
+# Pre-v0.4.1, returning a wedge handle whose source arena was a local tablets
+# was rejected at compile time as a use-after-free risk. Under smart wedges,
+# the GC traces wedge fields via interior-pointer lookup, so the source
+# arena stays alive as long as the handle is reachable. These programs now
+# compile and run correctly. See `tests/test_gc_torture.py` for runtime
+# coverage of the wedge-survives-collection invariant.
 
-def test_escape_rejects_return_of_local_push():
-    with pytest.raises(CompileError, match="cannot return a wedge handle"):
-        compile_to_ir(
-            "tablet Node { value: i64, next: wedge Node }\n"
-            "fn build() -> wedge Node {\n"
-            "  mut lib: tablets[8]Node\n"
-            "  lib.push(Node { value: 1, next: lost })\n"
-            "}\n"
-            "fn main() -> i32 { 0 }\n"
-        )
-
-
-def test_escape_rejects_return_of_tainted_binding():
-    with pytest.raises(CompileError, match="cannot return a wedge handle"):
-        compile_to_ir(
-            "tablet Node { value: i64, next: wedge Node }\n"
-            "fn build() -> wedge Node {\n"
-            "  mut lib: tablets[8]Node\n"
-            "  step h: wedge Node = lib.push(Node { value: 1, next: lost })\n"
-            "  h\n"
-            "}\n"
-            "fn main() -> i32 { 0 }\n"
-        )
+def test_handle_return_from_local_push_compiles():
+    # Bare wedge return out of a local arena.
+    compile_to_ir(
+        "tablet Node { value: i64, next: wedge Node }\n"
+        "fn build() -> wedge Node {\n"
+        "  mut lib: tablets[8]Node\n"
+        "  lib.push(Node { value: 1, next: lost })\n"
+        "}\n"
+        "fn main() -> i32 { 0 }\n"
+    )
 
 
-def test_escape_rejects_yielded_local_handle():
-    with pytest.raises(CompileError, match="cannot return a wedge handle"):
-        compile_to_ir(
-            "tablet Node { value: i64, next: wedge Node }\n"
-            "fn build() -> wedge Node {\n"
-            "  mut lib: tablets[8]Node\n"
-            "  yield lib.push(Node { value: 1, next: lost })\n"
-            "}\n"
-            "fn main() -> i32 { 0 }\n"
-        )
+def test_handle_return_via_step_binding_compiles():
+    compile_to_ir(
+        "tablet Node { value: i64, next: wedge Node }\n"
+        "fn build() -> wedge Node {\n"
+        "  mut lib: tablets[8]Node\n"
+        "  step h: wedge Node = lib.push(Node { value: 1, next: lost })\n"
+        "  h\n"
+        "}\n"
+        "fn main() -> i32 { 0 }\n"
+    )
+
+
+def test_handle_yield_from_local_arena_compiles():
+    compile_to_ir(
+        "tablet Node { value: i64, next: wedge Node }\n"
+        "fn build(early: bool) -> wedge Node {\n"
+        "  mut lib: tablets[8]Node\n"
+        "  if early {\n"
+        "    yield lib.push(Node { value: 1, next: lost })\n"
+        "  }\n"
+        "  lib.push(Node { value: 2, next: lost })\n"
+        "}\n"
+        "fn main() -> i32 { 0 }\n"
+    )
 
 
 def test_escape_accepts_lost_return(tmp_path):

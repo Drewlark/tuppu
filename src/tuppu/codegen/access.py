@@ -31,6 +31,8 @@ class AccessMixin:
                 var = None
             if var is not None and self._tablets_info_for(var.value_ty) is not None:
                 return self._gen_tablets_field(var, e.name)
+            if var is not None and self._is_ivec_value(var.value_ty):
+                return self._gen_ivec_field(var, e.name)
             if var is not None and isinstance(var.value_ty, ir.ArrayType):
                 if e.name == "len":
                     return ir.Constant(I64, var.value_ty.count)
@@ -51,6 +53,13 @@ class AccessMixin:
                 return self.builder.extract_value(target, 2)
             raise CodegenError(
                 f"tablets has no field {e.name!r}; only len"
+            )
+        if self._is_ivec_value(target.type):
+            if e.name == "len":
+                from ._common import IVEC_IDX_LEN
+                return self.builder.extract_value(target, IVEC_IDX_LEN)
+            raise CodegenError(
+                f"ivec has no field {e.name!r}; only len"
             )
         # Tablet handle: auto-deref. The handle is a pointer to the
         # underlying struct; GEP into it to the field slot, then load.
@@ -128,8 +137,10 @@ class AccessMixin:
         # tablets[N]T literals; synthesised variadic literals leave it
         # None, and we take the hint from the caller if provided, else
         # probe the first field's expression type.
+        elem_is_wedge = False
         if e.element is not None:
             elem_ty = self._lower_type(e.element)
+            elem_is_wedge = isinstance(e.element, A.TypeHandle)
         elif elem_ty_hint is not None:
             elem_ty = elem_ty_hint
         else:
@@ -144,7 +155,7 @@ class AccessMixin:
                     "variadic literal: element probe has no value",
                 )
             elem_ty = probe.type
-        info = self._get_tablets(e.size, elem_ty)
+        info = self._get_tablets(e.size, elem_ty, elem_is_wedge=elem_is_wedge)
         slot = self._alloca_entry(info.tablets_ty, ".tbls.lit")
         self.builder.store(ir.Constant(info.tablets_ty, None), slot)
         # Register cleanup BEFORE pushing so a push-then-error path
@@ -322,6 +333,11 @@ class AccessMixin:
                 info = self._tablets_info_for(var.value_ty)
                 if info is not None:
                     return self._gen_tablets_index(info, var, e.index)
+                if self._is_ivec_value(var.value_ty):
+                    elem_ty = self._ivec_elem_for_index(e)
+                    if elem_ty is not None:
+                        iv_info = self._get_ivec(elem_ty)
+                        return self._gen_ivec_index(iv_info, var, e.index)
                 if isinstance(var.value_ty, ir.ArrayType):
                     # Buffer indexing — GEP + bounds-trap + load.
                     idx = self._gen_expr(e.index)

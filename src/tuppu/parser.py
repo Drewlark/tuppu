@@ -390,6 +390,16 @@ class Parser:
             self.advance()
             element = self.parse_type()
             return _at(t, A.TypeHandle(element=element))
+        if t.kind is Tok.IVEC:
+            # `ivec<T>` — indirect vector: contiguous heap-allocated
+            # array of pointers, each pointing to a separately-allocated
+            # T. O(1) random access; T values are pointer-stable across
+            # resize.
+            self.advance()
+            self.eat(Tok.LT)
+            element = self.parse_type()
+            self.eat(Tok.GT)
+            return _at(t, A.TypeIVec(element=element))
         if t.kind is Tok.LBRACKET:
             self.advance()
             size = self.eat(Tok.INT, "array size (integer)").value

@@ -90,6 +90,18 @@ class TypeHandle:
     col:  int = _pos()
 
 @dataclass
+class TypeIVec:
+    """`ivec<T>` — indirect vector. Contiguous heap-allocated array of
+    pointers to per-element T allocations. Random access is O(1) (two
+    loads), and resize moves only the pointer array, leaving each T's
+    address stable for the lifetime of the surrounding ivec. Companion
+    type `dvec<T>` (planned) will store T values inline for primitive
+    T at the cost of pointer-instability across grow."""
+    element: "TypeExpr"
+    line: int = _pos()
+    col:  int = _pos()
+
+@dataclass
 class TypeFn:
     """First-class function type: `fn(T1, T2) -> U`. No environment —
     these are plain function pointers (capture comes later). Used in
@@ -116,7 +128,7 @@ class TypeApply:
 
 TypeExpr = Union[
     TypeName, TypeArray, TypeTablets, TypeBuffer, TypeVariadicTablets,
-    TypePointer, TypeHandle, TypeApply, TypeFn,
+    TypePointer, TypeHandle, TypeIVec, TypeApply, TypeFn,
 ]
 
 

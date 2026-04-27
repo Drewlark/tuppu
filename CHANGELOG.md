@@ -13,6 +13,47 @@ narrative.
 
 ### Added
 
+- **`ivec<T>` — indirect vector (real Vec, MVP).** Contiguous heap-
+  allocated array of pointers to per-element T allocations. O(1)
+  random access (two loads — one into the pointer array, one through
+  the slot pointer). T values are pointer-stable across grow: only
+  the pointer array realloc's, individual T allocations don't move,
+  so a `wedge T` taken from `iv.push(...)` stays valid for as many
+  subsequent pushes as you want — provable under `TUPPU_GC_STRESS=1`
+  (every-allocation collection). Methods: `iv.push(x) -> wedge T`,
+  `iv[i]`, `iv[i] = x`, `iv.len`, `for x in iv`. Ships as a built-in
+  primitive type rather than a stdlib tablet because the layout
+  needs runtime + codegen support: a contiguous heap array isn't
+  expressible via existing `tablets[N]T` (chunk-chained) or
+  `buffer[N]u8` (stack, u8-only) primitives. The pointer array's
+  trace fn (`__tuppu_ivec_trace` in `runtime/tuppu_gc.c`) walks
+  `(allocation_size - HDR_SIZE) / 8` slots — derived from the
+  buffer's GC header so a single shared descriptor handles every
+  cap. Counterpart `dvec<T>` (direct contiguous storage, NOT
+  pointer-stable, better for primitive T) is the planned next step;
+  the eventual auto-select wrapper picks one based on `sizeof(T)`.
+  16 new tests in `test_ivec.py` cover push/get round-trip, growth
+  across cap doublings, pointer-stability under stress (push 502
+  Items, deref pre-grow wedge), str payload, struct payload with
+  cleanup-bearing fields, set-via-index, and ivec-returned-from-fn
+  survival under caller GC pressure.
+- **Smart wedges: GC traces through `wedge T` fields.** Closes a
+  silent-wrong-result soundness bug where a wedge handle escaping
+  via a struct field or seal-variant payload kept no GC trace back
+  to its source arena. Under `TUPPU_GC_STRESS=1` the source chunks
+  got swept while the caller still held the wedge, producing
+  deterministic zero-reads (calloc-zeroed UAF). The fix has three
+  pieces: (1) `__tuppu_gc_mark_wedge(p)` in the runtime, which walks
+  the live-list to find the chunk whose `[start, end)` contains an
+  interior pointer; (2) per-struct + per-seal-variant wedge-field
+  bookkeeping in codegen, since LLVM types collapse `wedge T` and
+  `*T` to the same `T*`; (3) trace fns that dispatch wedge fields
+  through `mark_wedge` instead of `mark_ptr`. Eight new GC torture
+  tests pin the behavior in normal + stress modes for wedges
+  escaping via struct field, seal payload, `tablets[N]wedge T`, and
+  nested-struct wrapping. Linear-scan interior lookup is the
+  simplest correct implementation; upgrade to a sorted-array index
+  if a profile shows it.
 - **`type Name = TypeExpr` aliases.** Transparent — every use site
   resolves the alias's target. Works with primitives, tablets, seals,
   generic struct types (`type Counts = tablets[64]i64`), and chains
@@ -30,6 +71,19 @@ narrative.
   see LIMITATIONS.md.
 
 ### Removed
+
+- **Wedge-handle escape rule in typecheck.** With smart wedges, the
+  GC keeps the source arena alive for as long as a wedge into it is
+  reachable, so the compile-time rule that rejected `fn build() ->
+  wedge T { mut local; local.push(...) }` is no longer needed for
+  soundness. Deleted: `_expr_escapes`, `_local_tablets`, `_tainted`,
+  the body-/yield-site escape checks, and their taint-propagation
+  call sites in `_tc_let` / `_tc_assign`. The rule's incompleteness
+  (it didn't cover wedges wrapped in struct/seal payloads — the
+  v0.4.1 soundness bug) was a hint that the runtime, not the type
+  system, was the right place to enforce arena lifetime. Programs
+  that used to be rejected with "cannot return a wedge handle whose
+  tablets is declared locally" now compile and run correctly.
 
 - **`_neuter_return_if_borrow` and its call site in `_gen_yield`.**
   This was a UAF guard pre-GC that deep-cloned the return value of

@@ -54,6 +54,26 @@ SEX_IDX_RADIX = 1
 SEX_IDX_COUNT = 2
 SEX_IDX_SIGN = 3
 
+# ivec value layout — `{ buf: i8**, len: i64, cap: i64 }`. Shared
+# across every `ivec<T>`; T-specific behavior lives in per-T helper
+# fns (push, get, get_addr). The buffer is a heap-allocated array of
+# pointers (each pointing to a separately heap-allocated T), traced
+# by the runtime's `__tuppu_ivec_storage_desc`. One LLVM type for
+# every ivec means one shared descriptor too — the buffer pointer
+# at offset 0 is always a regular GC-traced pointer.
+IVEC_STRUCT = ir.LiteralStructType([
+    I8.as_pointer().as_pointer(),  # buf: i8**
+    I64,                           # len
+    I64,                           # cap
+])
+IVEC_IDX_BUF = 0
+IVEC_IDX_LEN = 1
+IVEC_IDX_CAP = 2
+# Initial cap on the first push (0 means "lazy alloc"). Subsequent
+# grows double; chosen as a single allocation rather than a sequence
+# of 1→2→4→8 to keep small ivecs off the GC's small-object pile.
+IVEC_INITIAL_CAP = 8
+
 INT_WIDTH: dict[str, int] = {
     "i8": 8, "i16": 16, "i32": 32, "i64": 64,
     "u8": 8, "u16": 16, "u32": 32, "u64": 64,
@@ -91,11 +111,32 @@ class TabletsInfo:
     node_ty: ir.IdentifiedStructType   # {[N x T], used: i64, next: Node*}
     tablets_ty: ir.LiteralStructType   # {head: Node*, tail: Node*, len: i64}
     suffix: str
+    # True iff the element type was declared as `wedge T` at the source
+    # level. LLVM types collapse `wedge T` and `*T` to the same `T*`,
+    # so we keep this flag separately to decide whether each chunk slot
+    # should be traced via mark_wedge (interior-pointer lookup, keeps
+    # the source arena alive) or mark_ptr (treat as a regular GC obj
+    # start). Set at `_get_tablets` time from the lowering call site.
+    elem_is_wedge: bool = False
     push: ir.Function | None = None
     get: ir.Function | None = None
     get_addr: ir.Function | None = None
     release: ir.Function | None = None
     clone: ir.Function | None = None
+
+
+@dataclass
+class IVecInfo:
+    """Per-T monomorphized helper fns for `ivec<T>`. The struct LLVM
+    type is shared (`IVEC_STRUCT`); only the helpers vary per element
+    type. Helpers are emitted lazily on first call so a type that
+    never gets indexed / pushed produces zero IR."""
+    elem_ty: ir.Type
+    suffix: str
+    elem_is_wedge: bool = False
+    push: ir.Function | None = None
+    get: ir.Function | None = None
+    get_addr: ir.Function | None = None
 
 
 # Names that the user cannot shadow — they resolve to compiler intrinsics.

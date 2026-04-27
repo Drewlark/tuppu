@@ -140,7 +140,8 @@ The full grammar + semantics live in [`SPEC.md`](./SPEC.md).
 |---|---|---|
 | `tablet Foo { ... }` | Product type (struct). Declared at module scope. |
 | `tablets[N]T` | Chunk-chained, pointer-stable, append-only arena of `T`. `N` is the chunk size. Backed by GC-allocated chunks linked by tail pointers. |
-| `wedge T` | Non-owning handle into a `tablets[N]T` slot. Returned by `tablets.push`, dereferenced via `.field` (auto-loads through the pointer). Compares equal to `lost` when null. |
+| `wedge T` | Non-owning handle into a `tablets[N]T` slot or `ivec<T>` element. Returned by `tablets.push` / `ivec.push`, dereferenced via `.field` (auto-loads through the pointer). Compares equal to `lost` when null. The GC traces wedge fields via interior-pointer lookup, so handles stay valid as long as they're reachable. |
+| `ivec<T>` | Indirect vector — contiguous heap-allocated array of pointers to per-element T allocations. O(1) random access, pointer-stable T values across grow. Methods: `.push(x)`, `[i]`, `[i] = x`, `.len`, `for x in iv`. Counterpart `dvec<T>` for primitive T is planned. |
 | `buffer[N]u8` | Fixed-size, stack-allocated, bounds-checked byte buffer. `u8` only (see `LIMITATIONS.md`). Cannot appear as a struct field (stack lifetime). |
 | `seal Foo { Variant1, Variant2(T) }` | Sum type. Variants can be nullary or carry payload fields. |
 | `*T` | Raw pointer (FFI-only). Created from `buffer[N]u8` decay; not constructible from owned values. |
@@ -165,6 +166,7 @@ fn       step     mut       if       elif      else
 while    for      in        yield    true      false      as
 table    tablet   tablets   wedge    lost      release
 seal     colophon copy      type     buffer    match
+ivec
 ```
 
 | Keyword | Role |
@@ -174,7 +176,7 @@ seal     colophon copy      type     buffer    match
 | `mut` | Alloca-backed mutable binding or function parameter. |
 | `if` / `elif` / `else` | Branching. Expression-typed when both arms produce a value. |
 | `while` | Pre-test loop. Body type is unit. |
-| `for x in iter` | Iterate over a `tablets`, `str` (yielding `u8`), or `table`. |
+| `for x in iter` | Iterate over a `tablets`, `ivec`, `str` (yielding `u8`), or `table`. |
 | `in` | The iter keyword in `for`. |
 | `yield` | Early return from a function body. Optional value. |
 | `true` / `false` | `bool` literals. |
@@ -190,6 +192,7 @@ seal     colophon copy      type     buffer    match
 | `copy` | Force a deep clone of a value. Rarely needed under GC; preserved for explicit-clone semantics. |
 | `type` | Type alias declaration: `type Bytes = buffer[1024]u8`. Transparent at every use site. |
 | `buffer` | Type expression for a fixed-size, stack-allocated, bounds-checked buffer (`u8`-only today). |
+| `ivec` | Type expression `ivec<T>` — indirect vector. Contiguous heap-allocated array of pointers to per-T heap allocations. O(1) index, pointer-stable across grow. |
 | `match` | Pattern-match expression over a `seal` value. Arms `Variant(b1, b2) => expr,` with optional `_` wildcard. |
 
 ## Standard library

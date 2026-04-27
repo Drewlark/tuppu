@@ -61,14 +61,24 @@ class SealsMixin:
             self._type_arg_subst = dict(zip(decl.type_params, arg_tys))
         try:
             variants: list[tuple[str, ir.LiteralStructType]] = []
+            wedge_idxs_per_variant: list[set[int]] = []
             for v in decl.variants:
                 field_tys = [self._lower_type(ft) for ft in v.fields]
                 payload = ir.LiteralStructType(field_tys)
                 variants.append((v.name, payload))
+                wedge_idxs_per_variant.append({
+                    i for i, ft in enumerate(v.fields)
+                    if isinstance(ft, A.TypeHandle)
+                })
         finally:
             self._type_arg_subst = saved_subst
         key = name if not arg_tys else (name, arg_tys)
         self._seal_variants[key] = variants
+        # Record wedge indices keyed by (seal_key, variant_idx) so the
+        # seal trace fn can dispatch the right mark call per payload
+        # field.
+        for vi, wedges in enumerate(wedge_idxs_per_variant):
+            self._seal_wedge_idxs[(key, vi)] = wedges
         max_bytes = 0
         for _, payload in variants:
             b = self._size_of(payload)

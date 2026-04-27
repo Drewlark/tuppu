@@ -91,8 +91,38 @@ class StmtMixin:
             self._gen_for_tablets(f, iter_val, info)
             return
 
+        if self._is_ivec_value(iter_val.type):
+            elem_ty = self._ivec_elem_for_for(f)
+            if elem_ty is not None:
+                iv_info = self._get_ivec(elem_ty)
+                self._gen_for_ivec(f, iter_val, iv_info)
+                return
+
         raise CodegenError(
             f"for: cannot iterate over value of type {iter_val.type}"
+        )
+
+    def _gen_for_ivec(
+        self, f: A.ForStmt, iv_val: ir.Value, info,
+    ) -> None:
+        """Iterate over an ivec value via the cached `get` helper.
+        Spills the ivec value to a temp alloca so we can pass an
+        address to `get`."""
+        assert self.builder is not None
+        from ._common import IVEC_STRUCT, IVEC_IDX_LEN
+        slot = self._alloca_entry(IVEC_STRUCT, "for.iv")
+        self.builder.store(iv_val, slot)
+        len_addr = self.builder.gep(
+            slot,
+            [ir.Constant(I32, 0), ir.Constant(I32, IVEC_IDX_LEN)],
+            inbounds=True,
+        )
+        length = self.builder.load(len_addr)
+        get_fn = self._get_ivec_get(info)
+        self._emit_counted_loop(
+            length,
+            lambda i: self.builder.call(get_fn, [slot, i]),
+            f,
         )
 
     def _gen_for_str(self, f: A.ForStmt, str_val: ir.Value) -> None:
@@ -505,6 +535,12 @@ class StmtMixin:
             self._cleanup_frames[-1].append(
                 (self._get_tablets_release(info), slot, name),
             )
+            self._register_gc_root(slot, value_ty)
+            return
+        if self._is_ivec_value(value_ty):
+            # ivec has no manual release — GC handles the storage and
+            # per-element heap allocs. We still need to root the slot
+            # so the buf pointer stays reachable across collections.
             self._register_gc_root(slot, value_ty)
             return
         if self._is_str_value(value_ty):
@@ -1203,6 +1239,31 @@ class StmtMixin:
                     inbounds=True,
                 )
                 return slot, parent_ty.element
+            if self._is_ivec_value(parent_ty):
+                # ivec lvalue index — write through get_addr so the
+                # underlying T allocation's address stays stable
+                # (a wedge taken before this assignment still sees
+                # the new value via the same pointer).
+                from ._common import IVEC_IDX_LEN
+                elem_ty = self._ivec_elem_for_index(target)
+                if elem_ty is None:
+                    raise CodegenError(
+                        "lvalue ivec index: missing element type "
+                        "from typecheck sideband"
+                    )
+                iv_info = self._get_ivec(elem_ty)
+                len_addr = self.builder.gep(
+                    parent_ptr,
+                    [ir.Constant(I32, 0), ir.Constant(I32, IVEC_IDX_LEN)],
+                    inbounds=True,
+                )
+                length = self.builder.load(len_addr)
+                self._emit_dynamic_bounds_trap(idx_val, length)
+                slot = self.builder.call(
+                    self._get_ivec_get_addr(iv_info),
+                    [parent_ptr, idx_val],
+                )
+                return slot, elem_ty
             info = self._tablets_info_for(parent_ty)
             if info is None:
                 raise CodegenError(

@@ -13,6 +13,7 @@ from ._common import (
     CodegenError, Variable,
     I1, I8, I16, I32, I64,
     INT_WIDTH, RAT, SEX, SEX_MAX_DIGITS,
+    IVEC_STRUCT,
 )
 
 
@@ -54,7 +55,10 @@ class TypesMixin:
             return self._get_monomorph_struct(t.name, arg_tys)
         if isinstance(t, A.TypeTablets):
             elem = self._lower_type(t.element)
-            return self._get_tablets(t.size, elem).tablets_ty
+            elem_is_wedge = isinstance(t.element, A.TypeHandle)
+            return self._get_tablets(
+                t.size, elem, elem_is_wedge=elem_is_wedge,
+            ).tablets_ty
         if isinstance(t, A.TypeBuffer):
             elem = self._lower_type(t.element)
             return ir.ArrayType(elem, t.size)
@@ -64,7 +68,10 @@ class TypesMixin:
             # is only meaningful at call sites.
             from ..typecheck import VARIADIC_CHUNK_SIZE
             elem = self._lower_type(t.element)
-            return self._get_tablets(VARIADIC_CHUNK_SIZE, elem).tablets_ty
+            elem_is_wedge = isinstance(t.element, A.TypeHandle)
+            return self._get_tablets(
+                VARIADIC_CHUNK_SIZE, elem, elem_is_wedge=elem_is_wedge,
+            ).tablets_ty
         if isinstance(t, A.TypePointer):
             elem = self._lower_type(t.element)
             return elem.as_pointer()
@@ -73,6 +80,15 @@ class TypesMixin:
             # `*T` at the source level but same LLVM representation.
             elem = self._lower_type(t.element)
             return elem.as_pointer()
+        if isinstance(t, A.TypeIVec):
+            # `ivec<T>` — single shared LLVM struct. Pre-register the
+            # per-T helper info so push / get can later look it up
+            # via the elem-ty key. (We retain elem-ty separately
+            # because IVEC_STRUCT loses T at the LLVM level.)
+            elem = self._lower_type(t.element)
+            elem_is_wedge = isinstance(t.element, A.TypeHandle)
+            self._get_ivec(elem, elem_is_wedge=elem_is_wedge)
+            return IVEC_STRUCT
         if isinstance(t, A.TypeFn):
             param_tys = [self._lower_type(p) for p in t.params]
             ret_ty = (
@@ -154,6 +170,10 @@ class TypesMixin:
             self._struct_fields[d.name] = list(
                 zip([n for n, _ in d.fields], field_tys)
             )
+            self._struct_wedge_idxs[d.name] = {
+                i for i, (_n, ftype) in enumerate(d.fields)
+                if isinstance(ftype, A.TypeHandle)
+            }
 
     def _get_monomorph_struct(
         self, name: str, arg_tys: tuple,
@@ -209,6 +229,10 @@ class TypesMixin:
         self._struct_mono_fields[key] = list(
             zip([n for n, _ in decl.fields], field_tys)
         )
+        self._struct_mono_wedge_idxs[key] = {
+            i for i, (_n, ftype) in enumerate(decl.fields)
+            if isinstance(ftype, A.TypeHandle)
+        }
         return ident_ty
 
     def _get_monomorph_fn(
@@ -304,7 +328,7 @@ class TypesMixin:
         paths where we have checker-resolved types, not AST nodes."""
         from ..typecheck import (
             TyInt, TyBool, TyRat, TyDish, TyUnit, TyHandle, TyTablets,
-            TyStruct, TySeal, TyVar,
+            TyIVec, TyStruct, TySeal, TyVar,
         )
         if isinstance(ty, TyVar):
             # Inside a generic fn specialization, a TyVar that survived
@@ -328,7 +352,17 @@ class TypesMixin:
         if isinstance(ty, TyHandle):
             return self._lower_ty(ty.element).as_pointer()
         if isinstance(ty, TyTablets):
-            return self._get_tablets(ty.size, self._lower_ty(ty.element)).tablets_ty
+            elem_is_wedge = isinstance(ty.element, TyHandle)
+            return self._get_tablets(
+                ty.size, self._lower_ty(ty.element),
+                elem_is_wedge=elem_is_wedge,
+            ).tablets_ty
+        if isinstance(ty, TyIVec):
+            elem_is_wedge = isinstance(ty.element, TyHandle)
+            self._get_ivec(
+                self._lower_ty(ty.element), elem_is_wedge=elem_is_wedge,
+            )
+            return IVEC_STRUCT
         if isinstance(ty, TyStruct):
             if ty.args:
                 arg_tys = tuple(self._lower_ty(a) for a in ty.args)
@@ -360,6 +394,19 @@ class TypesMixin:
             if ty is llvm_ty:
                 return self._struct_mono_fields[key]
         return None
+
+    def _struct_wedge_idxs_for(self, llvm_ty: ir.Type) -> set[int]:
+        """Indices of struct fields declared as `wedge T`. Empty set
+        if `llvm_ty` isn't a registered struct or has no wedge fields.
+        Used by the trace fn emitter to route those fields through
+        `__tuppu_gc_mark_wedge`."""
+        for name, ty in self._struct_types.items():
+            if ty is llvm_ty:
+                return self._struct_wedge_idxs.get(name, set())
+        for key, ty in self._struct_monomorphs.items():
+            if ty is llvm_ty:
+                return self._struct_mono_wedge_idxs.get(key, set())
+        return set()
 
     def _coerce(self, value: ir.Value, target_ty: ir.Type) -> ir.Value:
         """Insert a cast instruction if value's type differs from target_ty.
