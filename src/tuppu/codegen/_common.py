@@ -54,25 +54,43 @@ SEX_IDX_RADIX = 1
 SEX_IDX_COUNT = 2
 SEX_IDX_SIGN = 3
 
-# ivec value layout — `{ buf: i8**, len: i64, cap: i64 }`. Shared
-# across every `ivec<T>`; T-specific behavior lives in per-T helper
-# fns (push, get, get_addr). The buffer is a heap-allocated array of
-# pointers (each pointing to a separately heap-allocated T), traced
-# by the runtime's `__tuppu_ivec_storage_desc`. One LLVM type for
-# every ivec means one shared descriptor too — the buffer pointer
-# at offset 0 is always a regular GC-traced pointer.
+# ivec value layout — shared across every `ivec<T>`. Slot storage is
+# a chunk-chain of `Node_<T>_K` (K-element nodes reused from the
+# tablets infrastructure); `buf` is a leaf-byte indexing cache of
+# slot pointers that gives O(1) random access without forcing per-
+# element heap allocation.
+#
+#   { buf: i8**,             // leaf bytes, contents not traced
+#     len: i64,
+#     cap: i64,              // capacity of buf (= slot-pointer slots)
+#     head_node: i8*,        // first chunk; opaque so this struct stays
+#     tail_node: i8*,        // last chunk; T-agnostic at the LLVM level
+#   }
+#
+# head/tail keep the chunk chain alive via the GC's `_type_ptr_offsets`
+# walk; per-T helpers bitcast them to the right Node_T*. The chunks
+# themselves carry their own per-T descriptor (built through tablets'
+# `_get_chunk_type_desc`), so all interior T pointers get traced.
 IVEC_STRUCT = ir.LiteralStructType([
     I8.as_pointer().as_pointer(),  # buf: i8**
     I64,                           # len
     I64,                           # cap
+    I8.as_pointer(),               # head_node
+    I8.as_pointer(),               # tail_node
 ])
 IVEC_IDX_BUF = 0
 IVEC_IDX_LEN = 1
 IVEC_IDX_CAP = 2
+IVEC_IDX_HEAD = 3
+IVEC_IDX_TAIL = 4
 # Initial cap on the first push (0 means "lazy alloc"). Subsequent
 # grows double; chosen as a single allocation rather than a sequence
 # of 1→2→4→8 to keep small ivecs off the GC's small-object pile.
 IVEC_INITIAL_CAP = 8
+# Per-chunk slot count. 64 matches stdlib Vec's default and the cache-
+# friendly tablets sweet spot. With a 256-byte T that's a 16 KiB chunk —
+# one chunk allocation amortizes 64 pushes.
+IVEC_CHUNK_K = 64
 
 # dvec value layout — `{ buf: i8*, len: i64, cap: i64 }`. Like ivec,
 # the LLVM struct is shared across every `dvec<T>`; per-T differences

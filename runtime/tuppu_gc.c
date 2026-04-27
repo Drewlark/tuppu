@@ -353,34 +353,3 @@ size_t __tuppu_gc_data_size(void* p) {
     return hdr->size - HDR_SIZE;
 }
 
-/* ivec storage trace fn. The storage of an `ivec<T>` is a
- * heap-allocated array of `T*` slots — every slot is a pointer to a
- * separately-allocated T. The buffer's header records the total
- * allocation size; `(size - HDR_SIZE) / sizeof(void*)` recovers the
- * cap. We walk every cap slot (calloc-zeroed for unused slots, so
- * unused entries are NULL — mark_ptr's null check makes this a no-op
- * for them).
- *
- * Note we trace `cap` slots rather than `len`, because the buffer
- * doesn't carry `len` (that lives on the parent ivec struct).
- * Tracing past `len` is harmless under the calloc-zero invariant. */
-static void __tuppu_ivec_trace(char* buf) {
-    tuppu_hdr_t* hdr = HDR_OF(buf);
-    size_t n = (hdr->size - HDR_SIZE) / sizeof(void*);
-    void** slots = (void**)buf;
-    for (size_t i = 0; i < n; i++) {
-        mark_ptr(slots[i]);
-    }
-}
-
-/* Static descriptor for ivec storage buffers. Codegen passes this
- * descriptor to `__tuppu_gc_alloc` when allocating or growing the
- * pointer array — the trace fn handles per-cap iteration without
- * needing a per-(T, cap) descriptor at codegen time. */
-const tuppu_type_t __tuppu_ivec_storage_desc = {
-    .name        = "ivec_storage",
-    .size        = 0,             /* variable; runtime reads from header */
-    .n_ptrs      = 0,
-    .ptr_offsets = NULL,
-    .trace       = __tuppu_ivec_trace,
-};

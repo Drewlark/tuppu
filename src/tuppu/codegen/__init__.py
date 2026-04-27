@@ -365,7 +365,10 @@ class Codegen(
         if self._is_str_value(value_ty):
             return [0]
         if self._is_ivec_value(value_ty):
-            return [0]   # buf ptr; len/cap are scalar i64
+            # buf at 0 (leaf bytes — kept alive but not traced through),
+            # head_node at 24, tail_node at 32. The chunks reached
+            # through head/tail trace their own per-T slot contents.
+            return [0, 24, 32]
         if self._is_dvec_value(value_ty):
             return [0]   # buf ptr; len/cap are scalar i64
         info = self._tablets_info_for(value_ty)
