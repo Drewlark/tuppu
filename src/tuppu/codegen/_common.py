@@ -75,18 +75,26 @@ class Variable:
 
 @dataclass
 class TabletsInfo:
-    """Monomorphized helper functions and struct types for one (N, T) pair."""
+    """Monomorphized helper functions and struct types for one (N, T) pair.
+
+    Only `node_ty` / `tablets_ty` / `suffix` get populated eagerly at
+    registration — `_lower_type` needs those to resolve struct and
+    seal fields referring to `tablets[N]T`. Helper fn bodies defer
+    until first call; the chunk descriptor they depend on can't be
+    computed until every struct + seal is fully resolved (an element
+    type that's a seal is opaque during struct-field resolution),
+    and emitting bodies eagerly captures the desc against the wrong
+    size. Use `_get_tablets_push`, `_get_tablets_get`, etc. to
+    materialize them on demand."""
     N: int
     elem_ty: ir.Type
     node_ty: ir.IdentifiedStructType   # {[N x T], used: i64, next: Node*}
     tablets_ty: ir.LiteralStructType   # {head: Node*, tail: Node*, len: i64}
-    push: ir.Function
-    get: ir.Function
-    get_addr: ir.Function
-    release: ir.Function
-    # `clone(src_ptr) -> tablets_ty` — deep-copy. Built lazily on first
-    # use via `_get_tablets_clone` so plain scalar-element tablets that
-    # never get cloned don't pay for the helper.
+    suffix: str
+    push: ir.Function | None = None
+    get: ir.Function | None = None
+    get_addr: ir.Function | None = None
+    release: ir.Function | None = None
     clone: ir.Function | None = None
 
 

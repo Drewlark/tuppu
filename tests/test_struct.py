@@ -692,6 +692,30 @@ def test_wedge_field_assign_through_step_handle(tmp_path):
     assert out == b"1\n"
 
 
+def test_generic_struct_wrapping_tablets_mut_param(tmp_path):
+    # `tablet Vec<T> { storage: tablets[N]T }` with a `mut Vec<T>`
+    # param: the call-site mutability lookup in `_gen_call` has to
+    # key on the monomorphized fn name (`vec_push__i64`), not the
+    # source-level name (`vec_push`), otherwise the struct arg is
+    # evaluated by value and the coercion to Struct* fails.
+    src = (
+        "tablet Vec<T> { storage: tablets[16]T }\n"
+        "fn vec_push<T>(mut v: Vec<T>, x: T) {\n"
+        "  step _ = v.storage.push(x)\n"
+        "}\n"
+        "fn main() -> i32 {\n"
+        "  mut v: Vec<i64>\n"
+        "  vec_push(v, 42)\n"
+        "  vec_push(v, 43)\n"
+        "  println(v.storage[0])\n"
+        "  println(v.storage[1])\n"
+        "  0\n"
+        "}\n"
+    )
+    _, out, _ = run(src, tmp_path)
+    assert out == b"42\n43\n"
+
+
 def test_generic_arity_mismatch_rejected():
     with pytest.raises(CompileError, match="expects 1 type argument"):
         compile_to_ir(

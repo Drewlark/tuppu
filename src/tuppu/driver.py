@@ -94,8 +94,26 @@ def emit_object(ir_text: str, out: Path) -> None:
     out.write_bytes(tm.emit_object(ref))
 
 
+def _runtime_object(build_dir: Path) -> Path:
+    """Compile the bundled GC runtime to an object file, caching the
+    result in `build_dir`. Rebuilt if the source file is newer."""
+    src = Path(__file__).resolve().parents[2] / "runtime" / "tuppu_gc.c"
+    obj = build_dir / "tuppu_gc.o"
+    if obj.exists() and obj.stat().st_mtime >= src.stat().st_mtime:
+        return obj
+    subprocess.run(
+        ["clang", "-c", "-O2", "-Wall", "-o", str(obj), str(src)],
+        check=True,
+    )
+    return obj
+
+
 def link(obj: Path, out: Path) -> None:
-    subprocess.run(["clang", str(obj), "-o", str(out)], check=True)
+    runtime_obj = _runtime_object(obj.parent)
+    subprocess.run(
+        ["clang", str(obj), str(runtime_obj), "-o", str(out)],
+        check=True,
+    )
 
 
 # --- end-to-end entry points ----------------------------------------------

@@ -36,21 +36,26 @@ class TabletsMixin:
             # source — Field/Index/StringLit, or an Ident naming a
             # borrow binding). The three-way split keeps
             # push(fresh_call()) as a single malloc.
+            deferred_slot: ir.Value | None = None
             if self._is_cleanup_bearing_ty(info.elem_ty):
                 if isinstance(arg_expr, A.Ident):
-                    transferred = self._transfer_cleanup_into_container(
-                        arg_expr.name,
+                    # Defer zero so the source slot still reaches the
+                    # element chunks through GC during push's chunk
+                    # allocation. We zero after push returns.
+                    res = self._transfer_cleanup_into_container(
+                        arg_expr.name, defer_zero=True,
                     )
-                    if not transferred:
-                        # Ident with no transferable cleanup = borrow.
+                    if res is False:
                         val = self._deep_clone_if_cleanup_bearing(val)
+                    else:
+                        deferred_slot = res  # type: ignore[assignment]
                 elif self._is_borrow_source_expr(arg_expr):
                     val = self._deep_clone_if_cleanup_bearing(val)
                 # else: fresh-owned rvalue, transfer by default.
-            # Push returns a pointer to the just-written slot — this is
-            # the `tablet T` handle the user sees. Callers in statement
-            # position ignore it.
-            return self.builder.call(info.push, [ptr, val])
+            pushed = self.builder.call(self._get_tablets_push(info), [ptr, val])
+            if deferred_slot is not None:
+                self._zero_transferred_slot(deferred_slot)
+            return pushed
         raise CodegenError(f"tablets has no method {method!r}")
 
     def _gen_tablets_field(self, var: Variable, field_name: str) -> ir.Value:
@@ -100,7 +105,7 @@ class TabletsMixin:
         )
         length = self.builder.load(len_addr)
         self._emit_dynamic_bounds_trap(idx, length)
-        val = self.builder.call(info.get, [t_ptr, idx])
+        val = self.builder.call(self._get_tablets_get(info), [t_ptr, idx])
         # Reads from a container are borrows — the container owns the
         # bytes; the caller gets a view. Neuter cleanup markers so
         # copying the value (into another struct, another container,
@@ -141,40 +146,68 @@ class TabletsMixin:
     # --- tablets (chained-chunk growable storage) -----------------------
 
     def _get_tablets(self, N: int, elem_ty: ir.Type) -> TabletsInfo:
-        """Return (building once, caching thereafter) the struct types and
-        helper functions for tablets[N]T with the given element type."""
+        """Eagerly register (once, cache thereafter) the type half of
+        `tablets[N]T` — `node_ty` and `tablets_ty`. Helper fn bodies
+        (`push`, `get`, `get_addr`, `release`) defer to their
+        accessor methods, which build-and-cache on first use. Called
+        during struct/seal field resolution; at that point a seal
+        element type may still be opaque, so committing to the
+        chunk descriptor (which encodes `sizeof(T)`) would bake in
+        garbage. Lazy helpers dodge that ordering hazard."""
         key = (N, str(elem_ty))
         existing = self._tablets_types.get(key)
         if existing is not None:
             return existing
 
         suffix = f"{elem_ty}_{N}".replace(" ", "_").replace("{", "").replace("}", "")
-        # Use this Codegen's module context so identified types live
-        # with the module (not leak across compilations via the global
-        # LLVM context). Tablets helpers are cached in self._tablets_types
-        # so we only set the body once per (N, elem_ty).
         node_ty = self.module.context.get_identified_type(f"Node_{suffix}")
         if node_ty.is_opaque:
             node_ty.set_body(
-                ir.ArrayType(elem_ty, N),   # items
-                I64,                         # used
-                node_ty.as_pointer(),        # next
+                ir.ArrayType(elem_ty, N),
+                I64,
+                node_ty.as_pointer(),
             )
         tablets_ty = ir.LiteralStructType([
-            node_ty.as_pointer(),        # head
-            node_ty.as_pointer(),        # tail
-            I64,                         # len
+            node_ty.as_pointer(),
+            node_ty.as_pointer(),
+            I64,
         ])
 
         info = TabletsInfo(
-            N=N, elem_ty=elem_ty, node_ty=node_ty, tablets_ty=tablets_ty,
-            push=self._build_tablets_push(N, elem_ty, node_ty, tablets_ty, suffix),
-            get=self._build_tablets_get(N, elem_ty, node_ty, tablets_ty, suffix),
-            get_addr=self._build_tablets_get_addr(N, elem_ty, node_ty, tablets_ty, suffix),
-            release=self._build_tablets_release(N, elem_ty, node_ty, tablets_ty, suffix),
+            N=N, elem_ty=elem_ty,
+            node_ty=node_ty, tablets_ty=tablets_ty,
+            suffix=suffix,
         )
         self._tablets_types[key] = info
         return info
+
+    def _get_tablets_push(self, info: TabletsInfo) -> ir.Function:
+        if info.push is None:
+            info.push = self._build_tablets_push(
+                info.N, info.elem_ty, info.node_ty, info.tablets_ty, info.suffix,
+            )
+        return info.push
+
+    def _get_tablets_get(self, info: TabletsInfo) -> ir.Function:
+        if info.get is None:
+            info.get = self._build_tablets_get(
+                info.N, info.elem_ty, info.node_ty, info.tablets_ty, info.suffix,
+            )
+        return info.get
+
+    def _get_tablets_get_addr(self, info: TabletsInfo) -> ir.Function:
+        if info.get_addr is None:
+            info.get_addr = self._build_tablets_get_addr(
+                info.N, info.elem_ty, info.node_ty, info.tablets_ty, info.suffix,
+            )
+        return info.get_addr
+
+    def _get_tablets_release(self, info: TabletsInfo) -> ir.Function:
+        if info.release is None:
+            info.release = self._build_tablets_release(
+                info.N, info.elem_ty, info.node_ty, info.tablets_ty, info.suffix,
+            )
+        return info.release
 
     def _build_tablets_push(
         self, N: int, elem_ty: ir.Type,
@@ -218,12 +251,19 @@ class TabletsMixin:
         is_full = b.icmp_signed("==", used_existing, ir.Constant(I64, N))
         b.cbranch(is_full, need_new, do_insert)
 
-        # need.new: allocate via malloc, initialize, link into chain.
+        # need.new: allocate a GC-tracked chunk + link into chain.
+        # Chunks go through __tuppu_gc_alloc(size, &chunk_desc) so the
+        # collector can trace through each slot's pointer fields and
+        # the chunk's `next` via the descriptor's ptr_offsets table.
         b.position_at_end(need_new)
         # sizeof(node_ty) via GEP-from-null trick.
         size_ptr = b.gep(null_node, [ONE_I32], inbounds=False)
         node_size = b.ptrtoint(size_ptr, I64)
-        raw = b.call(self._get_malloc(), [node_size])
+        chunk_desc = self._get_chunk_type_desc(N, elem_ty, node_ty)
+        raw = b.call(
+            self._get_gc_alloc_typed(),
+            [node_size, b.bitcast(chunk_desc, I8.as_pointer())],
+        )
         new_node = b.bitcast(raw, node_ty.as_pointer())
         b.store(ir.Constant(I64, 0), b.gep(new_node, [ZERO_I32, ONE_I32], inbounds=True))
         b.store(null_node, b.gep(new_node, [ZERO_I32, TWO_I32], inbounds=True))
@@ -457,19 +497,15 @@ class TabletsMixin:
             return info.clone
         info.clone = self._build_tablets_clone(
             info.N, info.elem_ty, info.node_ty, info.tablets_ty,
-            info.push, info.tablets_ty.elements,  # unused, kept for signature shape
+            self._get_tablets_push(info), info.suffix,
         )
         return info.clone
 
     def _build_tablets_clone(
         self, N: int, elem_ty: ir.Type,
         node_ty: ir.IdentifiedStructType, tablets_ty: ir.LiteralStructType,
-        push: ir.Function, _suffix_elements,
+        push: ir.Function, suffix: str,
     ) -> ir.Function:
-        # Recover the suffix from push's name: "__tuppu_tbls_<suffix>_push".
-        push_name = push.name
-        suffix = push_name[len("__tuppu_tbls_"): -len("_push")]
-
         fn = ir.Function(
             self.module,
             ir.FunctionType(tablets_ty, [tablets_ty.as_pointer()]),
@@ -494,6 +530,36 @@ class TabletsMixin:
         # this fn; we load-and-return it at the end.
         dest_slot = b.alloca(tablets_ty, name="dest")
         b.store(ir.Constant(tablets_ty, None), dest_slot)
+        # Per-iteration spill slot for the cloned element, hoisted
+        # to entry so the loop body reuses one alloca instead of
+        # growing the stack each iteration.
+        elem_desc = self._get_type_desc(elem_ty)
+        elem_spill: ir.Value | None = None
+        if elem_desc is not None:
+            elem_spill = b.alloca(elem_ty, name=".elem.spill")
+        # Helper-fn body emission: isolate from caller's cleanup state
+        # so deep_clone's chokepoint doesn't pollute the caller. Root
+        # dest_slot so accumulated element clones stay reachable if a
+        # later alloc triggers GC. Paired pop emitted at `done`.
+        saved_frames = self._cleanup_frames
+        saved_counts = self._gc_root_counts
+        saved_helper = getattr(self, "_in_helper_emission", False)
+        saved_builder = self.builder
+        self._cleanup_frames = [[]]
+        self._gc_root_counts = [0]
+        self._in_helper_emission = True
+        self.builder = b
+        dest_desc = self._get_type_desc(tablets_ty)
+        dest_pushed = False
+        if dest_desc is not None:
+            b.call(
+                self._get_gc_push_root(),
+                [
+                    b.bitcast(dest_slot, I8.as_pointer()),
+                    b.bitcast(dest_desc, I8.as_pointer()),
+                ],
+            )
+            dest_pushed = True
         head = b.load(b.gep(src_ptr, [ZERO_I32, ZERO_I32], inbounds=True))
         b.branch(chunks)
 
@@ -520,15 +586,30 @@ class TabletsMixin:
             cur_phi, [ZERO_I32, ZERO_I32, i_phi], inbounds=True,
         )
         elem = b.load(slot_ptr)
-        # Save builder so _deep_clone_if_cleanup_bearing sees this
-        # function's context while it emits the clone call.
         saved = self.builder
         self.builder = b
         try:
             cloned = self._deep_clone_if_cleanup_bearing(elem)
         finally:
             self.builder = saved
+        # Protect the cloned element across push's internal chunk
+        # allocation. Without this root, a stress-mode collect fired
+        # inside push would reclaim the freshly cloned bytes before
+        # the dest chunk holds them. Popped immediately after push
+        # returns so the loop-iteration push/pop pair balances.
+        if elem_spill is not None:
+            b.store(cloned, elem_spill)
+            b.call(
+                self._get_gc_push_root(),
+                [
+                    b.bitcast(elem_spill, I8.as_pointer()),
+                    b.bitcast(elem_desc, I8.as_pointer()),
+                ],
+            )
+            cloned = b.load(elem_spill)
         b.call(push, [dest_slot, cloned])
+        if elem_spill is not None:
+            b.call(self._get_gc_pop_roots(), [ir.Constant(I64, 1)])
         i_next = b.add(i_phi, ir.Constant(I64, 1))
         i_phi.add_incoming(i_next, b.block)
         b.branch(slots)
@@ -541,7 +622,13 @@ class TabletsMixin:
         b.branch(chunks)
 
         b.position_at_end(done)
+        if dest_pushed:
+            b.call(self._get_gc_pop_roots(), [ir.Constant(I64, 1)])
         b.ret(b.load(dest_slot))
+        self._cleanup_frames = saved_frames
+        self._gc_root_counts = saved_counts
+        self._in_helper_emission = saved_helper
+        self.builder = saved_builder
         return fn
 
     def _element_release_fn(self, elem_ty: ir.Type) -> "ir.Function | None":

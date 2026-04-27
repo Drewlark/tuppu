@@ -150,6 +150,67 @@ EXPECTED: dict[str, dict] = {
             b"the gods favor this venture\n"
         ),
     },
+    # 1500+ lines of recursive-descent Lua interpreter — exercises
+    # everything heavy: strs interned in seal payloads stored in
+    # tablets-of-structs, mutually recursive ASTs, closures captured
+    # in seals, repeated `run()` calls so cross-call GC integrity
+    # gets stressed. Historically the worst regression magnet in
+    # the project; if a test catches the next GC bug, this one will.
+    "lua_interp.tpu":        {
+        "exit": 0,
+        "stdout": (
+            b"=== Tuppu-hosted Lua interpreter ===\n"
+            b"\n"
+            b"------------------------------------\n"
+            b"> print(1 + 2 * 3)\n"
+            b"---\n"
+            b"7\n"
+            b"------------------------------------\n"
+            b"> print((1 + 2) * 3)\n"
+            b"---\n"
+            b"9\n"
+            b"------------------------------------\n"
+            b"> local x = 5  print(x * 2)\n"
+            b"---\n"
+            b"10\n"
+            b"------------------------------------\n"
+            b"> local s = \"hello, \" .. \"world\"  print(s)\n"
+            b"---\n"
+            b"hello, world\n"
+            b"------------------------------------\n"
+            b"> if 10 > 5 then print(\"big\") else print(\"small\") end\n"
+            b"---\n"
+            b"big\n"
+            b"------------------------------------\n"
+            b"> local i = 1  while i <= 5 do print(i)  i = i + 1 end\n"
+            b"---\n"
+            b"1\n2\n3\n4\n5\n"
+            b"------------------------------------\n"
+            b"> local function sq(x) return x * x end  print(sq(7))\n"
+            b"---\n"
+            b"49\n"
+            b"------------------------------------\n"
+            b"> local function fact(n) if n <= 1 then return 1 else return n * fact(n - 1) end end  print(fact(5))\n"
+            b"---\n"
+            b"120\n"
+            b"------------------------------------\n"
+            b"> local function fib(n) if n < 2 then return n else return fib(n - 1) + fib(n - 2) end end  print(fib(10))\n"
+            b"---\n"
+            b"55\n"
+            b"------------------------------------\n"
+            b"> local function makeAdder(x) return function(y) return x + y end end  local add5 = makeAdder(5)  print(add5(3))  print(add5(100))\n"
+            b"---\n"
+            b"8\n105\n"
+            b"------------------------------------\n"
+            b"> local function apply(f, v) return f(v) end  local function dbl(n) return n * 2 end  print(apply(dbl, 21))\n"
+            b"---\n"
+            b"42\n"
+            b"------------------------------------\n"
+            b"> local function counter() local n = 0  local function step() n = n + 1  return n end  return step end  local c = counter()  print(c())  print(c())  print(c())\n"
+            b"---\n"
+            b"1\n2\n3\n"
+        ),
+    },
 }
 
 

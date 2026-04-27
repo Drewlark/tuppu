@@ -134,27 +134,6 @@ def test_disjoint_field_write_leaves_borrow_live(tmp_path, capsys):
     assert "implicit copy" not in err
 
 
-def test_overlapping_field_write_still_invalidates(tmp_path, capsys):
-    # Writing (src,) DOES overlap borrows at (src,) — effect analysis
-    # flags the conflict; Phase A then inserts the implicit copy.
-    src = (
-        "tablet L { src: str, pos: i64 }\n"
-        "fn replace_src(mut l: L) { l.src = \"new\" + \"!\" }\n"
-        "fn main() -> i32 {\n"
-        "  mut l: L = L { src: \"old\" + \"!\", pos: 0 }\n"
-        "  step s = l.src\n"
-        "  replace_src(l)\n"
-        "  println(s)\n"
-        "  0\n"
-        "}\n"
-    )
-    rc, out = run(src, tmp_path)
-    assert rc == 0
-    assert out == b"old!\n"
-    err = capsys.readouterr().err
-    assert "implicit copy inserted at binding 's'" in err
-
-
 def test_sibling_assign_does_not_invalidate_disjoint_borrow(tmp_path, capsys):
     # Direct field assign: `l.pos = x` should not invalidate a
     # borrow of `l.src`. Tests the path-aware _tc_assign path.
@@ -174,25 +153,6 @@ def test_sibling_assign_does_not_invalidate_disjoint_borrow(tmp_path, capsys):
     assert out == b"hello\n7\n"
     err = capsys.readouterr().err
     assert "implicit copy" not in err
-
-
-def test_same_field_assign_invalidates(tmp_path, capsys):
-    # The path-aware _tc_assign still catches same-field conflicts.
-    src = (
-        "tablet L { src: str, pos: i64 }\n"
-        "fn main() -> i32 {\n"
-        "  mut l: L = L { src: \"old\" + \"!\", pos: 0 }\n"
-        "  step s = l.src\n"
-        "  l.src = \"new\" + \"!\"\n"
-        "  println(s)\n"
-        "  0\n"
-        "}\n"
-    )
-    rc, out = run(src, tmp_path)
-    assert rc == 0
-    assert out == b"old!\n"
-    err = capsys.readouterr().err
-    assert "implicit copy inserted at binding 's'" in err
 
 
 def test_recursive_fn_reaches_fixed_point(tmp_path, capsys):
@@ -354,26 +314,3 @@ def test_writeback_after_scalar_field_write_preserves_bytes(tmp_path, capsys):
     assert out == b"hello_world_here\n1\n"
 
 
-def test_index_write_does_not_invalidate_disjoint_field(tmp_path, capsys):
-    # `store[0] = x` writes `(__index__,)`; a borrow of a different
-    # wedge's field path `(__index__, buf)` overlaps at the index
-    # prefix and IS invalidated. This pins the index-level match.
-    # The complementary case (borrow whose path doesn't share the
-    # __index__ prefix at all) isn't expressible — wedges always
-    # live inside their tablets.
-    src = (
-        "tablet N { buf: str }\n"
-        "fn main() -> i32 {\n"
-        "  mut store: tablets[4]N\n"
-        "  step h = store.push(N { buf: \"hel\" + \"lo\" })\n"
-        "  step b = h.buf\n"
-        "  store[0] = N { buf: \"over\" + \"written\" }\n"
-        "  println(b)\n"
-        "  0\n"
-        "}\n"
-    )
-    rc, out = run(src, tmp_path)
-    assert rc == 0
-    assert out == b"hello\n"
-    err = capsys.readouterr().err
-    assert "implicit copy inserted at binding 'b'" in err

@@ -643,11 +643,10 @@ def test_borrow_step_from_index_push_is_not_mut_reach(tmp_path):
     assert out == b"hi!\n"
 
 
-def test_borrow_rejected_after_index_assign(tmp_path, capsys):
-    # `a[0] = new` DOES free slot 0's old contents (it's cleanup-
-    # bearing). The borrow into a is invalidated — Phase A rewrites
-    # the binding's init to `copy a[0]` and warns, so the program
-    # compiles and prints the original value.
+def test_borrow_survives_index_assign_under_gc(tmp_path, capsys):
+    # `step p = a[0]` reads the str pointer; `a[0] = new` overwrites
+    # the slot. GC keeps the original string alive via p's shadow-
+    # stack root, so p still prints the original value.
     src = (
         "fn main() -> i32 {\n"
         "  mut a: tablets[4]str\n"
@@ -661,8 +660,6 @@ def test_borrow_rejected_after_index_assign(tmp_path, capsys):
     rc, out = run(src, tmp_path)
     assert rc == 0
     assert out == b"hi!\n"
-    err = capsys.readouterr().err
-    assert "implicit copy inserted at binding 'p'" in err
 
 
 def test_push_is_append_only_for_wedge_borrows(tmp_path):
@@ -751,14 +748,10 @@ def test_scalar_field_assign_does_not_invalidate_borrow(tmp_path):
     assert out == b"1\n2\n"
 
 
-def test_wedge_field_extract_implicit_copy_after_index_overwrite(tmp_path, capsys):
-    # Community repro: `step h = store.push(x); step b = h.buf;
-    # store[0] = new_x; use(b)`. Freeze catches via:
-    # - h registered as borrow of store (wedge arena tracking).
-    # - b registered as borrow of store (via h's root).
-    # - a[0] = x invalidates borrows rooted at store.
-    # Phase A: we emit a warning and rewrite `step b = h.buf` to
-    # `step b = copy h.buf`, so the program preserves the original.
+def test_wedge_field_extract_survives_index_overwrite(tmp_path, capsys):
+    # `step h = store.push(x); step b = h.buf; store[0] = new_x;
+    # use(b)`. GC keeps the original buf alive via b's shadow-stack
+    # root even after the slot is overwritten.
     src = (
         "tablet N { buf: str }\n"
         "fn main() -> i32 {\n"
@@ -773,8 +766,6 @@ def test_wedge_field_extract_implicit_copy_after_index_overwrite(tmp_path, capsy
     rc, out = run(src, tmp_path)
     assert rc == 0
     assert out == b"hello\n"
-    err = capsys.readouterr().err
-    assert "implicit copy inserted at binding 'b'" in err
 
 
 def test_match_binder_returned_no_double_free(tmp_path):
@@ -803,11 +794,9 @@ def test_match_binder_returned_no_double_free(tmp_path):
     assert out == b"hello\n"
 
 
-def test_borrow_step_from_field_implicit_copy_after_mut_assign(tmp_path, capsys):
-    # `step s = r.label; r.label = x; use(s)` — the assignment to
-    # r.label frees old bytes. Phase A rewrites the binding init to
-    # `copy r.label` and warns; the program prints the original
-    # value.
+def test_borrow_step_from_field_survives_mut_assign(tmp_path, capsys):
+    # `step s = r.label; r.label = x; use(s)` — GC keeps the first
+    # str alive via s's shadow-stack root.
     src = (
         "tablet Row { label: str }\n"
         "fn main() -> i32 {\n"
@@ -821,8 +810,6 @@ def test_borrow_step_from_field_implicit_copy_after_mut_assign(tmp_path, capsys)
     rc, out = run(src, tmp_path)
     assert rc == 0
     assert out == b"first!\n"
-    err = capsys.readouterr().err
-    assert "implicit copy inserted at binding 's'" in err
 
 
 def test_borrow_used_before_mut_call_fine(tmp_path):
@@ -928,15 +915,11 @@ def test_accumulator_pattern_no_false_positive(tmp_path):
     assert out == b"xxx\n"
 
 
-def test_mut_binding_borrow_chain_implicit_copy(tmp_path, capsys):
-    # Community-reported gap: `mut l: Lex = p.lex` makes l a borrow
-    # of p's bytes. `advance(l)` (mut param) mutates l, which would
-    # write THROUGH to p's bytes. Then `p.lex = l` reads l on the
-    # RHS while l's ultimate root has been mut-reached.
-    #
-    # Phase A: rewrite `mut l: Lex = p.lex` → `mut l: Lex = copy
-    # p.lex` and warn. Now l owns independent bytes; `advance(l)`
-    # mutates the copy; `p.lex = l` is a safe assignment.
+def test_mut_binding_borrow_chain_writeback_safe(tmp_path, capsys):
+    # `mut l: Lex = p.lex; advance(l); p.lex = l` — the classic
+    # writeback pattern. Under GC, no implicit copy is needed: the
+    # assign is just a pointer overwrite, the old bytes stay live
+    # through l's shadow-stack root during the assign.
     src = (
         "tablet Lex { buf: str, pos: i64 }\n"
         "tablet Parser { lex: Lex, depth: i64 }\n"
@@ -957,8 +940,6 @@ def test_mut_binding_borrow_chain_implicit_copy(tmp_path, capsys):
     rc, out = run(src, tmp_path)
     assert rc == 0
     assert out == b"hello\n1\n"
-    err = capsys.readouterr().err
-    assert "implicit copy inserted at binding 'l'" in err
 
 
 def test_mut_binding_copy_opt_out(tmp_path):
@@ -988,10 +969,10 @@ def test_mut_binding_copy_opt_out(tmp_path):
 
 # --- escape analysis -----------------------------------------------
 
-def test_escape_field_return_implicit_copy(tmp_path, capsys):
-    # Returning a Field read of a local struct — struct dies at
-    # fn exit, so a bare borrow would dangle. Phase A rewrites the
-    # tail to `copy r.label` and warns.
+def test_escape_field_return_safe_under_gc(tmp_path, capsys):
+    # Returning a Field read of a local struct. Under GC the returned
+    # pointer keeps the underlying str alive — caller receives a live
+    # reference, no escape hazard.
     src = (
         "tablet Row { label: str }\n"
         "fn leak() -> str {\n"
@@ -1006,8 +987,6 @@ def test_escape_field_return_implicit_copy(tmp_path, capsys):
     rc, out = run(src, tmp_path)
     assert rc == 0
     assert out == b"hello\n"
-    err = capsys.readouterr().err
-    assert "implicit copy inserted on return value" in err
 
 
 def test_match_binder_returned_fresh_copy(tmp_path):
@@ -1095,11 +1074,9 @@ def test_escape_ident_chain_transfer_still_works(tmp_path):
     assert out == b"Uruk\n"
 
 
-def test_implicit_copy_binding_once_per_binding(tmp_path, capsys):
-    # A binding whose init gets rewritten in place should warn
-    # exactly once, even if the binding is read multiple times
-    # after the mut-reach. Later reads see the already-wrapped
-    # init (an A.Copy) and don't rewrap.
+def test_repeated_reads_after_mut_assign_stay_live(tmp_path, capsys):
+    # A binding read multiple times after a mut-reach on its source
+    # — GC keeps the original bytes alive for every read.
     src = (
         "tablet Row { label: str }\n"
         "fn main() -> i32 {\n"
@@ -1114,14 +1091,11 @@ def test_implicit_copy_binding_once_per_binding(tmp_path, capsys):
     rc, out = run(src, tmp_path)
     assert rc == 0
     assert out == b"abc!\nabc!\n"
-    err = capsys.readouterr().err
-    assert err.count("implicit copy inserted at binding 's'") == 1
 
 
-def test_implicit_copy_escape_from_match_arm(tmp_path, capsys):
-    # Escape rewrite reaches into match arms: one arm's tail is a
-    # local Field read that would otherwise dangle. The rewriter
-    # wraps just that arm in `copy`.
+def test_match_arm_local_field_return(tmp_path, capsys):
+    # One arm's tail is a Field read off a local struct. Under GC
+    # the returned pointer keeps the str alive in the caller.
     src = (
         "seal Pick { First, Second }\n"
         "tablet Row { label: str }\n"
@@ -1141,8 +1115,6 @@ def test_implicit_copy_escape_from_match_arm(tmp_path, capsys):
     rc, out = run(src, tmp_path)
     assert rc == 0
     assert out == b"hello\nother\n"
-    err = capsys.readouterr().err
-    assert "implicit copy inserted on return value" in err
 
 
 def test_explicit_copy_suppresses_warning(tmp_path, capsys):
@@ -1165,9 +1137,9 @@ def test_explicit_copy_suppresses_warning(tmp_path, capsys):
     assert "implicit copy" not in err
 
 
-def test_escape_yield_field_implicit_copy(tmp_path, capsys):
-    # Same rule applied to yield — the yielded leaf is rewritten
-    # to `copy r.label` with a warning.
+def test_yield_field_of_local_safe_under_gc(tmp_path, capsys):
+    # Yielding a Field read off a local struct. Under GC the
+    # returned pointer keeps the str alive at caller.
     src = (
         "tablet Row { label: str }\n"
         "fn build(flag: bool) -> str {\n"
@@ -1184,8 +1156,6 @@ def test_escape_yield_field_implicit_copy(tmp_path, capsys):
     rc, out = run(src, tmp_path)
     assert rc == 0
     assert out == b"hello\nfallback\n"
-    err = capsys.readouterr().err
-    assert "implicit copy inserted on return value" in err
 
 
 def test_seal_pure_enum_no_release_fn(tmp_path):
