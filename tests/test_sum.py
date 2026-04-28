@@ -426,6 +426,67 @@ def test_variant_ctor_deep_clones_borrow_str(tmp_path):
     assert out == b"abcd\n"
 
 
+def test_generic_struct_holding_tablets_of_seal_with_str(tmp_path):
+    # Regression for the Map<JValue> shape: pushing a seal-with-str-
+    # payload into a tablets that lives inside a generic struct.
+    # Pre-fix, every read through the generic getter ran the function-
+    # exit cleanup walk, and tablets_release for cleanup-bearing T
+    # called seal_release on every chunk slot — zeroing the tag of
+    # every value the caller still owned. Subsequent reads then saw
+    # tag=0 (VNull). The fix routes borrow-source reads through the
+    # chokepoint with `for_transfer=True` (GC-rooted but no cleanup
+    # entry), and likewise transfers the chokepoint cleanup of a
+    # function's tail return out before frame teardown.
+    src = (
+        "seal V {\n"
+        "  VNull,\n"
+        "  VInt(i64),\n"
+        "  VStr(str),\n"
+        "}\n"
+        "\n"
+        "tablet Box<T> { items: tablets[64]T }\n"
+        "\n"
+        "fn box_push<T>(mut b: Box<T>, x: T) {\n"
+        "  b.items.push(x)\n"
+        "}\n"
+        "\n"
+        "fn box_get<T>(b: Box<T>, i: i64) -> T {\n"
+        "  b.items[i]\n"
+        "}\n"
+        "\n"
+        "fn show(v: V) {\n"
+        "  match v {\n"
+        "    VNull   => println(\"null\"),\n"
+        "    VInt(n) => println(\"int \", n),\n"
+        "    VStr(s) => println(\"str \", s),\n"
+        "  }\n"
+        "}\n"
+        "\n"
+        "fn main() -> i32 {\n"
+        "  mut c: Box<V>\n"
+        "  box_push(c, VInt(10))\n"
+        "  box_push(c, VStr(\"hello\"))\n"
+        "  box_push(c, VInt(20))\n"
+        "  box_push(c, VStr(\"world\"))\n"
+        "  show(box_get(c, 0))\n"
+        "  show(box_get(c, 1))\n"
+        "  show(box_get(c, 2))\n"
+        "  show(box_get(c, 3))\n"
+        "  show(box_get(c, 0))\n"
+        "  0\n"
+        "}\n"
+    )
+    rc, out, _ = run(src, tmp_path)
+    assert rc == 0
+    assert out == (
+        b"int 10\n"
+        b"str hello\n"
+        b"int 20\n"
+        b"str world\n"
+        b"int 10\n"
+    )
+
+
 def test_recursive_seal_via_tablet_wrapper(tmp_path):
     src = (
         "tablet N { e: E }\n"

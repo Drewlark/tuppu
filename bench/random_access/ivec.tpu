@@ -1,0 +1,25 @@
+// Mirror of dvec.tpu — random-access lookups, ivec storage.
+
+fn random_sum(v: ivec<i64>, lookups: i64) -> i64 {
+  mut total: i64 = 0
+  mut idx: i64 = 1
+  mut k: i64 = 0
+  step n: i64 = v.len
+  while k < lookups {
+    total = total + v[idx]
+    idx = (idx * 31 + 17) % n
+    k = k + 1
+  }
+  total
+}
+
+fn main() -> i32 {
+  mut v: ivec<i64>
+  mut i: i64 = 0
+  while i < 1000000 {
+    v.push(i * 7 + 3)
+    i = i + 1
+  }
+  println(random_sum(v, 10000000))
+  0
+}

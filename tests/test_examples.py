@@ -121,6 +121,24 @@ EXPECTED: dict[str, dict] = {
             b"99 not in list\n"
         ),
     },
+    "scribe_ledger.tpu":     {
+        "exit": 0,
+        "stdout": (
+            b"today's offerings (6 total):\n"
+            b"  barley\n"
+            b"  emmer\n"
+            b"  barley\n"
+            b"  sesame\n"
+            b"  emmer\n"
+            b"  barley\n"
+            b"tally:\n"
+            b"  barley = 10\n"
+            b"  emmer = 6\n"
+            b"  sesame = 1\n"
+            b"found barley: true\n"
+            b"found wheat:  false\n"
+        ),
+    },
     "reciprocal_table.tpu":  {
         "exit": 0,
         "stdout": (

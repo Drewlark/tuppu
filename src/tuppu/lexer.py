@@ -43,6 +43,8 @@ class Tok(Enum):
     TABLE = auto()
     TABLETS = auto()
     BUFFER = auto()      # emitted by `buffer` keyword — fixed-size byte buffer
+    IVEC = auto()        # emitted by `ivec` keyword — indirect vector (array of pointers)
+    DVEC = auto()        # emitted by `dvec` keyword — direct vector (contiguous T values)
     RELEASE = auto()
     STRUCT = auto()      # emitted by `tablet` keyword — product type decl
     WEDGE = auto()       # emitted by `wedge` keyword — handle type (tablet ref)
@@ -51,7 +53,9 @@ class Tok(Enum):
     LOST = auto()
     COLOPHON = auto()    # reserved; no semantics yet (see NEXT.md)
     GLOSS = auto()       # emitted by `gloss` keyword — operator overload decl
+    EDUBBA = auto()      # emitted by `edubba` keyword — methods block
     COPY = auto()        # emitted by `copy` keyword — deep-clone prefix op
+    TYPE_ALIAS = auto()  # emitted by `type` keyword — alias decl
 
     # type keywords (value: str — "i64", "bool", etc.)
     TYPE_KW = auto()
@@ -117,6 +121,18 @@ KEYWORDS: dict[str, Tok] = {
     # `buffer[N]T` is a fixed-size, stack-allocated byte buffer, chiefly
     # for FFI. Not a tablets — no chain, no growth, no release.
     "buffer": Tok.BUFFER,
+    # `ivec<T>` is an indirect vector — contiguous heap-allocated array of
+    # pointers to per-element T allocations. O(1) random access (two
+    # loads), pointer-stable T values (resize moves only the pointer
+    # array). Cousin: `dvec<T>` for direct contiguous T storage, better
+    # for primitive T at the cost of pointer-instability.
+    "ivec": Tok.IVEC,
+    # `dvec<T>` is a direct vector — contiguous heap-allocated array of
+    # T values inline. O(1) random access (one load), but T's address
+    # is invalidated by grow (memcpy moves inline T bytes), so push
+    # does not hand back a handle. Pick over ivec for primitive /
+    # small T where the per-element heap allocation is wasteful.
+    "dvec": Tok.DVEC,
     # `wedge T` is a handle into some `tablets[N]T` — cuneiform is
     # "wedge-writing", so a wedge is the atom of a Mesopotamian mark:
     # a single small reference to something larger.
@@ -140,12 +156,24 @@ KEYWORDS: dict[str, Tok] = {
     # for user types, mirroring the ancient scribal practice of
     # writing a gloss above a word to explain its reading.
     "gloss": Tok.GLOSS,
+    # `edubba T<...> { fn ... }` declares a methods block on a tablet.
+    # E2-DUB-BA-A was the Sumerian/Akkadian scribal school — literally
+    # "tablet-house" — where students learned to read, write, and
+    # operate on tablets. Methods on a type are the teachings of its
+    # edubba: a tablet holds the data, the edubba records what you
+    # can do with it. Multiple edubba blocks may be declared on the
+    # same tablet (different scribes, same tablet).
+    "edubba": Tok.EDUBBA,
     # `copy x` deep-clones a cleanup-bearing value into independent
     # ownership. Assyriological use: archival scribes made "copies" of
     # originals. Syntactic escape hatch under the freeze-while-borrow
     # rule — when a borrow would cross a mut-reaching call, `copy`
     # makes the cost visible in source.
     "copy": Tok.COPY,
+    # `type Bytes = buffer[1024]u8` declares a type alias. Aliases are
+    # transparent — the alias name is interchangeable with its target
+    # at every use site, no nominal-type wrapping.
+    "type": Tok.TYPE_ALIAS,
     "true": Tok.TRUE,
     "false": Tok.FALSE,
 }

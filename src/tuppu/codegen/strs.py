@@ -14,7 +14,8 @@ Design:
   memcpies both halves, appends a trailing NUL, returns a heap str.
 - `__tuppu_str_slice(s, lo, hi) -> str` bounds-checks
   `0 <= lo <= hi <= s.len`, copies `hi - lo` bytes into a fresh
-  heap buffer. v0.1 always copies; views would need lifetimes.
+  heap buffer. Always copies; introducing zero-copy slice views
+  would require an explicit lifetime story.
 - `int_to_str` / `rat_to_str` / `bool_to_str` / `sex_to_str` each
   return heap strs. `sex_to_str` mirrors the existing Babylonian
   printer shape so the string form matches what `println(s)`

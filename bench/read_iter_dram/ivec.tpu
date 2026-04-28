@@ -1,0 +1,15 @@
+// Mirror of dvec.tpu — DRAM-bound, ivec storage.
+fn main() -> i32 {
+  mut v: ivec<i64>
+  mut i: i64 = 0
+  while i < 4000000 { v.push(i * 3 + 1) i = i + 1 }
+  mut total: i64 = 0
+  mut k: i64 = 0
+  while k < 50 {
+    mut j: i64 = 0
+    while j < v.len { total = total + v[j] j = j + 1 }
+    k = k + 1
+  }
+  println(total)
+  0
+}

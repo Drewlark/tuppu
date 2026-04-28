@@ -79,7 +79,17 @@ class ExprMixin:
         else:
             raise CodegenError(f"expression not supported yet: {type(e).__name__}")
         if val is not None:
-            self._force_root_cleanup_value(val)
+            # Borrow-source reads (Ident, Field, Index, StringLit) alias
+            # into storage someone else owns — the caller, an enclosing
+            # mut binding, a string literal in `.rodata`. Routing them
+            # through the cleanup-frame would re-walk that storage at
+            # scope exit, and for tablets / structs / seals carrying
+            # cleanup-bearing fields the walk is destructive (it
+            # releases each element, zeroing seal tags through chunks
+            # the caller still owns). Spill+root for GC reachability,
+            # but skip the cleanup entry — `for_transfer=True`.
+            for_transfer = self._is_borrow_source_expr(e)
+            self._force_root_cleanup_value(val, for_transfer=for_transfer)
         return val
 
     def _gen_copy(self, e: A.Copy) -> ir.Value | None:
@@ -268,13 +278,19 @@ class ExprMixin:
             # source's cleanup may run here and free the original
             # bytes. Cloning into a caller-owned value sidesteps both
             # the UAF-via-local-cleanup case and the double-free-via-
-            # container-walk case.
+            # container-walk case. `for_transfer=True` keeps the clone
+            # GC-rooted across the about-to-fire frame cleanups, but
+            # skips registering the clone for that very same release
+            # walk — the caller takes ownership on return, so a local
+            # release would zero the value being handed back.
             if (
                 not self._is_terminated()
                 and tail_val is not None
                 and isinstance(b.tail, (A.Field, A.Index))
             ):
-                tail_val = self._deep_clone_if_cleanup_bearing(tail_val)
+                tail_val = self._deep_clone_if_cleanup_bearing(
+                    tail_val, for_transfer=True,
+                )
             # Emit cleanups for this frame on fall-through (not on early
             # return — yield emits its own chain before the ret).
             if not self._is_terminated():
@@ -389,6 +405,25 @@ class ExprMixin:
             if fname == entry_name:
                 frame.pop(i)
                 return
+
+    def _transfer_cleanup_by_slot(self, slot: ir.Value) -> bool:
+        """Drop the cleanup entry whose spill slot is exactly `slot`,
+        searching from the innermost frame outward. Used to transfer
+        ownership of a chokepoint-rooted value (typically a function's
+        return value) without depending on its position in the frame.
+
+        The slot identity comes from `self._last_rvalue_root_slot`,
+        which `_force_root_cleanup_value` sets at registration time —
+        so this is a tight pairing: the caller knows exactly which
+        cleanup it's removing, regardless of what other entries got
+        added before or after. The associated GC root stays pushed;
+        only the release call is suppressed."""
+        for frame in reversed(self._cleanup_frames):
+            for i, (_fn, ptr, _name) in enumerate(frame):
+                if ptr is slot:
+                    frame.pop(i)
+                    return True
+        return False
 
     def _frame_has_entry(self, name: str) -> bool:
         if not self._cleanup_frames:
@@ -593,6 +628,17 @@ class ExprMixin:
         raise CodegenError(f"unsupported binary op: {op}")
 
     def _gen_call(self, e: A.Call) -> ir.Value | None:
+        # Stdlib method dispatch — `Map<T>` exposes its `map_*` free
+        # functions through method-call syntax. Checked first so the
+        # receiver lowers as an lvalue path (`objs[o].items.set(k, v)`
+        # works without a mut Ident binding).
+        if (
+            isinstance(e.callee, A.Field)
+            and self._checker is not None
+            and id(e) in self._checker.method_dispatch_target
+        ):
+            return self._gen_struct_method_dispatch(e)
+
         # Method call on a tablets receiver — plain Ident or a field
         # chain rooted at one. For the field-chain case (buf.bytes.push)
         # we GEP through the struct to the tablets slot and dispatch on
@@ -609,6 +655,23 @@ class ExprMixin:
                         return self._gen_tablets_method(
                             info, var, e.callee.name, e.args,
                         )
+                    if self._is_ivec_value(var.value_ty):
+                        # ivec method dispatch — recover the per-T
+                        # IVecInfo from the typecheck-resolved element
+                        # type recorded on the call expression.
+                        elem_ty = self._ivec_elem_for_call(e)
+                        if elem_ty is not None:
+                            iv_info = self._get_ivec(elem_ty)
+                            return self._gen_ivec_method(
+                                iv_info, var, e.callee.name, e.args,
+                            )
+                    if self._is_dvec_value(var.value_ty):
+                        elem_ty = self._dvec_elem_for_call(e)
+                        if elem_ty is not None:
+                            dv_info = self._get_dvec(elem_ty)
+                            return self._gen_dvec_method(
+                                dv_info, var, e.callee.name, e.args,
+                            )
             elif isinstance(e.callee.target, A.Field):
                 try:
                     slot_ptr, slot_ty = self._lvalue_slot(e.callee.target)
@@ -623,6 +686,28 @@ class ExprMixin:
                         return self._gen_tablets_method(
                             info, inner, e.callee.name, e.args,
                         )
+                    if self._is_ivec_value(slot_ty):
+                        elem_ty = self._ivec_elem_for_call(e)
+                        if elem_ty is not None:
+                            iv_info = self._get_ivec(elem_ty)
+                            inner = Variable(
+                                is_mut=True, ir_ref=slot_ptr,
+                                value_ty=slot_ty,
+                            )
+                            return self._gen_ivec_method(
+                                iv_info, inner, e.callee.name, e.args,
+                            )
+                    if self._is_dvec_value(slot_ty):
+                        elem_ty = self._dvec_elem_for_call(e)
+                        if elem_ty is not None:
+                            dv_info = self._get_dvec(elem_ty)
+                            inner = Variable(
+                                is_mut=True, ir_ref=slot_ptr,
+                                value_ty=slot_ty,
+                            )
+                            return self._gen_dvec_method(
+                                dv_info, inner, e.callee.name, e.args,
+                            )
 
             # Struct field holding a fn-value: `obj.run(x)` loads the
             # field (a function pointer) and calls through it. Not a
@@ -800,6 +885,82 @@ class ExprMixin:
             param_mut_list = self._fn_param_mut.get(fn.name)
             if param_mut_list is not None and i < len(param_mut_list):
                 param_is_mut = param_mut_list[i]
+            if self._is_str_value(expected_ty):
+                coerced = self._str_as_borrow(coerced)
+            elif (
+                self._struct_fields_for(expected_ty) is not None
+                and self._struct_needs_cleanup(expected_ty)
+            ):
+                if param_is_mut:
+                    coerced = self._struct_as_borrow(coerced, expected_ty)
+            call_args.append(coerced)
+        return self.builder.call(fn, call_args)
+
+    def _gen_struct_method_dispatch(self, e: A.Call) -> ir.Value | None:
+        """Lower a stdlib method call (e.g. `m.set(k, v)` on `Map<T>`)
+        to its underlying free function. The receiver is the first
+        argument; if its corresponding param is mut, we hand over a
+        pointer to its slot (resolved via `_lvalue_slot` so any of
+        Ident / Field / Index lvalue paths work). Non-mut receivers
+        flow through the normal expression path and are passed by
+        value — same as a regular non-mut struct arg.
+        """
+        assert isinstance(e.callee, A.Field)
+        assert self._checker is not None
+        assert self.builder is not None
+        fn_name = self._checker.method_dispatch_target[id(e)]
+        mono_args = self._checker.mono_call_args.get(id(e))
+        if mono_args is not None:
+            arg_tys_llvm = tuple(self._lower_ty(a) for a in mono_args)
+            fn = self._get_monomorph_fn(fn_name, arg_tys_llvm)
+        else:
+            fn = self.functions.get(fn_name)
+        if fn is None:
+            raise CodegenError(
+                f"method dispatch: cannot resolve {fn_name!r}"
+            )
+        param_mut_list = self._fn_param_mut.get(fn.name, ())
+        receiver_is_mut = bool(param_mut_list) and param_mut_list[0]
+        call_args: list[ir.Value] = []
+        receiver_expr = e.callee.target
+        if receiver_is_mut:
+            # Lower the receiver as an lvalue path. This is the whole
+            # point of method dispatch — the receiver may be a Field /
+            # Index / Ident chain, anything `_lvalue_slot` can resolve
+            # to a stable pointer. Free-function calls reject all but
+            # mut-bound Idents; method calls accept the broader set.
+            slot_ptr, slot_ty = self._lvalue_slot(receiver_expr)
+            expected_pointee = fn.args[0].type.pointee
+            if slot_ty != expected_pointee:
+                raise CodegenError(
+                    f"method dispatch: receiver type {slot_ty} does not "
+                    f"match {fn_name!r} param 0 type {expected_pointee}"
+                )
+            call_args.append(slot_ptr)
+        else:
+            v = self._gen_expr(receiver_expr)
+            if v is None:
+                raise CodegenError(
+                    f"method dispatch: receiver of {fn_name!r} has no value"
+                )
+            coerced = self._coerce(v, fn.args[0].type)
+            # Non-mut struct receiver: same neutering rule as regular
+            # non-mut struct args — pass the SSA value as-is. Callee
+            # registers no cleanup, so no double-free risk.
+            call_args.append(coerced)
+        for i, arg in enumerate(e.args, start=1):
+            expected_ty = fn.args[i].type
+            v = self._gen_expr(arg)
+            if v is None:
+                raise CodegenError(
+                    f"method dispatch: arg {i} of {fn_name!r} has no value"
+                )
+            coerced = self._coerce(v, expected_ty)
+            param_is_mut = bool(
+                param_mut_list
+                and i < len(param_mut_list)
+                and param_mut_list[i]
+            )
             if self._is_str_value(expected_ty):
                 coerced = self._str_as_borrow(coerced)
             elif (

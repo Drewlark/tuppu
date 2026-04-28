@@ -3,6 +3,10 @@
 Usage:
     python -m tuppu build file.tpu... [-o output] [--no-stdlib]
     python -m tuppu run   file.tpu... [--no-stdlib]
+    python -m tuppu check file.tpu... [--no-stdlib]
+
+`check` parses + typechecks without emitting IR — fast feedback for
+"did I write valid Tuppu" without paying for codegen + linking.
 
 By default the bundled stdlib (all of <repo>/stdlib/*.tpu) is included in
 the compilation. Pass --no-stdlib to compile user files alone.
@@ -15,8 +19,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-from .driver import compile_files_to_binary, stdlib_files
-from .errors import CompileError
+from .driver import check_files, compile_files_to_binary, stdlib_files
+from .errors import CompileError, format_error
 
 
 def _resolve_inputs(user_files: list[Path], include_stdlib: bool) -> list[Path]:
@@ -32,7 +36,8 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     for name, help_ in [("build", "compile files into a native binary"),
-                        ("run",   "compile and execute immediately")]:
+                        ("run",   "compile and execute immediately"),
+                        ("check", "parse + typecheck only; no IR emission")]:
         s = sub.add_parser(name, help=help_)
         s.add_argument("files", nargs="+", type=Path, help=".tpu source files")
         s.add_argument(
@@ -47,6 +52,17 @@ def main(argv: list[str] | None = None) -> int:
 
     args = p.parse_args(argv)
     files = _resolve_inputs(args.files, include_stdlib=not args.no_stdlib)
+
+    # path -> source text for error rendering. Built lazily in the
+    # except branch so happy-path compiles don't pay for it.
+    def _read_source(path_str: str) -> str | None:
+        for f in files:
+            if str(f) == path_str:
+                try:
+                    return f.read_text()
+                except OSError:
+                    return None
+        return None
 
     try:
         if args.cmd == "build":
@@ -63,8 +79,16 @@ def main(argv: list[str] | None = None) -> int:
             with tempfile.TemporaryDirectory() as td:
                 binary = compile_files_to_binary(files, Path(td), name="a")
                 return subprocess.run([str(binary)]).returncode
+
+        if args.cmd == "check":
+            check_files(files)
+            print(f"tuppu: ok ({len(files)} file{'s' if len(files) != 1 else ''})",
+                  file=sys.stderr)
+            return 0
     except CompileError as e:
-        print(f"tuppu: {e}", file=sys.stderr)
+        path = getattr(e, "path", None)
+        text = _read_source(path) if path else None
+        print(f"tuppu: {format_error(e, text)}", file=sys.stderr)
         return 2
 
     return 1

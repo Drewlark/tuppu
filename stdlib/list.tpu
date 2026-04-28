@@ -8,8 +8,8 @@
 // which auto-releases at scope exit. Lists are therefore arena-
 // lifetimed — all handles die together when the tablets dies.
 //
-// Chunk size is pinned at 16; when we add numeric-generic parameters
-// (v0.2) that can be lifted.
+// Chunk size is pinned at 16. Numeric-generic parameters (so a user
+// can write `tablets[1024]Node<T>`) are pending — see LIMITATIONS.md.
 
 tablet Node<T> {
   value: T,

@@ -46,11 +46,15 @@ class TabletsMixin:
                         arg_expr.name, defer_zero=True,
                     )
                     if res is False:
-                        val = self._deep_clone_if_cleanup_bearing(val)
+                        val = self._deep_clone_if_cleanup_bearing(
+                            val, for_transfer=True,
+                        )
                     else:
                         deferred_slot = res  # type: ignore[assignment]
                 elif self._is_borrow_source_expr(arg_expr):
-                    val = self._deep_clone_if_cleanup_bearing(val)
+                    val = self._deep_clone_if_cleanup_bearing(
+                        val, for_transfer=True,
+                    )
                 # else: fresh-owned rvalue, transfer by default.
             pushed = self.builder.call(self._get_tablets_push(info), [ptr, val])
             if deferred_slot is not None:
@@ -145,7 +149,9 @@ class TabletsMixin:
 
     # --- tablets (chained-chunk growable storage) -----------------------
 
-    def _get_tablets(self, N: int, elem_ty: ir.Type) -> TabletsInfo:
+    def _get_tablets(
+        self, N: int, elem_ty: ir.Type, elem_is_wedge: bool = False,
+    ) -> TabletsInfo:
         """Eagerly register (once, cache thereafter) the type half of
         `tablets[N]T` — `node_ty` and `tablets_ty`. Helper fn bodies
         (`push`, `get`, `get_addr`, `release`) defer to their
@@ -153,13 +159,21 @@ class TabletsMixin:
         during struct/seal field resolution; at that point a seal
         element type may still be opaque, so committing to the
         chunk descriptor (which encodes `sizeof(T)`) would bake in
-        garbage. Lazy helpers dodge that ordering hazard."""
-        key = (N, str(elem_ty))
+        garbage. Lazy helpers dodge that ordering hazard.
+
+        `elem_is_wedge` is True iff the source-level element was
+        `wedge T`. LLVM collapses `wedge T` / `*T` / `T*` to the same
+        pointer type, so the cache key keeps them distinct: a
+        tablets-of-wedge needs chunk slots traced via mark_wedge, a
+        tablets-of-raw-ptr does not."""
+        key = (N, str(elem_ty), elem_is_wedge)
         existing = self._tablets_types.get(key)
         if existing is not None:
             return existing
 
         suffix = f"{elem_ty}_{N}".replace(" ", "_").replace("{", "").replace("}", "")
+        if elem_is_wedge:
+            suffix = f"w_{suffix}"
         node_ty = self.module.context.get_identified_type(f"Node_{suffix}")
         if node_ty.is_opaque:
             node_ty.set_body(
@@ -177,6 +191,7 @@ class TabletsMixin:
             N=N, elem_ty=elem_ty,
             node_ty=node_ty, tablets_ty=tablets_ty,
             suffix=suffix,
+            elem_is_wedge=elem_is_wedge,
         )
         self._tablets_types[key] = info
         return info
@@ -185,6 +200,7 @@ class TabletsMixin:
         if info.push is None:
             info.push = self._build_tablets_push(
                 info.N, info.elem_ty, info.node_ty, info.tablets_ty, info.suffix,
+                elem_is_wedge=info.elem_is_wedge,
             )
         return info.push
 
@@ -212,7 +228,7 @@ class TabletsMixin:
     def _build_tablets_push(
         self, N: int, elem_ty: ir.Type,
         node_ty: ir.IdentifiedStructType, tablets_ty: ir.LiteralStructType,
-        suffix: str,
+        suffix: str, elem_is_wedge: bool = False,
     ) -> ir.Function:
         # Returns a pointer to the just-pushed element slot — this is
         # the `tablet T` handle the user sees from `tablets.push(...)`.
@@ -259,7 +275,9 @@ class TabletsMixin:
         # sizeof(node_ty) via GEP-from-null trick.
         size_ptr = b.gep(null_node, [ONE_I32], inbounds=False)
         node_size = b.ptrtoint(size_ptr, I64)
-        chunk_desc = self._get_chunk_type_desc(N, elem_ty, node_ty)
+        chunk_desc = self._get_chunk_type_desc(
+            N, elem_ty, node_ty, elem_is_wedge=elem_is_wedge,
+        )
         raw = b.call(
             self._get_gc_alloc_typed(),
             [node_size, b.bitcast(chunk_desc, I8.as_pointer())],

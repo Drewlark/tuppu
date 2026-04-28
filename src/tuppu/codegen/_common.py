@@ -54,6 +54,61 @@ SEX_IDX_RADIX = 1
 SEX_IDX_COUNT = 2
 SEX_IDX_SIGN = 3
 
+# ivec value layout — shared across every `ivec<T>`. Slot storage is
+# a chunk-chain of `Node_<T>_K` (K-element nodes reused from the
+# tablets infrastructure); `buf` is a leaf-byte indexing cache of
+# slot pointers that gives O(1) random access without forcing per-
+# element heap allocation.
+#
+#   { buf: i8**,             // leaf bytes, contents not traced
+#     len: i64,
+#     cap: i64,              // capacity of buf (= slot-pointer slots)
+#     head_node: i8*,        // first chunk; opaque so this struct stays
+#     tail_node: i8*,        // last chunk; T-agnostic at the LLVM level
+#   }
+#
+# head/tail keep the chunk chain alive via the GC's `_type_ptr_offsets`
+# walk; per-T helpers bitcast them to the right Node_T*. The chunks
+# themselves carry their own per-T descriptor (built through tablets'
+# `_get_chunk_type_desc`), so all interior T pointers get traced.
+IVEC_STRUCT = ir.LiteralStructType([
+    I8.as_pointer().as_pointer(),  # buf: i8**
+    I64,                           # len
+    I64,                           # cap
+    I8.as_pointer(),               # head_node
+    I8.as_pointer(),               # tail_node
+])
+IVEC_IDX_BUF = 0
+IVEC_IDX_LEN = 1
+IVEC_IDX_CAP = 2
+IVEC_IDX_HEAD = 3
+IVEC_IDX_TAIL = 4
+# Initial cap on the first push (0 means "lazy alloc"). Subsequent
+# grows double; chosen as a single allocation rather than a sequence
+# of 1→2→4→8 to keep small ivecs off the GC's small-object pile.
+IVEC_INITIAL_CAP = 8
+# Per-chunk slot count. 64 matches stdlib Vec's default and the cache-
+# friendly tablets sweet spot. With a 256-byte T that's a 16 KiB chunk —
+# one chunk allocation amortizes 64 pushes.
+IVEC_CHUNK_K = 64
+
+# dvec value layout — `{ buf: i8*, len: i64, cap: i64 }`. Like ivec,
+# the LLVM struct is shared across every `dvec<T>`; per-T differences
+# (slot size, trace logic) live in helper fns and the per-T storage
+# descriptor. Buffer holds T values inline at byte offset
+# `i * sizeof(T)`. Grow path memcpy's the inline T bytes — wedges
+# into individual slots are invalidated.
+DVEC_STRUCT = ir.LiteralStructType([
+    I8.as_pointer(),  # buf: i8* (byte-addressed; we GEP-by-offset
+                      # and bitcast to T* per-slot)
+    I64,              # len
+    I64,              # cap
+])
+DVEC_IDX_BUF = 0
+DVEC_IDX_LEN = 1
+DVEC_IDX_CAP = 2
+DVEC_INITIAL_CAP = 8
+
 INT_WIDTH: dict[str, int] = {
     "i8": 8, "i16": 16, "i32": 32, "i64": 64,
     "u8": 8, "u16": 16, "u32": 32, "u64": 64,
@@ -91,11 +146,52 @@ class TabletsInfo:
     node_ty: ir.IdentifiedStructType   # {[N x T], used: i64, next: Node*}
     tablets_ty: ir.LiteralStructType   # {head: Node*, tail: Node*, len: i64}
     suffix: str
+    # True iff the element type was declared as `wedge T` at the source
+    # level. LLVM types collapse `wedge T` and `*T` to the same `T*`,
+    # so we keep this flag separately to decide whether each chunk slot
+    # should be traced via mark_wedge (interior-pointer lookup, keeps
+    # the source arena alive) or mark_ptr (treat as a regular GC obj
+    # start). Set at `_get_tablets` time from the lowering call site.
+    elem_is_wedge: bool = False
     push: ir.Function | None = None
     get: ir.Function | None = None
     get_addr: ir.Function | None = None
     release: ir.Function | None = None
     clone: ir.Function | None = None
+
+
+@dataclass
+class IVecInfo:
+    """Per-T monomorphized helper fns for `ivec<T>`. The struct LLVM
+    type is shared (`IVEC_STRUCT`); only the helpers vary per element
+    type. Helpers are emitted lazily on first call so a type that
+    never gets indexed / pushed produces zero IR."""
+    elem_ty: ir.Type
+    suffix: str
+    elem_is_wedge: bool = False
+    push: ir.Function | None = None
+    get: ir.Function | None = None
+    get_addr: ir.Function | None = None
+
+
+@dataclass
+class DVecInfo:
+    """Per-T monomorphized helper fns + buffer descriptor for
+    `dvec<T>`. The struct LLVM type is shared (`DVEC_STRUCT`); the
+    buffer's GC type descriptor and trace fn vary per T because the
+    buffer holds inline T values whose layout the GC must walk.
+
+    `desc` is the buffer's `tuppu_type_t` global, holding a per-T
+    trace fn that loops `(allocation_size - HDR_SIZE) / sizeof(T)`
+    slots and recurses through T's standard tracing path."""
+    elem_ty: ir.Type
+    suffix: str
+    elem_is_wedge: bool = False
+    desc: ir.GlobalVariable | None = None
+    trace_fn: ir.Function | None = None
+    push: ir.Function | None = None
+    get: ir.Function | None = None
+    get_addr: ir.Function | None = None
 
 
 # Names that the user cannot shadow — they resolve to compiler intrinsics.

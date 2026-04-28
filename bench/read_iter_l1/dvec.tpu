@@ -1,0 +1,19 @@
+// Read-iter, L1-resident regime.
+// 4k × 8B = 32 KB → fits in L1 cache on a typical core.
+// 50000 iterations to pull total work into ~1s territory.
+// Tests per-element read cost when memory is fast — any dvec/ivec
+// gap here is purely the load-count difference (dvec: 1, ivec: 2).
+fn main() -> i32 {
+  mut v: dvec<i64>
+  mut i: i64 = 0
+  while i < 4000 { v.push(i * 3 + 1) i = i + 1 }
+  mut total: i64 = 0
+  mut k: i64 = 0
+  while k < 50000 {
+    mut j: i64 = 0
+    while j < v.len { total = total + v[j] j = j + 1 }
+    k = k + 1
+  }
+  println(total)
+  0
+}

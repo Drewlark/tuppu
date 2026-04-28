@@ -1,0 +1,3 @@
+# Built bench binaries — names follow the pattern `<variant>_bin`
+# (dvec_bin, ivec_bin, etc.) per bench/run.sh.
+*_bin

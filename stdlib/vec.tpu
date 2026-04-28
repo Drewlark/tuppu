@@ -1,0 +1,80 @@
+// Generic vector — a chunk-chained dynamic array wrapped in a struct
+// so user code can pass it around through `mut Vec<T>` parameters
+// instead of plumbing the bare `tablets[N]T` directly.
+//
+// Storage is a `tablets[CHUNK]T`: each chunk holds CHUNK contiguous
+// slots, and chunks form a singly-linked chain. `push` is amortized
+// O(1) (allocate a new chunk every CHUNK appends), random access via
+// `[]` is O(N/CHUNK), iteration via `for` is sequential O(N). Pointer
+// stability holds — once an element is pushed, its address is stable
+// for the life of the vec, so `wedge T` handles into the storage stay
+// valid across further pushes.
+//
+// CHUNK is 64 here as a cache-friendly default. Lifting CHUNK into a
+// type parameter (so `Vec<T, 16>` and `Vec<T, 1024>` monomorphize
+// independently) needs numeric generics — see LIMITATIONS.md.
+
+tablet Vec<T> { storage: tablets[64]T }
+
+// Append `x` to the end. Returns a wedge into the new slot — the
+// caller can ignore it (write `vec_push(v, x)` as a bare statement)
+// or hold onto it as a stable handle (`step h = vec_push(v, x)`).
+fn vec_push<T>(mut v: Vec<T>, x: T) -> wedge T {
+  v.storage.push(x)
+}
+
+// Length of the vec. O(1).
+fn vec_len<T>(v: Vec<T>) -> i64 {
+  v.storage.len
+}
+
+// Read the i-th element. Aborts if `i` is out of range — same bounds
+// check as bare `tablets[i]`.
+fn vec_get<T>(v: Vec<T>, i: i64) -> T {
+  v.storage[i]
+}
+
+// Overwrite the i-th element in place. Aborts on out-of-range.
+fn vec_set<T>(mut v: Vec<T>, i: i64, x: T) {
+  v.storage[i] = x
+}
+
+// Swap the elements at positions `i` and `j`. No-op when i == j.
+// Used by reverse / sort to shuffle without temporaries on the
+// caller's side.
+fn vec_swap<T>(mut v: Vec<T>, i: i64, j: i64) {
+  if i == j { yield }
+  step a: T = v.storage[i]
+  step b: T = v.storage[j]
+  v.storage[i] = b
+  v.storage[j] = a
+}
+
+// In-place reverse. O(N) swaps, no allocation — exploits indexed write
+// rather than building a fresh vec.
+fn vec_reverse<T>(mut v: Vec<T>) {
+  mut lo: i64 = 0
+  mut hi: i64 = v.storage.len - 1
+  while lo < hi {
+    vec_swap(v, lo, hi)
+    lo += 1
+    hi -= 1
+  }
+}
+
+// Linear search for `x`. Returns the first index whose element is
+// `==` to x, or -1 if absent. T must support `==`; the
+// monomorphization fails otherwise.
+fn vec_find<T>(v: Vec<T>, x: T) -> i64 {
+  mut i: i64 = 0
+  while i < v.storage.len {
+    if v.storage[i] == x { yield i }
+    i += 1
+  }
+  -1
+}
+
+// True iff `v` contains an element `==` to `x`.
+fn vec_contains<T>(v: Vec<T>, x: T) -> bool {
+  vec_find(v, x) >= 0
+}

@@ -51,15 +51,20 @@ def _builtin_decls() -> list[A.Decl]:
 
 def _parse_labeled(sources: list[tuple[str, str]]) -> A.Program:
     """Parse a list of (label, source_text) pairs and merge their top-level
-    decls into one Program. Labels are used only for error-message context.
-    Built-in declarations (e.g. the `str` seal) are prepended automatically."""
+    decls into one Program. Labels are file paths; on lex/parse errors
+    they're attached to the error as `e.path` so the driver can render
+    source context. Type-checker and codegen errors don't currently get
+    the path attached — see LIMITATIONS.md — they fall back to the bare
+    line:col format. Built-in declarations (e.g. the `str` seal) are
+    prepended automatically."""
     decls: list[A.Decl] = list(_builtin_decls())
     # Built-in `str` tablet is auto-prepended above.
     for label, text in sources:
         try:
             prog = parse(lex(text))
         except (LexError, ParseError) as e:
-            raise type(e)(f"{label}: {e.message}", e.line, e.col) from None
+            e.path = label
+            raise
         decls.extend(prog.decls)
     return A.Program(decls=decls)
 
@@ -71,6 +76,22 @@ def compile_sources_to_ir(sources: list[tuple[str, str]]) -> str:
     checker = check(prog)
     _emit_warnings(checker.warnings)
     return str(codegen(prog, checker))
+
+
+def check_sources(sources: list[tuple[str, str]]) -> None:
+    """Parse and typecheck a list of (label, source_text) pairs without
+    emitting IR. Used by `tuppu check` for fast feedback. Raises
+    CompileError on any lex / parse / type problem; prints warnings
+    to stderr otherwise."""
+    prog = _parse_labeled(sources)
+    checker = check(prog)
+    _emit_warnings(checker.warnings)
+
+
+def check_files(paths: list[Path]) -> None:
+    """File-list flavor of check_sources — mirrors compile_files_to_binary."""
+    sources = [(str(p), p.read_text()) for p in paths]
+    check_sources(sources)
 
 
 def _emit_warnings(warnings: list[CompileWarning]) -> None:
@@ -86,6 +107,9 @@ def compile_to_ir(source: str) -> str:
 # --- object and link ------------------------------------------------------
 
 def emit_object(ir_text: str, out: Path) -> None:
+    """Lower Tuppu-emitted LLVM IR to a native object file. No
+    optimization passes run — see GC_REQS.md and LIMITATIONS.md
+    for why."""
     llvm.initialize_native_target()
     llvm.initialize_native_asmprinter()
     ref = llvm.parse_assembly(ir_text)

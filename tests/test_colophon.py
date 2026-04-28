@@ -278,7 +278,8 @@ def test_colophon_fn_return_non_primitive_rejected():
 
 
 def test_colophon_nested_fn_type_rejected():
-    # A callback that itself takes a callback — rejected at v0.1.
+    # A callback that itself takes a callback — rejected (callback
+    # signatures are primitives-only, no nested fn types).
     with pytest.raises(CompileError, match="primitives-only"):
         compile_to_ir(
             'colophon fn nested(cb: fn(fn(i32)) -> i32) -> i32\n'

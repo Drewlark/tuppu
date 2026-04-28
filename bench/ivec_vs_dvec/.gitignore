@@ -1,0 +1,5 @@
+# compiled benchmark binaries — regenerate via run.sh
+ivec_T*
+dvec_T*
+!ivec_T*.tpu
+!dvec_T*.tpu

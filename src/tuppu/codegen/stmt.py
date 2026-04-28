@@ -91,8 +91,65 @@ class StmtMixin:
             self._gen_for_tablets(f, iter_val, info)
             return
 
+        if self._is_ivec_value(iter_val.type):
+            elem_ty = self._ivec_elem_for_for(f)
+            if elem_ty is not None:
+                iv_info = self._get_ivec(elem_ty)
+                self._gen_for_ivec(f, iter_val, iv_info)
+                return
+
+        if self._is_dvec_value(iter_val.type):
+            elem_ty = self._dvec_elem_for_for(f)
+            if elem_ty is not None:
+                dv_info = self._get_dvec(elem_ty)
+                self._gen_for_dvec(f, iter_val, dv_info)
+                return
+
         raise CodegenError(
             f"for: cannot iterate over value of type {iter_val.type}"
+        )
+
+    def _gen_for_ivec(
+        self, f: A.ForStmt, iv_val: ir.Value, info,
+    ) -> None:
+        """Iterate over an ivec value via the cached `get` helper.
+        Spills the ivec value to a temp alloca so we can pass an
+        address to `get`."""
+        assert self.builder is not None
+        from ._common import IVEC_STRUCT, IVEC_IDX_LEN
+        slot = self._alloca_entry(IVEC_STRUCT, "for.iv")
+        self.builder.store(iv_val, slot)
+        len_addr = self.builder.gep(
+            slot,
+            [ir.Constant(I32, 0), ir.Constant(I32, IVEC_IDX_LEN)],
+            inbounds=True,
+        )
+        length = self.builder.load(len_addr)
+        get_fn = self._get_ivec_get(info)
+        self._emit_counted_loop(
+            length,
+            lambda i: self.builder.call(get_fn, [slot, i]),
+            f,
+        )
+
+    def _gen_for_dvec(
+        self, f: A.ForStmt, dv_val: ir.Value, info,
+    ) -> None:
+        assert self.builder is not None
+        from ._common import DVEC_STRUCT, DVEC_IDX_LEN
+        slot = self._alloca_entry(DVEC_STRUCT, "for.dv")
+        self.builder.store(dv_val, slot)
+        len_addr = self.builder.gep(
+            slot,
+            [ir.Constant(I32, 0), ir.Constant(I32, DVEC_IDX_LEN)],
+            inbounds=True,
+        )
+        length = self.builder.load(len_addr)
+        get_fn = self._get_dvec_get(info)
+        self._emit_counted_loop(
+            length,
+            lambda i: self.builder.call(get_fn, [slot, i]),
+            f,
         )
 
     def _gen_for_str(self, f: A.ForStmt, str_val: ir.Value) -> None:
@@ -238,12 +295,15 @@ class StmtMixin:
         if val is None:
             raise CodegenError("yield value diverged")
         coerced = self._coerce(val, ret_ty)
-        coerced = self._neuter_return_if_borrow(coerced, y.value)
-        # Unwind every live cleanup frame (inner-to-outer) before the
-        # ret. The return value has already been captured into `coerced`
-        # so it doesn't matter if the cleanup invalidates heap memory
-        # — escape analysis rejects programs that return handles into
-        # soon-released tablets.
+        # Pre-GC, this site deep-cloned cleanup-bearing Field/Index
+        # returns to dodge UAF: the local source struct would be
+        # released at frame pop, freeing bytes the caller had just
+        # received. Under the current GC that's no longer a hazard —
+        # the returned value's type descriptor (e.g. str.ptr → byte
+        # buffer) keeps the underlying allocation reachable from the
+        # caller's binding. The wedge-handle escape rule is what
+        # still rules out genuinely dangling returns; everything
+        # else just rides the shadow stack.
         self._emit_all_cleanups_for_early_return()
         self.builder.ret(coerced)
 
@@ -263,20 +323,6 @@ class StmtMixin:
             return self._struct_as_borrow(val, val.type)
         return val
 
-    def _neuter_return_if_borrow(
-        self, val: ir.Value, expr: "A.Expr",
-    ) -> ir.Value:
-        """When a fn returns a cleanup-bearing value that the callee
-        doesn't own — a Field read off a struct, an Index into a
-        container, etc. — deep-clone so the caller receives
-        independently-owned bytes. Cloning sidesteps both double-free
-        and UAF risks. Users who want to avoid the alloc can return a
-        wedge / handle instead, or return an Ident of a locally-bound
-        struct (which transfers ownership cleanly)."""
-        if not isinstance(expr, (A.Field, A.Index)):
-            return val
-        return self._deep_clone_if_cleanup_bearing(val)
-
     def _register_gc_root(self, slot: ir.Value, value_ty: ir.Type) -> None:
         """If `value_ty` has traceable pointer fields, emit a
         `__tuppu_gc_push_root(slot, &type_desc)` call at the current
@@ -293,6 +339,29 @@ class StmtMixin:
             while len(self._gc_root_counts) < len(self._cleanup_frames):
                 self._gc_root_counts.append(0)
             self._gc_root_counts[-1] += 1
+
+    def _register_wedge_root(self, slot: ir.Value) -> None:
+        """Push the shared `__tuppu_wedge` descriptor for a wedge slot.
+        Different from `_register_gc_root` because wedge values share
+        one descriptor regardless of element type — `mark_wedge` does
+        the chunk lookup itself — and the LLVM type at the slot is
+        plain `*T` so the standard `_get_type_desc` path returns None.
+        Counts toward the same frame pop tally."""
+        if not self._cleanup_frames:
+            return
+        b = self.builder
+        assert b is not None
+        desc = self._get_wedge_descriptor()
+        b.call(
+            self._get_gc_push_root(),
+            [
+                b.bitcast(slot, I8.as_pointer()),
+                b.bitcast(desc, I8.as_pointer()),
+            ],
+        )
+        while len(self._gc_root_counts) < len(self._cleanup_frames):
+            self._gc_root_counts.append(0)
+        self._gc_root_counts[-1] += 1
 
     def _push_cleanup_frame(self) -> None:
         """Push a fresh cleanup frame + GC-root counter in lockstep."""
@@ -342,7 +411,9 @@ class StmtMixin:
         if total > 0 and self.builder is not None:
             self._emit_gc_pop_roots(total)
 
-    def _deep_clone_if_cleanup_bearing(self, val: ir.Value) -> ir.Value:
+    def _deep_clone_if_cleanup_bearing(
+        self, val: ir.Value, *, for_transfer: bool = False,
+    ) -> ir.Value:
         """Deep-clone `val` if it's a cleanup-bearing type — str, a
         user struct whose fields recursively require cloning, a
         tablets value, or a seal carrying cleanup-bearing payload.
@@ -350,11 +421,22 @@ class StmtMixin:
         happens, the fresh heap bytes are routed through the same
         chokepoint as Call results — spilled to a rooted slot so a
         subsequent allocating op can't reclaim them before the
-        consumer stores or transfers the value."""
+        consumer stores or transfers the value.
+
+        `for_transfer=True` is set by call sites that are about to
+        hand the cloned value off to a long-lived container (a
+        tablets / ivec / dvec push, a seal variant payload, a struct
+        field, an assignment lvalue). The clone is still GC-rooted
+        for the duration of the push (which may allocate and
+        collect), but no cleanup entry is registered in the current
+        frame — the container takes over ownership, so a frame-exit
+        release would double-free what the container holds."""
         assert self.builder is not None
         if self._is_str_value(val.type):
             cloned = self.builder.call(self._get_str_clone(), [val])
-            return self._force_root_cleanup_value(cloned)
+            return self._force_root_cleanup_value(
+                cloned, for_transfer=for_transfer,
+            )
         if (
             self._struct_fields_for(val.type) is not None
             and self._struct_needs_cleanup(val.type)
@@ -362,7 +444,9 @@ class StmtMixin:
             cloned = self.builder.call(
                 self._get_struct_clone(val.type), [val],
             )
-            return self._force_root_cleanup_value(cloned)
+            return self._force_root_cleanup_value(
+                cloned, for_transfer=for_transfer,
+            )
         info = self._tablets_info_for(val.type)
         if info is not None:
             # Tablets clone takes a pointer; spill the SSA to a temp.
@@ -371,7 +455,9 @@ class StmtMixin:
             cloned = self.builder.call(
                 self._get_tablets_clone(info), [src_slot],
             )
-            return self._force_root_cleanup_value(cloned)
+            return self._force_root_cleanup_value(
+                cloned, for_transfer=for_transfer,
+            )
         if (
             self._seal_key_for_ty(val.type) is not None
             and self._seal_needs_cleanup(val.type)
@@ -379,7 +465,9 @@ class StmtMixin:
             cloned = self.builder.call(
                 self._get_seal_clone(val.type), [val],
             )
-            return self._force_root_cleanup_value(cloned)
+            return self._force_root_cleanup_value(
+                cloned, for_transfer=for_transfer,
+            )
         return val
 
     def _emit_all_cleanups_for_early_return(self) -> None:
@@ -393,6 +481,10 @@ class StmtMixin:
         self._emit_all_gc_root_pops_for_early_return()
 
     def _gen_binding(self, b: A.Binding) -> None:
+        is_wedge_binding = (
+            self._checker is not None
+            and id(b) in self._checker.wedge_bindings
+        )
         # Uninitialized mut binding with explicit type: zero-initialize.
         if b.init is None:
             assert b.is_mut and b.type_ann is not None  # parser enforces this
@@ -402,6 +494,8 @@ class StmtMixin:
             self.builder.store(ir.Constant(ty, None), slot)
             self._bind(b.name, Variable(is_mut=True, ir_ref=slot, value_ty=ty))
             self._maybe_register_cleanup(b.name, ty, slot)
+            if is_wedge_binding:
+                self._register_wedge_root(slot)
             return
 
         # Tablets literal as initializer: `_gen_tablets_lit_addr` already
@@ -437,6 +531,8 @@ class StmtMixin:
             self.builder.store(init_val, slot)
             self._bind(b.name, Variable(is_mut=True, ir_ref=slot, value_ty=init_val.type))
             self._maybe_register_cleanup(b.name, init_val.type, slot)
+            if is_wedge_binding:
+                self._register_wedge_root(slot)
         else:
             # Step-bound cleanup-bearing values need a slot so the
             # scope-exit release can see them. Covers the built-in str
@@ -497,6 +593,21 @@ class StmtMixin:
                 is_mut=False, ir_ref=init_val, value_ty=init_val.type,
                 transfer_on_tail=transfer_on_tail,
             ))
+            if is_wedge_binding:
+                # `push_root` needs an addressable slot — the wedge
+                # value above is just an SSA pointer. Spill it into
+                # one and push that as the root. The read path (via
+                # the Variable above) is whatever step's convention is
+                # at the time; this side slot only exists for the GC
+                # to scan. If step bindings later become slot-backed
+                # uniformly, this spill collapses into the binding's
+                # main slot.
+                assert self.builder is not None
+                wedge_slot = self._alloca_entry(
+                    init_val.type, f"{b.name}.wedge_root",
+                )
+                self.builder.store(init_val, wedge_slot)
+                self._register_wedge_root(wedge_slot)
 
     def _maybe_register_cleanup(
         self, name: str, value_ty: ir.Type, slot: ir.Value,
@@ -516,6 +627,18 @@ class StmtMixin:
             self._cleanup_frames[-1].append(
                 (self._get_tablets_release(info), slot, name),
             )
+            self._register_gc_root(slot, value_ty)
+            return
+        if self._is_ivec_value(value_ty):
+            # ivec has no manual release — GC handles the storage and
+            # per-element heap allocs. We still need to root the slot
+            # so the buf pointer stays reachable across collections.
+            self._register_gc_root(slot, value_ty)
+            return
+        if self._is_dvec_value(value_ty):
+            # dvec is the same story as ivec: no release fn, but the
+            # buf pointer needs rooting so the inline T storage stays
+            # reachable across collections.
             self._register_gc_root(slot, value_ty)
             return
         if self._is_str_value(value_ty):
@@ -1030,7 +1153,9 @@ class StmtMixin:
             return f"{name}__{arg_tag}"
         return "anon_seal"
 
-    def _force_root_cleanup_value(self, val: ir.Value) -> ir.Value:
+    def _force_root_cleanup_value(
+        self, val: ir.Value, *, for_transfer: bool = False,
+    ) -> ir.Value:
         """Chokepoint primitive. Unconditionally spill+root a
         cleanup-bearing rvalue — used at PRODUCTION sites (Call /
         Binary str-concat / Copy) so consumers don't need to re-root.
@@ -1042,7 +1167,26 @@ class StmtMixin:
         emission (clone/release/trace) sets `_in_helper_emission`
         so clone results don't pollute the outer caller's cleanup
         frame — the helper roots its own dst slot at entry to keep
-        sequential field clones alive across reallocs."""
+        sequential field clones alive across reallocs.
+
+        `for_transfer=True` is set when the caller is about to hand
+        this value off to a long-lived container in the same
+        statement (a push, a struct field, a seal payload, an
+        assignment). The slot is still GC-rooted so allocations
+        between here and the transfer point can't reclaim it, but
+        no cleanup entry is registered — the container will own the
+        value once the transfer completes, and a frame-exit release
+        would corrupt what the container now holds.
+
+        Side effect: stores the registered cleanup slot (or None if
+        no cleanup was registered) in `self._last_rvalue_root_slot`.
+        `_gen_fn_body` reads this to transfer the return value's
+        cleanup out of the outer frame by slot identity. Always reset
+        on entry so the field reflects ONLY this call's outcome."""
+        # Reset first — any early-return path below leaves the field
+        # at None, so callers see "no cleanup was registered here"
+        # rather than a stale value from an earlier chokepoint.
+        self._last_rvalue_root_slot = None
         if getattr(self, "_in_helper_emission", False):
             return val
         if not self._cleanup_frames:
@@ -1073,10 +1217,11 @@ class StmtMixin:
                 release = self._get_seal_release(val.type)
             else:
                 release = None
-        if release is not None:
+        if release is not None and not for_transfer:
             self._cleanup_frames[-1].append(
                 (release, slot, ".rvalue.root"),
             )
+            self._last_rvalue_root_slot = slot
         self._register_gc_root(slot, val.type)
         return val
 
@@ -1125,9 +1270,13 @@ class StmtMixin:
                     a.value.name,
                 )
                 if not transferred:
-                    coerced = self._deep_clone_if_cleanup_bearing(coerced)
+                    coerced = self._deep_clone_if_cleanup_bearing(
+                        coerced, for_transfer=True,
+                    )
             elif self._is_borrow_source_expr(a.value):
-                coerced = self._deep_clone_if_cleanup_bearing(coerced)
+                coerced = self._deep_clone_if_cleanup_bearing(
+                    coerced, for_transfer=True,
+                )
         self.builder.store(coerced, slot_ptr)
 
     def _lvalue_slot(self, target: A.Expr) -> tuple[ir.Value, ir.Type]:
@@ -1196,48 +1345,85 @@ class StmtMixin:
                 f"tablet has no field {target.name!r}"
             )
         if isinstance(target, A.Index):
-            # lvalue indexing into a mut tablets or buffer: `arr[n] = v`
-            # or `arr[n].field = v`. Resolve the inner binding,
-            # bounds-check the index, and return the slot pointer
-            # (not the loaded value) so Field chains built on top can
-            # GEP through the struct.
-            if not isinstance(target.target, A.Ident):
-                raise CodegenError(
-                    f"lvalue indexing: target must be a mut tablets or "
-                    f"buffer binding, got {type(target.target).__name__}"
-                )
-            var = self._lookup(target.target.name)
-            if not var.is_mut:
-                raise CodegenError(
-                    f"cannot assign into step binding {target.target.name!r}"
-                )
+            # lvalue indexing: `arr[n] = v`, `arr[n].field = v`,
+            # `obj.field[n] = v`, `m.keys[i] = v`, etc. Resolve the
+            # parent (which may itself be a Field / Index chain) to
+            # the pointer-to-container slot, then GEP / call get_addr
+            # on top.
+            parent_ptr, parent_ty = self._lvalue_slot(target.target)
             idx_val = self._gen_expr(target.index)
             if idx_val is None:
                 raise CodegenError("lvalue index has no value")
             idx_val = self._coerce(idx_val, I64)
-            if isinstance(var.value_ty, ir.ArrayType):
-                self._emit_bounds_trap(idx_val, var.value_ty.count)
+            if isinstance(parent_ty, ir.ArrayType):
+                self._emit_bounds_trap(idx_val, parent_ty.count)
                 slot = self.builder.gep(
-                    var.ir_ref,
+                    parent_ptr,
                     [ir.Constant(I32, 0), idx_val],
                     inbounds=True,
                 )
-                return slot, var.value_ty.element
-            info = self._tablets_info_for(var.value_ty)
+                return slot, parent_ty.element
+            if self._is_ivec_value(parent_ty):
+                # ivec lvalue index — write through get_addr so the
+                # underlying T allocation's address stays stable
+                # (a wedge taken before this assignment still sees
+                # the new value via the same pointer).
+                from ._common import IVEC_IDX_LEN
+                elem_ty = self._ivec_elem_for_index(target)
+                if elem_ty is None:
+                    raise CodegenError(
+                        "lvalue ivec index: missing element type "
+                        "from typecheck sideband"
+                    )
+                iv_info = self._get_ivec(elem_ty)
+                len_addr = self.builder.gep(
+                    parent_ptr,
+                    [ir.Constant(I32, 0), ir.Constant(I32, IVEC_IDX_LEN)],
+                    inbounds=True,
+                )
+                length = self.builder.load(len_addr)
+                self._emit_dynamic_bounds_trap(idx_val, length)
+                slot = self.builder.call(
+                    self._get_ivec_get_addr(iv_info),
+                    [parent_ptr, idx_val],
+                )
+                return slot, elem_ty
+            if self._is_dvec_value(parent_ty):
+                from ._common import DVEC_IDX_LEN
+                elem_ty = self._dvec_elem_for_index(target)
+                if elem_ty is None:
+                    raise CodegenError(
+                        "lvalue dvec index: missing element type "
+                        "from typecheck sideband"
+                    )
+                dv_info = self._get_dvec(elem_ty)
+                len_addr = self.builder.gep(
+                    parent_ptr,
+                    [ir.Constant(I32, 0), ir.Constant(I32, DVEC_IDX_LEN)],
+                    inbounds=True,
+                )
+                length = self.builder.load(len_addr)
+                self._emit_dynamic_bounds_trap(idx_val, length)
+                slot = self.builder.call(
+                    self._get_dvec_get_addr(dv_info),
+                    [parent_ptr, idx_val],
+                )
+                return slot, elem_ty
+            info = self._tablets_info_for(parent_ty)
             if info is None:
                 raise CodegenError(
-                    f"lvalue indexing: {target.target.name!r} is not a "
-                    f"tablets or buffer (got {var.value_ty})"
+                    f"lvalue indexing: parent is not a tablets or buffer "
+                    f"(got {parent_ty})"
                 )
             len_addr = self.builder.gep(
-                var.ir_ref,
+                parent_ptr,
                 [ir.Constant(I32, 0), ir.Constant(I32, 2)],
                 inbounds=True,
             )
             length = self.builder.load(len_addr)
             self._emit_dynamic_bounds_trap(idx_val, length)
             slot = self.builder.call(
-                self._get_tablets_get_addr(info), [var.ir_ref, idx_val],
+                self._get_tablets_get_addr(info), [parent_ptr, idx_val],
             )
             return slot, info.elem_ty
         raise CodegenError(

@@ -1,0 +1,18 @@
+tablet Big { x0: i64, x1: i64, x2: i64, x3: i64, x4: i64, x5: i64, x6: i64, x7: i64, x8: i64, x9: i64, x10: i64, x11: i64, x12: i64, x13: i64, x14: i64, x15: i64, x16: i64, x17: i64, x18: i64, x19: i64, x20: i64, x21: i64, x22: i64, x23: i64, x24: i64, x25: i64, x26: i64, x27: i64, x28: i64, x29: i64, x30: i64, x31: i64, x32: i64, x33: i64, x34: i64, x35: i64, x36: i64, x37: i64, x38: i64, x39: i64, x40: i64, x41: i64, x42: i64, x43: i64, x44: i64, x45: i64, x46: i64, x47: i64, x48: i64, x49: i64, x50: i64, x51: i64, x52: i64, x53: i64, x54: i64, x55: i64, x56: i64, x57: i64, x58: i64, x59: i64, x60: i64, x61: i64, x62: i64, x63: i64 }
+
+fn make_big(seed: i64) -> Big {
+  Big { x0: seed + 0, x1: seed + 1, x2: seed + 2, x3: seed + 3, x4: seed + 4, x5: seed + 5, x6: seed + 6, x7: seed + 7, x8: seed + 8, x9: seed + 9, x10: seed + 10, x11: seed + 11, x12: seed + 12, x13: seed + 13, x14: seed + 14, x15: seed + 15, x16: seed + 16, x17: seed + 17, x18: seed + 18, x19: seed + 19, x20: seed + 20, x21: seed + 21, x22: seed + 22, x23: seed + 23, x24: seed + 24, x25: seed + 25, x26: seed + 26, x27: seed + 27, x28: seed + 28, x29: seed + 29, x30: seed + 30, x31: seed + 31, x32: seed + 32, x33: seed + 33, x34: seed + 34, x35: seed + 35, x36: seed + 36, x37: seed + 37, x38: seed + 38, x39: seed + 39, x40: seed + 40, x41: seed + 41, x42: seed + 42, x43: seed + 43, x44: seed + 44, x45: seed + 45, x46: seed + 46, x47: seed + 47, x48: seed + 48, x49: seed + 49, x50: seed + 50, x51: seed + 51, x52: seed + 52, x53: seed + 53, x54: seed + 54, x55: seed + 55, x56: seed + 56, x57: seed + 57, x58: seed + 58, x59: seed + 59, x60: seed + 60, x61: seed + 61, x62: seed + 62, x63: seed + 63 }
+}
+
+fn main() -> i32 {
+  mut v: ivec<Big>
+  mut i: i64 = 0
+  while i < 200000 {
+    v.push(make_big(i))
+    i = i + 1
+  }
+  println(v.len)
+  println(v[0].x0)
+  println(v[199999].x0)
+  0
+}

@@ -135,6 +135,27 @@ class TyBuffer:
     def __str__(self) -> str: return f"buffer[{self.size}]{self.element}"
 
 @dataclass(frozen=True)
+class TyIVec:
+    """`ivec<T>` — indirect vector: contiguous heap-allocated array of
+    pointers to per-element T allocations. Random access is O(1); T
+    values are pointer-stable across grow (only the pointer array
+    moves). Parallel to `tablets[N]T` but with different shape:
+    contiguous instead of chunk-chained, and one heap object per
+    element instead of N-per-chunk."""
+    element: "Ty"
+    def __str__(self) -> str: return f"ivec<{self.element}>"
+
+@dataclass(frozen=True)
+class TyDVec:
+    """`dvec<T>` — direct vector: contiguous heap-allocated array of
+    T values inline. Random access is O(1) (one load). Grow moves T
+    bytes, so wedges into individual elements are invalidated; for
+    that reason push returns unit, unlike ivec/tablets which hand
+    back stable handles."""
+    element: "Ty"
+    def __str__(self) -> str: return f"dvec<{self.element}>"
+
+@dataclass(frozen=True)
 class TyStruct:
     """A user-defined tablet (product) type. Nominally typed — equal
     by name only, with an optional tuple of instantiated type args
@@ -217,6 +238,7 @@ INTRINSIC_NAMES = {
     "int_to_str", "sex_to_str",
     "bytes_to_str", "buffer_to_str",
 }
+
 
 # The fixed set of operator-overload op names users may declare with
 # `gloss <op>(...)`. Each maps to the operator symbol it implements,
@@ -314,6 +336,11 @@ class Checker:
         self.tables: dict[str, TyTable] = {}
         self.structs: dict[str, TyStruct] = {}
         self.struct_fields: dict[str, tuple[tuple[str, Ty], ...]] = {}
+        # Type aliases — `type Bytes = buffer[1024]u8`. Stored as the
+        # raw AST TypeExpr; resolved on demand inside `_resolve_type`
+        # so the alias target can itself reference user structs / seals
+        # / other aliases declared anywhere in the program.
+        self.type_aliases: dict[str, A.TypeExpr] = {}
         # Seals (sum types) — registered alongside structs in phase 0.
         self.seals: dict[str, TySeal] = {}
         self.seal_type_params: dict[str, tuple[str, ...]] = {}
@@ -321,8 +348,9 @@ class Checker:
         # Order is source order so codegen can assign stable tag indices.
         self.seal_variants: dict[str, tuple[tuple[str, tuple[Ty, ...]], ...]] = {}
         # variant_name → (seal_name, variant_index, declared_field_tys).
-        # Variant names are globally unique for v0.1 — ambiguity would
-        # require qualified syntax we haven't designed yet.
+        # Variant names are globally unique because qualified-variant
+        # syntax (`Seal::Variant`) hasn't been designed yet — ambiguity
+        # would force that decision.
         self.variant_lookup: dict[str, tuple[str, int, tuple[Ty, ...]]] = {}
         # Generics: per-tablet type-parameter names, in declaration order.
         self.struct_type_params: dict[str, tuple[str, ...]] = {}
@@ -339,6 +367,35 @@ class Checker:
         # these to know which specialization to emit.
         self.mono_call_args: dict[int, tuple] = {}   # Call node → tuple of Ty
         self.mono_struct_args: dict[int, tuple] = {} # StructLit → tuple of Ty
+        # `ivec<T>` calls need T at codegen; the LLVM struct loses it.
+        # Recorded at typecheck for any method/index/iter on an ivec.
+        self.ivec_elem_at_call: dict[int, "Ty"] = {}     # Call → elem Ty
+        self.ivec_elem_at_index: dict[int, "Ty"] = {}    # Index → elem Ty
+        self.ivec_elem_at_for: dict[int, "Ty"] = {}      # ForStmt → elem Ty
+        # Same shape for `dvec<T>` — different runtime layout but the
+        # codegen still needs T at every call/index/iter site.
+        self.dvec_elem_at_call: dict[int, "Ty"] = {}
+        self.dvec_elem_at_index: dict[int, "Ty"] = {}
+        self.dvec_elem_at_for: dict[int, "Ty"] = {}
+        # Bindings whose resolved type is `wedge T`. Codegen consults
+        # this set to spill the wedge value to a stack slot and push it
+        # as a GC root with a trace fn that calls `mark_wedge` — without
+        # this, a wedge held across allocations whose source ivec /
+        # tablets has gone out of scope can be the only path to its
+        # chunk, and the chunk is silently swept (the LLVM type is just
+        # a plain pointer, so the chokepoint's `_type_desc_key` returns
+        # None and no root push happens).
+        self.wedge_bindings: set[int] = set()
+        # Method-call dispatch: when a tablet exposes operations through
+        # `edubba T<...> { fn ... }`, each method becomes a regular
+        # mangled fn (`<TypeName>__<method>`) and lands in this registry
+        # under its short name. `_tc_method_call` resolves a receiver's
+        # type to its method table, picks the mangled fn name, and
+        # records both the dispatch target on `method_dispatch_target`
+        # and the mono args (if any) on `mono_call_args` so codegen can
+        # emit the call exactly like a regular generic free fn call.
+        self.tablet_methods: dict[str, dict[str, str]] = {}
+        self.method_dispatch_target: dict[int, str] = {}  # Call → fn name
         # Variadic calls: Call node id → synthesized TabletsLit holding
         # the collected trailing arguments. Codegen consults this to
         # emit the literal once for the last param slot.
@@ -369,16 +426,9 @@ class Checker:
         self.scopes: list[dict[str, Ty]] = [{}]
         self.current_fn: str = "<top>"
         self.warnings: list[CompileWarning] = []
-        # Escape tracking: name → True if this binding holds a handle
-        # (or a tablets) whose storage is rooted in a mut tablets
-        # declared inside the current function. Returning such a value
-        # is a use-after-free and gets rejected.
-        self._local_tablets: set[str] = set()
-        self._tainted: dict[str, bool] = {}
-        # Escape analysis: which names in scope are fn parameters
-        # (borrowing their bytes back out is fine — caller owns the
-        # storage). Anything else in scope is locally declared and
-        # cannot escape via return without an explicit `copy`.
+        # Set of fn parameter names in scope. Retained for diagnostic
+        # phrasing in a few error messages; no longer load-bearing for
+        # any escape rule (smart wedges trace through GC instead).
         self._fn_params: set[str] = set()
 
     def _warn(self, message: str, line: int = 0, col: int = 0) -> None:
@@ -387,11 +437,16 @@ class Checker:
     def check(self) -> None:
         # Phase 0a: collect struct + seal names so type bodies can refer
         # to each other and to user types regardless of source order.
+        # Aliases register their target AST eagerly; the target gets
+        # resolved lazily on first use so it can name struct / seal /
+        # alias siblings declared later in the file.
         for d in self.prog.decls:
             if isinstance(d, A.StructDecl):
                 self._register_struct_name(d)
             elif isinstance(d, A.SealDecl):
                 self._register_seal_name(d)
+            elif isinstance(d, A.AliasDecl):
+                self._register_alias(d)
         # Phase 0b: resolve fields (structs) and variants (seals) now
         # that all user type names are in scope.
         for d in self.prog.decls:
@@ -399,6 +454,14 @@ class Checker:
                 self._resolve_struct_fields(d)
             elif isinstance(d, A.SealDecl):
                 self._resolve_seal_variants(d)
+        # Phase 0c: lower edubba blocks to flat FnDecls. By the time we
+        # reach the fn-signature phase, methods need to look like regular
+        # generic fns, so we splice them into `self.prog.decls` here and
+        # populate the method registry. The host tablet must exist (we
+        # validate against `self.structs` collected in 0a). The
+        # EdubbaDecl is dropped — every later phase iterates the new
+        # flat fns directly and never sees the wrapper.
+        self._lower_edubbas()
         # Phase 1: function signatures (parameter and return types can now
         # reference any struct). Colophons declare externs and join the
         # same fn table so call sites resolve uniformly. Gloss decls
@@ -422,6 +485,24 @@ class Checker:
 
     # --- registration ------------------------------------------------
 
+    def _register_alias(self, a: A.AliasDecl) -> None:
+        if a.name in PRIM_TYPES:
+            raise CheckError(
+                f"type alias {a.name!r}: name shadows a built-in type",
+                a.line, a.col,
+            )
+        if a.name in self.structs or a.name in self.seals:
+            raise CheckError(
+                f"type alias {a.name!r}: name collides with an existing "
+                f"tablet or seal",
+                a.line, a.col,
+            )
+        if a.name in self.type_aliases:
+            raise CheckError(
+                f"duplicate type alias {a.name!r}", a.line, a.col,
+            )
+        self.type_aliases[a.name] = a.target
+
     def _register_struct_name(self, s: A.StructDecl) -> None:
         if s.name in PRIM_TYPES:
             raise CheckError(
@@ -431,8 +512,69 @@ class Checker:
             raise CheckError(
                 f"duplicate tablet {s.name!r}", s.line, s.col,
             )
+        if s.name in self.type_aliases:
+            raise CheckError(
+                f"tablet {s.name!r}: name collides with an existing "
+                f"type alias",
+                s.line, s.col,
+            )
         self.structs[s.name] = TyStruct(name=s.name)
         self.struct_type_params[s.name] = tuple(s.type_params)
+
+    def _lower_edubbas(self) -> None:
+        """Splice each `edubba T<...> { fn ... }` block's methods into
+        the program's top-level decl list as flat FnDecls (with type
+        params copied from the host edubba) and register them in
+        `self.tablet_methods`. The EdubbaDecl wrapper is dropped — by
+        the time later phases iterate `self.prog.decls`, methods look
+        like ordinary generic free fns. Validation here:
+        - Host tablet must exist (registered in phase 0a).
+        - Edubba arity matches the tablet's type-param count.
+        - No two methods on the same tablet share a name.
+        - `mut self` is only allowed when the host tablet is itself
+          a struct codegen lowers to a mut-pointer parameter. (All
+          tablets currently qualify; the check is here so a future
+          built-in-only tablet shape gets a clear error.)
+        """
+        new_decls: list[A.Decl] = []
+        for d in self.prog.decls:
+            if not isinstance(d, A.EdubbaDecl):
+                new_decls.append(d)
+                continue
+            if d.type_name not in self.structs:
+                raise CheckError(
+                    f"edubba {d.type_name!r}: no tablet by that name",
+                    d.line, d.col,
+                )
+            host_params = self.struct_type_params.get(d.type_name, ())
+            if len(d.type_params) != len(host_params):
+                raise CheckError(
+                    f"edubba {d.type_name}: type-param arity {len(d.type_params)} "
+                    f"does not match tablet arity {len(host_params)}",
+                    d.line, d.col,
+                )
+            methods = self.tablet_methods.setdefault(d.type_name, {})
+            for m in d.methods:
+                # The parser mangled the method name as `<Type>__<name>`.
+                # Recover the short name for the registry.
+                if not m.name.startswith(f"{d.type_name}__"):
+                    raise CheckError(
+                        f"edubba {d.type_name}: malformed method name "
+                        f"{m.name!r} (compiler bug — parser should have "
+                        f"mangled this)",
+                        m.line, m.col,
+                    )
+                short = m.name[len(d.type_name) + 2:]
+                if short in methods:
+                    raise CheckError(
+                        f"edubba {d.type_name}: duplicate method "
+                        f"{short!r}",
+                        m.line, m.col,
+                    )
+                m.type_params = list(d.type_params)
+                methods[short] = m.name
+                new_decls.append(m)
+        self.prog.decls[:] = new_decls
 
     def _register_seal_name(self, s: A.SealDecl) -> None:
         if s.name in PRIM_TYPES:
@@ -469,7 +611,8 @@ class Checker:
                     raise CheckError(
                         f"variant {v.name!r} is already declared in seal "
                         f"{prev_seal!r}; variant names must be globally "
-                        f"unique in v0.1",
+                        f"unique (qualified-variant syntax is not yet "
+                        f"designed)",
                         v.line, v.col,
                     )
                 field_tys = tuple(
@@ -631,16 +774,15 @@ class Checker:
             # (int, bool, unit); anything else would need marshaling
             # inside the C-invoked callback, which we don't have a
             # story for. Nested fn types (fns returning fns) are
-            # rejected at v0.1.
+            # rejected for the same reason.
             if isinstance(ty, TyFn):
                 if all(is_primitive(p) for p in ty.params) and is_primitive(ty.ret):
                     return
                 raise CheckError(
                     f"colophon {c.name!r}: {where} has type {ty}; "
-                    f"callback signatures are primitives-only (int / "
-                    f"bool / unit) at v0.1 — str / struct / wedge / "
-                    f"nested fn aren't marshalable across a C-invoked "
-                    f"callback",
+                    f"callback signatures must be primitives-only (int / "
+                    f"bool / unit) — str / struct / wedge / nested fn "
+                    f"aren't marshalable across a C-invoked callback",
                     c.line, c.col,
                 )
             raise CheckError(
@@ -836,8 +978,6 @@ class Checker:
     def _check_fn_body(self, fn: A.FnDecl) -> None:
         self.current_fn = fn.name
         self.scopes = [{}]
-        self._local_tablets = set()
-        self._tainted = {}
         self._fn_params = {p.name for p in fn.params}
         # Type params are in scope while we check the body so local
         # bindings with annotations like `mut cur: wedge Node<T>` work.
@@ -865,16 +1005,6 @@ class Checker:
                 f"in fn {fn.name!r}: body produces {body_ty}, expected {expected}",
                 fn.line, fn.col,
             )
-        # Trailing-expression return (no yield): apply escape check.
-        if isinstance(expected, TyHandle) and self._expr_escapes(fn.body):
-            raise CheckError(
-                f"in fn {fn.name!r}: cannot return a wedge handle whose "
-                f"tablets is declared locally — auto-release at scope "
-                f"exit would free the storage while the caller still "
-                f"holds the handle. Take the tablets as a parameter "
-                f"instead.",
-                fn.line, fn.col,
-            )
 
     # --- type resolution --------------------------------------------
 
@@ -886,6 +1016,12 @@ class Checker:
             # in scope as fresh type variables.
             if t.name in self._active_type_vars:
                 return self._active_type_vars[t.name]
+            if t.name in self.type_aliases:
+                # Aliases are transparent: resolve the target in the
+                # alias's stead. Cycles surface as RecursionError —
+                # cheap detection but the user gets a stack trace
+                # rather than a clean diagnostic. Improve later.
+                return self._resolve_type(self.type_aliases[t.name], where)
             if t.name in self.structs:
                 # Using a generic tablet's name without type args is
                 # only valid if the tablet is non-generic.
@@ -945,12 +1081,14 @@ class Checker:
             return TyTablets(size=t.size, element=inner)
         if isinstance(t, A.TypeBuffer):
             inner = self._resolve_type(t.element, f"{where} element")
-            # v0.1 scope: only byte buffers. Narrowing this avoids
-            # committing to a story for struct-element buffers, which
-            # would intersect with ownership in ways we haven't spec'd.
+            # Buffers carry only u8 today. Lifting the restriction needs
+            # an ownership story for struct / heap-bearing element types
+            # inside a stack-lifetime container — we haven't decided
+            # whether to copy on overwrite, forbid overwrite, or treat
+            # the buffer as a borrow window into something else.
             if not (isinstance(inner, TyInt) and inner.width == 8 and not inner.signed):
                 raise CheckError(
-                    f"{where}: buffer element must be u8 in v0.1, got {inner}",
+                    f"{where}: buffer element must be u8, got {inner}",
                     t.line, t.col,
                 )
             return TyBuffer(size=t.size, element=inner)
@@ -963,7 +1101,9 @@ class Checker:
             return TyTablets(size=VARIADIC_CHUNK_SIZE, element=inner)
         if isinstance(t, A.TypeArray):
             raise CheckError(
-                f"{where}: array types are not supported in v0.1",
+                f"{where}: bare array types are not supported — use "
+                f"`tablets[N]T` for a growable arena or `buffer[N]u8` "
+                f"for a stack-lifetime byte buffer",
                 t.line, t.col,
             )
         if isinstance(t, A.TypePointer):
@@ -972,6 +1112,12 @@ class Checker:
         if isinstance(t, A.TypeHandle):
             inner = self._resolve_type(t.element, f"{where} element")
             return TyHandle(element=inner)
+        if isinstance(t, A.TypeIVec):
+            inner = self._resolve_type(t.element, f"{where} element")
+            return TyIVec(element=inner)
+        if isinstance(t, A.TypeDVec):
+            inner = self._resolve_type(t.element, f"{where} element")
+            return TyDVec(element=inner)
         if isinstance(t, A.TypeFn):
             params = tuple(
                 self._resolve_type(p, f"{where} fn-type parameter")
@@ -1048,10 +1194,7 @@ class Checker:
         if b.init is None:
             assert declared is not None  # parser enforces this
             self._bind(b.name, declared, b.line, b.col)
-            if isinstance(declared, TyTablets) and b.is_mut:
-                self._local_tablets.add(b.name)
-            if isinstance(declared, TyHandle):
-                self._tainted[b.name] = False
+            self._maybe_mark_wedge_binding(b, declared)
             return
         init_ty = self._tc_expr(b.init, expected=declared)
         if declared is not None:
@@ -1062,16 +1205,17 @@ class Checker:
                     b.line, b.col,
                 )
             self._bind(b.name, declared, b.line, b.col)
-            final_ty = declared
+            self._maybe_mark_wedge_binding(b, declared)
         else:
             self._bind(b.name, init_ty, b.line, b.col)
-            final_ty = init_ty
-        # Track provenance for handles and locally-declared tablets so
-        # the escape check at function return can reject UAFs.
-        if isinstance(final_ty, TyTablets) and b.is_mut:
-            self._local_tablets.add(b.name)
-        if isinstance(final_ty, TyHandle):
-            self._tainted[b.name] = self._expr_escapes(b.init)
+            self._maybe_mark_wedge_binding(b, init_ty)
+
+    def _maybe_mark_wedge_binding(self, b: A.Binding, ty: Ty) -> None:
+        """If the binding holds a `wedge T` value, record it so codegen
+        emits the GC-root spill. The LLVM lowering loses wedge-ness
+        (just a pointer), so we have to surface it from here."""
+        if isinstance(ty, TyHandle):
+            self.wedge_bindings.add(id(b))
 
     def _tc_assign(self, a: A.Assign) -> None:
         # Type-check the target as an expression: this both validates
@@ -1085,12 +1229,6 @@ class Checker:
                 f"value has type {value_ty}",
                 a.line, a.col,
             )
-        # Taint propagation for mut handle bindings: once tainted,
-        # always tainted (covers the case `head = lib.push(...)` where
-        # `head` later gets returned).
-        if isinstance(target_ty, TyHandle) and isinstance(a.target, A.Ident):
-            if self._expr_escapes(a.value):
-                self._tainted[a.target.name] = True
 
     def _tc_for(self, f: A.ForStmt) -> None:
         # Resolve element type before we look at the body so errors about
@@ -1112,6 +1250,12 @@ class Checker:
             return self.tables[f.iter.name].element
         iter_ty = self._tc_expr(f.iter)
         if isinstance(iter_ty, TyTablets):
+            return iter_ty.element
+        if isinstance(iter_ty, TyIVec):
+            self.ivec_elem_at_for[id(f)] = iter_ty.element
+            return iter_ty.element
+        if isinstance(iter_ty, TyDVec):
+            self.dvec_elem_at_for[id(f)] = iter_ty.element
             return iter_ty.element
         str_ty = self.structs.get("str")
         if str_ty is not None and iter_ty == str_ty:
@@ -1149,66 +1293,6 @@ class Checker:
                 f"returns {expected}",
                 y.line, y.col,
             )
-        if isinstance(expected, TyHandle) and self._expr_escapes(y.value):
-            raise CheckError(
-                f"yield: cannot return a wedge handle whose tablets "
-                f"is declared locally — auto-release at scope exit "
-                f"would free the storage while the caller still holds "
-                f"the handle. Take the tablets as a parameter instead.",
-                y.line, y.col,
-            )
-
-    def _expr_escapes(self, e: A.Expr) -> bool:
-        """Would returning `e` hand the caller a handle into a tablets
-        that the current function owns (and will therefore auto-release
-        before control returns to the caller)?
-
-        Conservative analysis: walk the expression, find its root. If
-        the root is a locally-declared mut tablets (or an already-
-        tainted handle binding), the answer is yes. Parameters and
-        `lost` are safe; calls to other user functions trust the
-        callee's own escape check."""
-        if isinstance(e, A.LostLit):
-            return False
-        if isinstance(e, A.Ident):
-            if e.name in self._local_tablets:
-                return True
-            return self._tainted.get(e.name, False)
-        if isinstance(e, A.Field):
-            return self._expr_escapes(e.target)
-        if isinstance(e, A.Call):
-            # tablets.push(...) — root is the tablets receiver.
-            if (
-                isinstance(e.callee, A.Field)
-                and isinstance(e.callee.target, A.Ident)
-                and e.callee.name == "push"
-            ):
-                return self._expr_escapes(e.callee.target)
-            # Plain function call: trust the callee's own escape check.
-            return False
-        if isinstance(e, A.IfExpr):
-            # Either arm could produce the returned value; taint is
-            # the OR of both (a conservative-but-sound approximation).
-            then_esc = any(
-                self._expr_escapes(s.expr) if isinstance(s, A.ExprStmt) else False
-                for s in [*e.then.stmts, *([A.ExprStmt(expr=e.then.tail)] if e.then.tail else [])]
-            ) if e.then.tail else False
-            if e.then.tail is not None:
-                then_esc = self._expr_escapes(e.then.tail)
-            else:
-                then_esc = False
-            if e.else_ is None:
-                return then_esc
-            if isinstance(e.else_, A.IfExpr):
-                else_esc = self._expr_escapes(e.else_)
-            elif e.else_.tail is not None:
-                else_esc = self._expr_escapes(e.else_.tail)
-            else:
-                else_esc = False
-            return then_esc or else_esc
-        if isinstance(e, A.Block):
-            return self._expr_escapes(e.tail) if e.tail is not None else False
-        return False
 
     def _tc_release(self, r: A.ReleaseStmt) -> None:
         ty = self._lookup(r.name, r.line, r.col)
@@ -1543,6 +1627,10 @@ class Checker:
             return self._occurs_in(var_name, ty.element)
         if isinstance(ty, TyTablets):
             return self._occurs_in(var_name, ty.element)
+        if isinstance(ty, TyIVec):
+            return self._occurs_in(var_name, ty.element)
+        if isinstance(ty, TyDVec):
+            return self._occurs_in(var_name, ty.element)
         if isinstance(ty, TyStruct):
             return any(self._occurs_in(var_name, a) for a in ty.args)
         if isinstance(ty, TySeal):
@@ -1559,6 +1647,12 @@ class Checker:
         if isinstance(ty, TyTablets):
             inner = self._substitute(ty.element, subst)
             return TyTablets(size=ty.size, element=inner)
+        if isinstance(ty, TyIVec):
+            inner = self._substitute(ty.element, subst)
+            return TyIVec(element=inner)
+        if isinstance(ty, TyDVec):
+            inner = self._substitute(ty.element, subst)
+            return TyDVec(element=inner)
         if isinstance(ty, TyStruct) and ty.args:
             new_args = tuple(self._substitute(a, subst) for a in ty.args)
             return TyStruct(name=ty.name, args=new_args)
@@ -1913,6 +2007,83 @@ class Checker:
                 f"tablets has no method {method!r}", e.line, e.col,
             )
 
+        if isinstance(recv_ty, TyIVec):
+            if method == "push":
+                if len(e.args) != 1:
+                    raise CheckError(
+                        "ivec.push takes one argument", e.line, e.col,
+                    )
+                at = self._tc_expr(e.args[0])
+                if not _coerces_to(at, recv_ty.element):
+                    raise CheckError(
+                        f"ivec.push: value has type {at}, "
+                        f"element type is {recv_ty.element}",
+                        e.line, e.col,
+                    )
+                # Record elem-ty for codegen — IVEC_STRUCT loses T at
+                # the LLVM level, so we forward it via sideband.
+                self.ivec_elem_at_call[id(e)] = recv_ty.element
+                # ivec.push allocates a fresh per-element T on the heap
+                # and stores its pointer in the array. Existing element
+                # heap addresses don't move; only the pointer array
+                # might realloc. So push returns nothing useful — unlike
+                # tablets, where the returned wedge points at a stable
+                # arena slot, ivec elements are independently allocated
+                # and the stable address is the returned wedge into the
+                # heap-allocated T. Return a wedge for the same UX.
+                return TyHandle(element=recv_ty.element)
+            raise CheckError(
+                f"ivec has no method {method!r}", e.line, e.col,
+            )
+
+        if isinstance(recv_ty, TyDVec):
+            if method == "push":
+                if len(e.args) != 1:
+                    raise CheckError(
+                        "dvec.push takes one argument", e.line, e.col,
+                    )
+                at = self._tc_expr(e.args[0])
+                if not _coerces_to(at, recv_ty.element):
+                    raise CheckError(
+                        f"dvec.push: value has type {at}, "
+                        f"element type is {recv_ty.element}",
+                        e.line, e.col,
+                    )
+                self.dvec_elem_at_call[id(e)] = recv_ty.element
+                # Unlike ivec / tablets, dvec.push returns unit. Inline
+                # T storage means a grow can memcpy elements to a new
+                # buffer; handing back a wedge to the just-pushed slot
+                # would dangle on the very next push. Users index into
+                # `dv[i]` for read access; that path is freshly
+                # bounds-checked + dereferenced each time.
+                return UNIT
+            raise CheckError(
+                f"dvec has no method {method!r}", e.line, e.col,
+            )
+
+        # Method dispatch on a tablet receiver — `m.set(k, v)` resolves
+        # through `tablet_methods`, populated when the tablet's
+        # `edubba T { ... }` block was lowered. Receiver becomes the
+        # first arg; for mut methods codegen passes the lvalue pointer
+        # so receivers can be Field/Index paths without forcing the
+        # caller to bind to a mut Ident.
+        if (
+            isinstance(recv_ty, TyStruct)
+            and recv_ty.name in self.tablet_methods
+        ):
+            methods = self.tablet_methods[recv_ty.name]
+            if method in methods:
+                return self._tc_struct_method_dispatch(
+                    e, recv_ty, methods[method],
+                )
+            if methods:
+                available = ", ".join(sorted(methods))
+                raise CheckError(
+                    f"{recv_ty.name} has no method {method!r}; "
+                    f"available: {available}",
+                    e.line, e.col,
+                )
+
         # Struct field that happens to be a fn value — `obj.run(x)` is
         # not a method dispatch but a field-access-then-indirect-call.
         # Resolve the field's type via the struct registry; if it's a
@@ -1927,6 +2098,102 @@ class Checker:
             f"method call: {recv_name!r} is {recv_ty}, not a tablets",
             e.line, e.col,
         )
+
+    def _tc_struct_method_dispatch(
+        self, e: A.Call, recv_ty: "TyStruct", fn_name: str,
+    ) -> Ty:
+        """Route a method call on a stdlib tablet to its underlying free
+        function. The receiver was already typechecked by `_tc_method_call`
+        — we re-run the standard generic-fn unification flow here against
+        the synthetic arg list `[receiver, *e.args]`, pinning the
+        type-parameter substitution from the receiver's type up front so
+        callers don't need to spell `T` explicitly.
+
+        Records `mono_call_args[id(e)]` (when the underlying fn is generic)
+        and `method_dispatch_target[id(e)]` so codegen can find the target
+        and decide whether the receiver gets passed by pointer or value."""
+        fn = self.fns.get(fn_name)
+        if fn is None:
+            raise CheckError(
+                f"method dispatch on {recv_ty}: stdlib fn {fn_name!r} "
+                f"is missing — make sure the matching stdlib file is "
+                f"loaded",
+                e.line, e.col,
+            )
+        if len(fn.params) != len(e.args) + 1:
+            raise CheckError(
+                f"{fn_name} expects {len(fn.params) - 1} arg(s) after "
+                f"the receiver, got {len(e.args)}",
+                e.line, e.col,
+            )
+        type_params = self.fn_type_params.get(fn_name, ())
+        inst_names = [f"{fn_name}.{tp}#{id(e)}" for tp in type_params]
+        inst_subst = {
+            tp: TyVar(fresh)
+            for tp, fresh in zip(type_params, inst_names)
+        }
+        subst: dict[str, Ty] = {}
+        # Pin T from the receiver type before typechecking explicit args
+        # so their hints are concrete (e.g. `Map<JValue>.set(k, v)` knows
+        # v should be a JValue, not an open TyVar).
+        receiver_param = self._substitute(fn.params[0], inst_subst)
+        try:
+            self._unify(receiver_param, recv_ty, subst)
+        except _UnifyError as ex:
+            raise CheckError(
+                f"method dispatch: receiver has type {recv_ty}, but "
+                f"{fn_name}'s first param expects {fn.params[0]}"
+                f"{f' ({ex.detail})' if ex.detail else ''}",
+                e.line, e.col,
+            ) from None
+        arg_hints: list[Ty | None] = []
+        for pty in fn.params[1:]:
+            h = self._substitute(self._substitute(pty, inst_subst), subst)
+            arg_hints.append(
+                h if not self._has_open_tyvar(h, inst_names) else None
+            )
+        arg_tys = [
+            self._tc_expr(a, expected=h)
+            for a, h in zip(e.args, arg_hints)
+        ]
+        for i, (at, pty) in enumerate(zip(arg_tys, fn.params[1:]), start=1):
+            freshened = self._substitute(pty, inst_subst)
+            try:
+                self._unify(freshened, at, subst)
+            except _UnifyError as ex:
+                raise CheckError(
+                    f"call to {fn_name!r}: arg {i} has type {at}, "
+                    f"expected {pty}"
+                    f"{f' ({ex.detail})' if ex.detail else ''}",
+                    e.line, e.col,
+                ) from None
+        for i, (at, pty) in enumerate(zip(arg_tys, fn.params[1:]), start=1):
+            inst = self._substitute(self._substitute(pty, inst_subst), subst)
+            if not _coerces_to(at, inst):
+                raise CheckError(
+                    f"call to {fn_name!r}: arg {i} has type {at}, "
+                    f"expected {inst}",
+                    e.line, e.col,
+                )
+        ret = self._substitute(self._substitute(fn.ret, inst_subst), subst)
+        if type_params:
+            missing = [
+                tp for tp, fresh in zip(type_params, inst_names)
+                if fresh not in subst
+            ]
+            if missing:
+                raise CheckError(
+                    f"call to {fn_name!r}: could not infer type "
+                    f"parameter(s) {', '.join(missing)} from receiver "
+                    f"and argument types",
+                    e.line, e.col,
+                )
+            self.mono_call_args[id(e)] = tuple(
+                self._substitute(subst[fresh], subst)
+                for fresh in inst_names
+            )
+        self.method_dispatch_target[id(e)] = fn_name
+        return ret
 
     def _tc_field(self, e: A.Field) -> Ty:
         target_ty = self._tc_expr(e.target)
@@ -1949,6 +2216,20 @@ class Checker:
                 return I64
             raise CheckError(
                 f"tablets has no field {e.name!r}; only len",
+                e.line, e.col,
+            )
+        if isinstance(target_ty, TyIVec):
+            if e.name == "len":
+                return I64
+            raise CheckError(
+                f"ivec has no field {e.name!r}; only len",
+                e.line, e.col,
+            )
+        if isinstance(target_ty, TyDVec):
+            if e.name == "len":
+                return I64
+            raise CheckError(
+                f"dvec has no field {e.name!r}; only len",
                 e.line, e.col,
             )
         if isinstance(target_ty, TyBuffer):
@@ -2105,6 +2386,24 @@ class Checker:
                     e.line, e.col,
                 )
             return target_ty.element
+        if isinstance(target_ty, TyIVec):
+            idx_ty = self._tc_expr(e.index)
+            if not _is_int(idx_ty):
+                raise CheckError(
+                    f"ivec index must be integer, got {idx_ty}",
+                    e.line, e.col,
+                )
+            self.ivec_elem_at_index[id(e)] = target_ty.element
+            return target_ty.element
+        if isinstance(target_ty, TyDVec):
+            idx_ty = self._tc_expr(e.index)
+            if not _is_int(idx_ty):
+                raise CheckError(
+                    f"dvec index must be integer, got {idx_ty}",
+                    e.line, e.col,
+                )
+            self.dvec_elem_at_index[id(e)] = target_ty.element
+            return target_ty.element
         if isinstance(target_ty, TyBuffer):
             idx_ty = self._tc_expr(e.index)
             if not _is_int(idx_ty):
@@ -2150,9 +2449,10 @@ class Checker:
     def _tc_copy(self, e: A.Copy, expected: Ty | None = None) -> Ty:
         """`copy x` has the same type as its operand. At codegen we
         dispatch to `_deep_clone_if_cleanup_bearing`, which is a no-op
-        on scalars/handles/fn-pointers — so `copy` on a plain int is
-        harmless redundancy rather than an error. Future lint could
-        warn, but v0.1 stays permissive."""
+        on scalars / handles / fn-pointers — so `copy` on a plain int
+        is harmless redundancy rather than an error. A future lint
+        could warn on those redundant copies; the type checker stays
+        permissive for now."""
         return self._tc_expr(e.value, expected=expected)
 
     def _tc_cast(self, e: A.Cast) -> Ty:

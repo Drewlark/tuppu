@@ -104,11 +104,16 @@ class Parser:
                 decls.append(self.parse_colophon())
             elif self.check(Tok.GLOSS):
                 decls.append(self.parse_gloss())
+            elif self.check(Tok.EDUBBA):
+                decls.append(self.parse_edubba())
+            elif self.check(Tok.TYPE_ALIAS):
+                decls.append(self.parse_type_alias())
             else:
                 t = self.peek()
                 raise ParseError(
                     f"expected 'fn', 'table', 'tablet', 'seal', 'colophon', "
-                    f"or 'gloss' at top level, got {t.kind.name}",
+                    f"'gloss', 'edubba', or 'type' at top level, got "
+                    f"{t.kind.name}",
                     t.line, t.col,
                 )
             self.skip_newlines()
@@ -136,6 +141,111 @@ class Parser:
         body = self.parse_block()
         return _at(start, A.GlossDecl(
             op=op, params=params, return_type=return_type, body=body,
+        ))
+
+    def parse_edubba(self) -> A.EdubbaDecl:
+        """`edubba T<...> { fn ... fn ... }` — methods block on a
+        tablet. Each method's first param is implicit `self` or
+        `mut self` (no type annotation; the receiver type is the
+        block's `T<...>` filled in here). The synthesized `Param` is
+        prepended so the rest of the compiler sees a perfectly normal
+        generic fn with a struct first param. Method names are mangled
+        as `<TypeName>__<method>` to keep the user-visible global fn
+        namespace clean — the typecheck registry exposes them through
+        method-call syntax only."""
+        start = self.eat(Tok.EDUBBA)
+        type_name = self.eat(Tok.IDENT, "tablet name after 'edubba'").value
+        type_params = self.parse_type_params()
+        # Build the receiver type expression once — every method param
+        # references it. For non-generic tablets we emit a TypeName;
+        # generic ones get a TypeApply with TypeName children.
+        if type_params:
+            receiver_ty: A.TypeExpr = A.TypeApply(
+                name=type_name,
+                args=[A.TypeName(name=tp) for tp in type_params],
+            )
+        else:
+            receiver_ty = A.TypeName(name=type_name)
+        self.eat(Tok.LBRACE)
+        methods: list[A.FnDecl] = []
+        self.skip_newlines()
+        while not self.check(Tok.RBRACE):
+            if not self.check(Tok.FN):
+                t = self.peek()
+                raise ParseError(
+                    f"expected 'fn' inside edubba block, got {t.kind.name}",
+                    t.line, t.col,
+                )
+            method = self._parse_edubba_method(type_name, receiver_ty)
+            methods.append(method)
+            self.skip_newlines()
+        self.eat(Tok.RBRACE)
+        return _at(start, A.EdubbaDecl(
+            type_name=type_name,
+            type_params=type_params,
+            methods=methods,
+        ))
+
+    def _parse_edubba_method(
+        self, type_name: str, receiver_ty: "A.TypeExpr",
+    ) -> A.FnDecl:
+        """Parse one fn inside an edubba block. The first param must be
+        `self` or `mut self` (no explicit type) — we synthesize the
+        Param here and prepend it. The fn name is mangled with the
+        host tablet so two tablets can each have a `len` without
+        clashing in the global symbol table."""
+        start = self.eat(Tok.FN)
+        method_name = self.eat(Tok.IDENT, "method name").value
+        # Methods do not get their own type-param list — they inherit
+        # the host edubba's. Disallow `<...>` to avoid silent confusion.
+        if self.check(Tok.LT):
+            t = self.peek()
+            raise ParseError(
+                "edubba methods inherit the block's type parameters; "
+                "drop the per-method `<...>` list",
+                t.line, t.col,
+            )
+        self.eat(Tok.LPAREN)
+        # First arg must be `self` or `mut self`.
+        self_start = self.peek()
+        is_mut_self = False
+        if self.check(Tok.MUT):
+            self.advance()
+            is_mut_self = True
+        sname_tok = self.eat(Tok.IDENT, "'self' as receiver")
+        if sname_tok.value != "self":
+            raise ParseError(
+                f"edubba method receiver must be named 'self', got "
+                f"{sname_tok.value!r}",
+                sname_tok.line, sname_tok.col,
+            )
+        # Disallow an explicit type annotation — receiver is implicit.
+        if self.check(Tok.COLON):
+            t = self.peek()
+            raise ParseError(
+                "edubba method receiver carries no type annotation — "
+                "`self` is the host tablet",
+                t.line, t.col,
+            )
+        self_param = _at(self_start, A.Param(
+            name="self", type=receiver_ty, is_mut=is_mut_self,
+        ))
+        params: list[A.Param] = [self_param]
+        while self.check(Tok.COMMA):
+            self.advance()
+            params.append(self.parse_param())
+        self.eat(Tok.RPAREN)
+        return_type: A.TypeExpr | None = None
+        if self.check(Tok.ARROW):
+            self.advance()
+            return_type = self.parse_type()
+        body = self.parse_block()
+        return _at(start, A.FnDecl(
+            name=f"{type_name}__{method_name}",
+            params=params,
+            return_type=return_type,
+            body=body,
+            type_params=[],  # filled in at lowering from the host edubba
         ))
 
     def parse_colophon(self) -> A.ColophonDecl:
@@ -210,6 +320,17 @@ class Parser:
         self.eat(Tok.COLON)
         ty = self.parse_type()
         return _at(start, A.Param(name=name, type=ty, is_mut=is_mut))
+
+    def parse_type_alias(self) -> A.AliasDecl:
+        """`type Name = TypeExpr` — declares a transparent alias.
+        No type-parameter list yet (would need first-class tuples /
+        higher-kinded handling for the common cases users actually
+        want)."""
+        start = self.eat(Tok.TYPE_ALIAS)
+        name = self.eat(Tok.IDENT, "alias name").value
+        self.eat(Tok.EQ)
+        target = self.parse_type()
+        return _at(start, A.AliasDecl(name=name, target=target))
 
     def parse_struct_decl(self) -> A.StructDecl:
         start = self.eat(Tok.STRUCT)
@@ -377,6 +498,25 @@ class Parser:
             self.advance()
             element = self.parse_type()
             return _at(t, A.TypeHandle(element=element))
+        if t.kind is Tok.IVEC:
+            # `ivec<T>` — indirect vector: contiguous heap-allocated
+            # array of pointers, each pointing to a separately-allocated
+            # T. O(1) random access; T values are pointer-stable across
+            # resize.
+            self.advance()
+            self.eat(Tok.LT)
+            element = self.parse_type()
+            self.eat(Tok.GT)
+            return _at(t, A.TypeIVec(element=element))
+        if t.kind is Tok.DVEC:
+            # `dvec<T>` — direct vector: contiguous heap-allocated
+            # array of T values inline. O(1) random access (one load),
+            # but grow invalidates T addresses, so push returns unit.
+            self.advance()
+            self.eat(Tok.LT)
+            element = self.parse_type()
+            self.eat(Tok.GT)
+            return _at(t, A.TypeDVec(element=element))
         if t.kind is Tok.LBRACKET:
             self.advance()
             size = self.eat(Tok.INT, "array size (integer)").value
@@ -452,20 +592,18 @@ class Parser:
         return _at(t, A.ExprStmt(expr=expr))
 
     def _check_lvalue(self, expr: A.Expr, start) -> None:
-        """An assignment target must be an Ident, a `.`-chain of Field
-        accesses, or one rooted at a tablets index (`arr[n].field = v`).
-        The index case terminates the walk at the Index node; codegen's
-        `_lvalue_slot` resolves the target mut binding and does the
-        runtime bounds check."""
+        """An assignment target must be a chain of `.`-field and `[]`-
+        index access steps rooted at an Ident. `r.field = v`,
+        `arr[n] = v`, `arr[n].field = v`, `m.values[idx] = v` — all
+        legal. Codegen's `_lvalue_slot` walks the same chain to GEP
+        the slot pointer + emit bounds checks."""
         node = expr
-        while isinstance(node, A.Field):
+        while isinstance(node, (A.Field, A.Index)):
             node = node.target
-        if isinstance(node, A.Index) and isinstance(node.target, A.Ident):
-            return
         if not isinstance(node, A.Ident):
             raise ParseError(
-                "assignment target must be a variable, a `.`-chain "
-                "of fields, or an indexed tablet element",
+                "assignment target must be a variable or a chain of "
+                "field / index accesses rooted at one",
                 start.line, start.col,
             )
 

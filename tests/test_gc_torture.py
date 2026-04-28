@@ -54,7 +54,7 @@ tablet Tree { label: str, left: wedge Tree, right: wedge Tree }
 fn inorder(t: wedge Tree, mut out: tablets[64]str) {
   if t == lost { yield }
   inorder(t.left, out)
-  step _push = out.push(copy t.label)
+  out.push(copy t.label)
   inorder(t.right, out)
 }
 
@@ -123,13 +123,13 @@ fn main() -> i32 {
   mut groups: tablets[4]tablets[4]tablets[4]str
   mut g1: tablets[4]tablets[4]str
   mut row1: tablets[4]str
-  step _a = row1.push("alpha")
-  step _b = row1.push("beta")
-  step _r1 = g1.push(row1)
+  row1.push("alpha")
+  row1.push("beta")
+  g1.push(row1)
   mut row2: tablets[4]str
-  step _c = row2.push("gamma")
-  step _r2 = g1.push(row2)
-  step _g = groups.push(g1)
+  row2.push("gamma")
+  g1.push(row2)
+  groups.push(g1)
   println(groups[0][0][0])
   println(groups[0][0][1])
   println(groups[0][1][0])
@@ -152,11 +152,10 @@ tablet Inbox { name: str, msgs: tablets[8]Msg }
 fn main() -> i32 {
   mut inboxes: tablets[4]Inbox
   mut box1: Inbox = Inbox { name: "alice", msgs: tablets[8]Msg { } }
-  step _m1 = box1.msgs.push(Text("hi"))
-  step _m2 = box1.msgs.push(Empty)
-  step _m3 = box1.msgs.push(Text("bye"))
-  step _i = inboxes.push(box1)
-
+  box1.msgs.push(Text("hi"))
+  box1.msgs.push(Empty)
+  box1.msgs.push(Text("bye"))
+  inboxes.push(box1)
   step who = inboxes[0].name
   println(who)
   for m in inboxes[0].msgs {
@@ -280,7 +279,7 @@ fn main() -> i32 {
   mut store: tablets[64]Row
   mut i: i64 = 0
   while i < 50 {
-    step _p = store.push(Row { label: "r" + int_to_str(i), n: i })
+    store.push(Row { label: "r" + int_to_str(i), n: i })
     i = i + 1
   }
   // Pull row 7 out, clone via the by-value pass through `copy_row`,
@@ -351,16 +350,14 @@ fn run_tape(t: Tape) -> i64 {
 fn main() -> i32 {
   mut tapes: tablets[8]Tape
   mut t1: Tape = Tape { name: "t" + "1", ops: tablets[16]Op { } }
-  step _o1 = t1.ops.push(OAdd(10))
-  step _o2 = t1.ops.push(OMul(3))
-  step _o3 = t1.ops.push(OSub(5))
-  step _t1 = tapes.push(t1)
-
+  t1.ops.push(OAdd(10))
+  t1.ops.push(OMul(3))
+  t1.ops.push(OSub(5))
+  tapes.push(t1)
   mut t2: Tape = Tape { name: "t" + "2", ops: tablets[16]Op { } }
-  step _o4 = t2.ops.push(OAdd(100))
-  step _o5 = t2.ops.push(OSub(1))
-  step _t2 = tapes.push(t2)
-
+  t2.ops.push(OAdd(100))
+  t2.ops.push(OSub(1))
+  tapes.push(t2)
   for tape in tapes {
     println(tape.name, " = ", run_tape(tape))
   }
@@ -382,8 +379,7 @@ def test_struct_alignment_gc_offsets(tmp_path, stress):
 tablet Padded { a: i8, b: i64, c: str }
 fn main() -> i32 {
   mut store: tablets[4]Padded
-  step _p = store.push(Padded { a: 1, b: 2, c: "aligned" + "!" })
-
+  store.push(Padded { a: 1, b: 2, c: "aligned" + "!" })
   // Force a collect while the Padded struct sits in the chunk
   mut acc: str = ""
   mut i: i64 = 0
@@ -429,6 +425,129 @@ fn main() -> i32 {
     rc, stdout = run(src, tmp_path, stress)
     assert rc == 0
     assert stdout == b"outer_str\ninner_str\n"
+
+
+def test_field_return_survives_caller_gc_pressure(tmp_path, stress):
+    # Returning a Field expression from a local struct: the caller
+    # forces multiple GC cycles before reading the result. The GC
+    # must keep the returned str's bytes alive via the str type
+    # descriptor (str.ptr → heap byte buffer), even though the local
+    # struct that originally owned the field is gone.
+    src = """
+tablet Row { label: str }
+
+fn build() -> str {
+  step r: Row = Row { label: "abc" + "def" }
+  r.label
+}
+
+fn main() -> i32 {
+  step s = build()
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 {
+    acc = acc + "."
+    i = i + 1
+  }
+  println(s)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"abcdef\n"
+
+
+def test_index_return_from_local_tablets_survives_gc(tmp_path, stress):
+    # Returning a tablets-Index value: the local tablets is unreachable
+    # after the function returns, but the str at slot 0 still has a
+    # live byte-buffer that the caller's binding keeps rooted.
+    src = """
+fn build() -> str {
+  mut local: tablets[4]str
+  local.push("first" + "_str")
+  local.push("second" + "_str")
+  local[0]
+}
+
+fn main() -> i32 {
+  step s = build()
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 {
+    acc = acc + "."
+    i = i + 1
+  }
+  println(s)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"first_str\n"
+
+
+def test_field_return_from_match_arm_survives_gc(tmp_path, stress):
+    # The Field return is inside a match arm; the arm's binding goes
+    # out of scope along with the local scrutinee at fn return, but
+    # the returned str must stay alive in the caller through GC.
+    src = """
+seal Pick { First, Second }
+tablet Row { label: str }
+
+fn pick(p: Pick) -> str {
+  step r: Row = Row { label: "winner" + "!" }
+  match p {
+    First => r.label,
+    Second => "other",
+  }
+}
+
+fn main() -> i32 {
+  step s = pick(First)
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 {
+    acc = acc + "."
+    i = i + 1
+  }
+  println(s)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"winner!\n"
+
+
+def test_nested_field_return_survives_gc(tmp_path, stress):
+    # Returning a Field-of-Field — outer.inner.label. Both the outer
+    # and inner structs are local; only the str's byte buffer must
+    # survive in the caller.
+    src = """
+tablet Inner { label: str }
+tablet Outer { inner: Inner }
+
+fn build() -> str {
+  step o: Outer = Outer { inner: Inner { label: "deep" + "_str" } }
+  o.inner.label
+}
+
+fn main() -> i32 {
+  step s = build()
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 {
+    acc = acc + "."
+    i = i + 1
+  }
+  println(s)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"deep_str\n"
 
 
 def test_anonymous_rvalue_block_tail_uaf(tmp_path, stress):
@@ -544,3 +663,331 @@ fn main() -> i32 {
     rc, stdout = run(src, tmp_path, stress)
     assert rc == 0
     assert stdout == b"b2\n"
+
+
+# --- smart wedges: wedge escapes keep the source arena alive --------------
+#
+# The v0.4.1 soundness bug: a wedge that escaped via a wrapping struct or
+# seal payload kept no GC trace back to its source arena. Under stress the
+# arena got swept while the caller still held the wedge, producing silent
+# zero-reads. The fix is interior-pointer marking via __tuppu_gc_mark_wedge,
+# emitted by trace fns for any field declared as `wedge T`. Each test below
+# escapes a wedge through a different wrapper shape and reads the wedge
+# after heavy collection pressure; under the bug, all of them read 0.
+
+
+def test_wedge_in_struct_returned_survives_gc(tmp_path, stress):
+    src = """
+tablet Tree { value: i64 }
+tablet Box { handle: wedge Tree }
+
+fn make() -> Box {
+  mut nodes: tablets[16]Tree
+  step h = nodes.push(Tree { value: 42 })
+  Box { handle: h }
+}
+
+fn main() -> i32 {
+  step b = make()
+  // Force collection pressure unrelated to the boxed wedge.
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 {
+    acc = acc + "x"
+    i = i + 1
+  }
+  println(b.handle.value)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"42\n"
+
+
+def test_wedge_in_seal_payload_returned_survives_gc(tmp_path, stress):
+    src = """
+tablet Cell { value: i64 }
+seal Holder { Empty, Some(wedge Cell) }
+
+fn make() -> Holder {
+  mut cells: tablets[16]Cell
+  step h = cells.push(Cell { value: 7 })
+  Some(h)
+}
+
+fn main() -> i32 {
+  step holder = make()
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 {
+    acc = acc + "y"
+    i = i + 1
+  }
+  match holder {
+    Empty => println(0),
+    Some(h) => println(h.value),
+  }
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"7\n"
+
+
+def test_tablets_of_wedge_returned_survives_gc(tmp_path, stress):
+    # tablets[N]wedge T — each chunk slot is a wedge into another arena.
+    # The chunk descriptor must dispatch each slot through mark_wedge.
+    src = """
+tablet Item { v: i64 }
+
+fn build() -> tablets[8]wedge Item {
+  mut store: tablets[16]Item
+  mut handles: tablets[8]wedge Item
+  handles.push(store.push(Item { v: 11 }))
+  handles.push(store.push(Item { v: 22 }))
+  handles.push(store.push(Item { v: 33 }))
+  handles
+}
+
+fn main() -> i32 {
+  mut hs = build()
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 {
+    acc = acc + "z"
+    i = i + 1
+  }
+  for h in hs { println(h.v) }
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"11\n22\n33\n"
+
+
+def test_wedge_in_nested_struct_returned_survives_gc(tmp_path, stress):
+    # Wedge two levels deep: outer struct holds an inner struct that holds
+    # the wedge. Trace fn must recurse through the inner struct's fields.
+    src = """
+tablet Leaf { tag: i64 }
+tablet Inner { ref: wedge Leaf }
+tablet Outer { inner: Inner }
+
+fn make() -> Outer {
+  mut leaves: tablets[8]Leaf
+  step h = leaves.push(Leaf { tag: 99 })
+  Outer { inner: Inner { ref: h } }
+}
+
+fn main() -> i32 {
+  step o = make()
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 {
+    acc = acc + "q"
+    i = i + 1
+  }
+  println(o.inner.ref.tag)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"99\n"
+
+
+# --- return-value cleanup-frame transfer ---------------------------------
+#
+# Probes for the chokepoint / fn-body-exit ownership transfer: a fn
+# returning a cleanup-bearing value must hand the heap bytes to the
+# caller without the about-to-fire frame cleanup zeroing or freeing
+# them. Each shape below historically broke the original heuristic
+# transfer or was at risk of breaking a future variant of it.
+
+
+def test_yield_with_cleanup_bearing_return(tmp_path, stress):
+    # Multiple yield paths plus a fall-through tail, all returning a
+    # str rvalue. Yields run their own cleanup chain before the ret;
+    # fall-through goes through the slot-identity transfer. Both must
+    # hand the str across unmolested.
+    src = """
+fn pick(n: i64) -> str {
+  if n < 0 { yield "negative" + "" }
+  if n == 0 { yield "zero" + "" }
+  "positive" + ""
+}
+
+fn main() -> i32 {
+  println(pick(-5))
+  println(pick(0))
+  println(pick(42))
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 { acc = acc + "."  i = i + 1 }
+  println(pick(-1))
+  println(pick(0))
+  println(pick(1))
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == (
+        b"negative\nzero\npositive\n"
+        b"negative\nzero\npositive\n"
+    )
+
+
+def test_step_bound_if_then_return_step(tmp_path, stress):
+    # `step a = if cond { make() } else { other() }; a`. Each branch
+    # registers its own .rvalue.root in the inner if-block frame; the
+    # `step` consumes via _maybe_register_cleanup with the binding
+    # name, not .rvalue.root; the tail Ident triggers
+    # _transfer_ownership_out so `a` exits clean. The slot-identity
+    # transfer at fn exit must target the body's outer chokepoint
+    # spill, ignoring all of the above.
+    src = """
+fn make_a() -> str { "alpha" + "_made" }
+fn make_b() -> str { "beta"  + "_made" }
+
+fn pick_str(flag: bool) -> str {
+  step a: str = if flag { make_a() } else { make_b() }
+  a
+}
+
+fn main() -> i32 {
+  println(pick_str(true))
+  println(pick_str(false))
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 { acc = acc + "."  i = i + 1 }
+  println(pick_str(true))
+  println(pick_str(false))
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == (
+        b"alpha_made\nbeta_made\n"
+        b"alpha_made\nbeta_made\n"
+    )
+
+
+def test_nested_if_as_fn_body_tail(tmp_path, stress):
+    # Body tail is a nested if-expression directly producing a str
+    # rvalue from each branch. The outer chokepoint that produces the
+    # transferable slot must be the if-expression's, not any branch's.
+    src = """
+fn pick(n: i64) -> str {
+  if n < 0 {
+    "neg" + ""
+  } else if n == 0 {
+    "zero" + ""
+  } else {
+    "pos" + ""
+  }
+}
+
+fn main() -> i32 {
+  println(pick(-1))
+  println(pick(0))
+  println(pick(1))
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 { acc = acc + "."  i = i + 1 }
+  println(pick(-2))
+  println(pick(0))
+  println(pick(99))
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"neg\nzero\npos\nneg\nzero\npos\n"
+
+
+def test_intermediate_cleanup_then_unrelated_return(tmp_path, stress):
+    # `step held = ...; finisher()`. The block's frame contains both
+    # `held`'s cleanup AND finisher()'s .rvalue.root chokepoint
+    # spill. Both fire when the inner block frame pops — but the SSA
+    # value flowing out is independent of the spill slot's bytes.
+    # Then the OUTER chokepoint registers .rvalue.root for the
+    # returned str in the fn body frame; the slot-identity transfer
+    # picks that one, not held's (different name) and not the inner
+    # finisher's (already released and frame popped).
+    src = """
+fn make_left() -> str  { "L_" + "side" }
+fn make_right() -> str { "R_" + "side" }
+fn finisher() -> str   { "fin" + "ish" }
+
+fn flow(b: bool) -> str {
+  step held: str = if b { make_left() } else { make_right() }
+  finisher()
+}
+
+fn main() -> i32 {
+  println(flow(true))
+  println(flow(false))
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 { acc = acc + "x"  i = i + 1 }
+  println(flow(true))
+  println(flow(false))
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"finish\nfinish\nfinish\nfinish\n"
+
+
+def test_fresh_seal_with_str_payload_returned_from_fn(tmp_path, stress):
+    # Fresh-owned seal as fn return value. seal_release zeroes the
+    # tag of whatever slot it's called on, so if the return-value
+    # cleanup ever fires before ret, the caller observes VNull
+    # instead of the actual variant. Stress mode forces a collection
+    # on every alloc — exercises the GC-rooting half of the chokepoint
+    # in tandem with the cleanup-transfer half.
+    src = """
+seal V {
+  VNull,
+  VInt(i64),
+  VStr(str),
+}
+
+fn make_v_str(s: str) -> V { VStr(s + "_tail") }
+fn make_v_int(n: i64) -> V { VInt(n) }
+
+fn pick(b: bool) -> V {
+  if b { make_v_str("alpha") } else { make_v_int(7) }
+}
+
+fn show(v: V) {
+  match v {
+    VNull   => println("null"),
+    VInt(n) => println("int ", n),
+    VStr(s) => println("str ", s),
+  }
+}
+
+fn main() -> i32 {
+  show(pick(true))
+  show(pick(false))
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 100 { acc = acc + "."  i = i + 1 }
+  show(pick(true))
+  show(pick(false))
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == (
+        b"str alpha_tail\nint 7\n"
+        b"str alpha_tail\nint 7\n"
+    )
