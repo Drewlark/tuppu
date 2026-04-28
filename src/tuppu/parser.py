@@ -108,12 +108,16 @@ class Parser:
                 decls.append(self.parse_edubba())
             elif self.check(Tok.TYPE_ALIAS):
                 decls.append(self.parse_type_alias())
+            elif self.check(Tok.IMPORT):
+                decls.append(self.parse_import())
+            elif self.check(Tok.FROM):
+                decls.append(self.parse_from_import())
             else:
                 t = self.peek()
                 raise ParseError(
                     f"expected 'fn', 'table', 'tablet', 'seal', 'colophon', "
-                    f"'gloss', 'edubba', or 'type' at top level, got "
-                    f"{t.kind.name}",
+                    f"'gloss', 'edubba', 'type', 'import', or 'from' at top "
+                    f"level, got {t.kind.name}",
                     t.line, t.col,
                 )
             self.skip_newlines()
@@ -247,6 +251,58 @@ class Parser:
             body=body,
             type_params=[],  # filled in at lowering from the host edubba
         ))
+
+    def parse_import(self) -> A.ImportDecl:
+        """`import x.y.z` — wildcard form. Brings every public top-level
+        name from module `x.y.z` into the current file's scope. The
+        `import x as y` aliasing form is reserved for a future qualified-
+        access design and rejected here."""
+        start = self.eat(Tok.IMPORT)
+        path = self._parse_module_path()
+        if self.check(Tok.AS):
+            t = self.peek()
+            raise ParseError(
+                "`import x as y` is not yet supported; use "
+                "`from x import name [as alias]` to rename individual "
+                "imports",
+                t.line, t.col,
+            )
+        return _at(start, A.ImportDecl(path=path, names=None))
+
+    def parse_from_import(self) -> A.ImportDecl:
+        """`from x.y import a, b as c` — selective form. Brings only the
+        named decls into scope, optionally with a local alias each."""
+        start = self.eat(Tok.FROM)
+        path = self._parse_module_path()
+        self.eat(Tok.IMPORT, "expected 'import' after module path")
+        names: list[tuple[str, str | None]] = []
+        names.append(self._parse_import_name())
+        while self.check(Tok.COMMA):
+            self.advance()
+            names.append(self._parse_import_name())
+        return _at(start, A.ImportDecl(path=path, names=names))
+
+    def _parse_module_path(self) -> list[str]:
+        """Read a dotted identifier path like `stdlib.list` into a list
+        of segments. Each segment is a plain IDENT; the dots are pure
+        path separators (no expression-level meaning)."""
+        first = self.eat(Tok.IDENT, "module path segment")
+        path = [first.value]
+        while self.check(Tok.DOT):
+            self.advance()
+            seg = self.eat(Tok.IDENT, "module path segment after '.'")
+            path.append(seg.value)
+        return path
+
+    def _parse_import_name(self) -> tuple[str, str | None]:
+        """One entry in a `from ... import ...` list: `name` or
+        `name as alias`. Returns (source_name, local_alias_or_None)."""
+        n = self.eat(Tok.IDENT, "imported name").value
+        alias: str | None = None
+        if self.check(Tok.AS):
+            self.advance()
+            alias = self.eat(Tok.IDENT, "alias name after 'as'").value
+        return (n, alias)
 
     def parse_colophon(self) -> A.ColophonDecl:
         """`colophon fn name(params) -> type` — declare an external C

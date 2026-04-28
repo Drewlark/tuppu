@@ -430,26 +430,59 @@ class Checker:
         # phrasing in a few error messages; no longer load-bearing for
         # any escape rule (smart wedges trace through GC instead).
         self._fn_params: set[str] = set()
+        # Module support. Each top-level decl is associated with a
+        # dotted module path via `Program.module_of`. v1 keeps the
+        # global flat namespace (decls still must be uniquely named
+        # across the whole program) and uses module info for two
+        # things only: validating import paths against discovered
+        # modules, and checking visibility of `_`-prefixed names
+        # across module boundaries. v2 will move to per-module
+        # namespaces with module-prefixed mangling.
+        self._top_decl_module: dict[str, tuple[str, ...]] = {}
+        self._known_modules: set[tuple[str, ...]] = set()
+        # Updated at every top-level decl visit (signature registration
+        # and body checking). Reads of `_`-prefixed top-level names
+        # outside their declaring module raise a visibility error.
+        self.current_module: tuple[str, ...] = ()
 
     def _warn(self, message: str, line: int = 0, col: int = 0) -> None:
         self.warnings.append(CompileWarning(message=message, line=line, col=col))
 
     def check(self) -> None:
+        # Phase 0-pre: catalogue every module path that contributed at
+        # least one decl. This is the universe of valid `import` targets.
+        # Decls without a module entry (built-in injections, single-source
+        # tests) belong to the root module (empty tuple).
+        for d in self.prog.decls:
+            mod = self.prog.module_of.get(id(d), ())
+            self._known_modules.add(mod)
+        # Phase 0-imports: validate `import` / `from ... import` decls.
+        # Both forms must reference a known module. The `from x import y`
+        # form additionally requires `y` to be a top-level decl of `x`,
+        # and not private (`_`-prefixed). Names visible at this point
+        # via the current flat namespace satisfy v1; v2 will populate
+        # per-module local scopes from these decls.
+        self._validate_imports()
         # Phase 0a: collect struct + seal names so type bodies can refer
         # to each other and to user types regardless of source order.
         # Aliases register their target AST eagerly; the target gets
         # resolved lazily on first use so it can name struct / seal /
         # alias siblings declared later in the file.
         for d in self.prog.decls:
+            self.current_module = self.prog.module_of.get(id(d), ())
             if isinstance(d, A.StructDecl):
                 self._register_struct_name(d)
+                self._top_decl_module[d.name] = self.current_module
             elif isinstance(d, A.SealDecl):
                 self._register_seal_name(d)
+                self._top_decl_module[d.name] = self.current_module
             elif isinstance(d, A.AliasDecl):
                 self._register_alias(d)
+                self._top_decl_module[d.name] = self.current_module
         # Phase 0b: resolve fields (structs) and variants (seals) now
         # that all user type names are in scope.
         for d in self.prog.decls:
+            self.current_module = self.prog.module_of.get(id(d), ())
             if isinstance(d, A.StructDecl):
                 self._resolve_struct_fields(d)
             elif isinstance(d, A.SealDecl):
@@ -468,20 +501,105 @@ class Checker:
         # register in both the fn table (under a mangled name) and the
         # operator dispatch table.
         for d in self.prog.decls:
+            self.current_module = self.prog.module_of.get(id(d), ())
             if isinstance(d, A.FnDecl):
                 self._register_fn(d)
+                self._top_decl_module[d.name] = self.current_module
             elif isinstance(d, A.ColophonDecl):
                 self._register_colophon(d)
+                self._top_decl_module[d.name] = self.current_module
             elif isinstance(d, A.GlossDecl):
                 self._register_gloss(d)
+                # Gloss decls don't expose a user-named top-level slot;
+                # their mangled name is internal-only, so we skip the
+                # visibility table for them.
         for d in self.prog.decls:
+            self.current_module = self.prog.module_of.get(id(d), ())
             if isinstance(d, A.TableDecl):
                 self._register_table(d)
+                self._top_decl_module[d.name] = self.current_module
         for d in self.prog.decls:
+            self.current_module = self.prog.module_of.get(id(d), ())
             if isinstance(d, A.FnDecl):
                 self._check_fn_body(d)
             elif isinstance(d, A.GlossDecl):
                 self._check_gloss_body(d)
+        # Reset to the root module after all decls have been visited so
+        # any subsequent invocations (e.g. tests reusing the Checker
+        # instance) start from a clean slate.
+        self.current_module = ()
+
+    def _validate_imports(self) -> None:
+        """Walk every `ImportDecl` and check it points at a real module.
+        For `from x import y` form, also check `y` is a top-level decl
+        in module `x`, and that `y` isn't private (`_`-prefixed).
+
+        Per-module module-table assembly is deferred to v2; v1 keeps
+        the global flat namespace, so this validation is the only
+        semantic effect of an import for now. The visibility check on
+        `_`-prefixed names is enforced separately at every name
+        resolution site, so a missing import doesn't silently let
+        private names through."""
+        # Build module → set of public top-level decl names. Built-in
+        # injections (str) live in the root module and are always
+        # visible — the import system isn't gating them.
+        public_by_module: dict[tuple[str, ...], set[str]] = {}
+        for d in self.prog.decls:
+            mod = self.prog.module_of.get(id(d), ())
+            name = getattr(d, "name", None)
+            if not name or isinstance(d, (A.ImportDecl, A.GlossDecl, A.EdubbaDecl)):
+                continue
+            public_by_module.setdefault(mod, set()).add(name)
+
+        for d in self.prog.decls:
+            if not isinstance(d, A.ImportDecl):
+                continue
+            mod = tuple(d.path)
+            if mod not in self._known_modules:
+                pretty = ".".join(d.path)
+                raise CheckError(
+                    f"unknown module {pretty!r} in import",
+                    d.line, d.col,
+                )
+            if d.names is None:
+                # Wildcard `import x.y` — nothing to validate per-name.
+                continue
+            exports = public_by_module.get(mod, set())
+            for src_name, _alias in d.names:
+                if src_name.startswith("_"):
+                    raise CheckError(
+                        f"cannot import private name {src_name!r} from "
+                        f"{'.'.join(d.path)!r} (names beginning with "
+                        f"'_' are private to their module)",
+                        d.line, d.col,
+                    )
+                if src_name not in exports:
+                    pretty = ".".join(d.path)
+                    raise CheckError(
+                        f"module {pretty!r} has no export named "
+                        f"{src_name!r}",
+                        d.line, d.col,
+                    )
+
+    def _check_visibility(self, name: str, line: int, col: int) -> None:
+        """If `name` is a `_`-prefixed top-level decl declared in a
+        module other than `self.current_module`, raise. Names without
+        a module entry (built-ins, intrinsics, locals) are always
+        visible — only top-level user decls are subject to this check."""
+        if not name.startswith("_"):
+            return
+        decl_mod = self._top_decl_module.get(name)
+        if decl_mod is None:
+            return
+        if decl_mod == self.current_module:
+            return
+        here = ".".join(self.current_module) or "<root>"
+        there = ".".join(decl_mod) or "<root>"
+        raise CheckError(
+            f"name {name!r} is private to module {there!r} and not "
+            f"visible from module {here!r}",
+            line, col,
+        )
 
     # --- registration ------------------------------------------------
 
@@ -1033,6 +1151,7 @@ class Checker:
                         f"write `{t.name}<...>`",
                         t.line, t.col,
                     )
+                self._check_visibility(t.name, t.line, t.col)
                 return self.structs[t.name]
             if t.name in self.seals:
                 params = self.seal_type_params.get(t.name, ())
@@ -1043,6 +1162,7 @@ class Checker:
                         f"write `{t.name}<...>`",
                         t.line, t.col,
                     )
+                self._check_visibility(t.name, t.line, t.col)
                 return self.seals[t.name]
             raise CheckError(
                 f"{where}: unknown type {t.name!r}", t.line, t.col,
@@ -1056,6 +1176,7 @@ class Checker:
                         f"{len(params)} type argument(s), got {len(t.args)}",
                         t.line, t.col,
                     )
+                self._check_visibility(t.name, t.line, t.col)
                 resolved_args = tuple(
                     self._resolve_type(a, f"{where} type arg") for a in t.args
                 )
@@ -1068,6 +1189,7 @@ class Checker:
                         f"{len(params)} type argument(s), got {len(t.args)}",
                         t.line, t.col,
                     )
+                self._check_visibility(t.name, t.line, t.col)
                 resolved_args = tuple(
                     self._resolve_type(a, f"{where} type arg") for a in t.args
                 )
@@ -1152,6 +1274,10 @@ class Checker:
         for scope in reversed(self.scopes):
             if name in scope:
                 return scope[name]
+        # Top-level visibility check: a `_`-prefixed name resolved
+        # outside its declaring module is a private-access error.
+        # Locals shadow this, so the scope walk above runs first.
+        self._check_visibility(name, line, col)
         # Gather everything nameable in this program so the suggestion
         # can point to a function / struct / table if the user typo'd
         # across categories, not just a local.
@@ -1752,6 +1878,7 @@ class Checker:
                 f"{_suggest(name, self.fns)}",
                 e.line, e.col,
             )
+        self._check_visibility(name, e.line, e.col)
         # Variadic call: split args into (fixed, tail). The fixed args
         # typecheck against the first (n-1) params; the tail becomes a
         # synthesized TabletsLit that gets typechecked against the last

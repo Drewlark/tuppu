@@ -244,6 +244,19 @@ What works:
 - Type errors with source `line:col`; codegen errors now also carry
   `line:col` via `Codegen._current_loc` tracking.
 - Compile-time warning infrastructure.
+- **Imports v1 — syntax + visibility.** `import x.y` (wildcard form),
+  `from x.y import name [as alias]` (selective), and recursive
+  discovery of `.tpu` files under directory inputs (`tuppu run src/`
+  walks the tree). Each file gets a module path derived from its
+  location (`stdlib/list.tpu` → module `stdlib.list`,
+  `src/sema/typecheck.tpu` → `sema.typecheck`). v1 validates import
+  paths and selected names against the discovered module set, and
+  enforces visibility for `_`-prefixed top-level decls (private to
+  declaring module — reads from another module error). The global
+  flat namespace is preserved for backward compat; **per-module
+  name resolution and module-prefix LLVM mangling are deferred to
+  v2**. The cross-module variant disambiguation (LIMITATIONS.md
+  flat-seal-variant bug) waits on v2.
 
 What doesn't yet:
 - Fn-as-value / closures — the next planned chunk after dynamic strings.
@@ -254,7 +267,10 @@ What doesn't yet:
 - Escape-analysis rat-fallback for rat-only sex values (**Phase 3c**
   — the big compiler-learning chunk).
 - `--strict-dish` flag (see FUTURE_OPTIMIZATIONS.md for the sketch).
-- Imports / namespacing.
+- Imports v2 — per-module name resolution + module-prefix LLVM
+  mangling + cross-module variant disambiguation. v1 ships the
+  syntax + `_`-prefix visibility on the global flat namespace; the
+  scoping-and-mangling lift is the next chunk.
 - `read_line() -> str` — needs stdin wrapper, not yet added.
 - Expression-level pointer ops (`*p`, `&x`, `p + 1`) — intentional.
 - `impress` reinterpret cast (documented in SPEC §14).
@@ -424,43 +440,73 @@ order, names need not match. Codegen is a no-op bitcast. A third
 mechanism (trait-driven `into`-style conversion) can layer on later
 without colliding with either `as` or `impress`.
 
-## 2. Imports — design sketch
+## 2. Imports — v1 shipped, v2 queued
 
-### Grammar
+### v1 (shipped)
+
+The conversation in `scratch/NEXT_BIG_FEATURE.md` chose dotted module
+paths (Python / Rust shape) over the older `use stdlib/rat` slash
+form. v1 lands the syntax + visibility, with namespacing semantics
+deferred to v2 so the change is backward-compatible.
+
+```tuppu
+import stdlib.list
+from stdlib.map import Map, get as map_get
 ```
-use_decl = "use" path
-path     = IDENT ("/" IDENT)*
-```
-Example: `use stdlib/rat` imports all public decls from that file.
 
-### Visibility
-- `fn foo(...)` is file-local by default.
-- `pub fn foo(...)` is exported / visible to `use`rs.
-- Same for `tablet` / `tablet` with a `pub` prefix.
+What v1 ships:
+- **Lexer / parser / AST** — `import` and `from` keywords, dotted
+  paths, optional `as <local_name>` per imported name.
+  `import x as y` (wildcard alias) reserved for v2 with a clear
+  error message.
+- **Driver discovery** — `tuppu run src/` (or any directory input)
+  walks the tree for `.tpu` files. Each file is assigned a module
+  path: `stdlib/list.tpu` → `("stdlib", "list")`,
+  `src/sema/typecheck.tpu` → `("sema", "typecheck")`,
+  `<source>` (single-string compiles) → `()` (root).
+- **Import validation** — unknown module path errors at typecheck;
+  `from x import y` checks `y` exists in `x` and isn't private.
+- **`_`-prefix visibility** — top-level decls whose name starts with
+  `_` are private to their declaring module. Reads from another
+  module error with `"name '_foo' is private to module 'x'..."`.
+- **Backward compat** — global flat namespace preserved. Existing
+  multi-file tests, the auto-included stdlib, and single-source
+  compiles all keep working with no changes. Imports are validated
+  but otherwise semantically a no-op in v1: names already share
+  the global namespace, so `from x import y` is decorative for
+  anything not `_`-prefixed.
 
-### Name resolution
-Simplest: `use stdlib/rat` copies all `pub` names from
-`stdlib/rat.tpu` into the current file's namespace unqualified (Go's
-dot import, Python's `from x import *`). Qualified
-`use stdlib/rat as r` + `r.rat_abs(x)` comes later.
+Tests: `tests/test_modules.py` (20 cases — lexer, parser, module
+path derivation, import validation, visibility within / across
+modules, single-source regression).
 
-### Driver changes
-When the driver sees `use stdlib/rat` it resolves the file:
-- Same-directory relative — fine for single-project.
-- `TUPPU_PATH` env var — search path for modules.
-- Bundled stdlib lives at `stdlib/`, resolve as
-  `stdlib/rat` → `stdlib/rat.tpu`.
-- Existing stdlib auto-include becomes opt-in via `use`.
+### v2 (queued)
 
-### Files to touch
-- `src/tuppu/ast.py` — `UseDecl(path: list[str])`, `pub: bool` on
-  FnDecl/StructDecl.
-- `src/tuppu/parser.py` — parse `use`.
-- `src/tuppu/driver.py` — resolve `use` to additional source files;
-  parse/typecheck in dependency order.
-- `src/tuppu/typecheck.py` — per-file visibility, import resolution.
-- Migration: existing stdlib functions marked `pub`; examples add
-  `use stdlib/rat` / `use stdlib/sex` at top.
+The bigger lift the strategy doc described — what v1 deliberately
+deferred:
+- **Per-module name resolution.** A name in module A is not visible
+  from module B unless explicitly imported. Wildcard `import x.y`
+  expands to bringing every public decl into the current scope,
+  rather than just being a noop (today). Stdlib's auto-include
+  becomes `from stdlib.* import *` semantically rather than "merge
+  the namespaces."
+- **Module-prefix LLVM mangling.** Non-extern user fns / tablets /
+  seals get a `<module>__<name>` symbol mangle, so two modules can
+  each declare `Map<T>` (or `seal A { X }; seal B { X }` —
+  the LIMITATIONS.md flat-seal-variant bug) without collision at
+  the IR level.
+- **Cross-module variant disambiguation.** `variant_lookup` gets
+  keyed by (module, name); a use site searches the current module
+  first, then imported modules, errors on ambiguity.
+- **Qualified module access.** `parser.parse(x)` and `map.Map<T>` —
+  the typechecker recognises `parser` as an imported module name
+  and treats the Field/TypeApply as a module-qualified lookup
+  (rather than an ordinary field/struct access). Needs care so
+  local-binding shadowing wins, and needs parser support for
+  dotted type names in `TypeApply`.
+- **`import x.y as z`.** Currently rejected at parse with a "not
+  yet supported" message. Falls out naturally once qualified
+  access lands — `z.foo` is the alias-prefixed form of `x.y.foo`.
 
 ## 3. Sex Phase 3 — /, escape analysis (3a done)
 

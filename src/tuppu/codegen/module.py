@@ -65,6 +65,8 @@ class ModuleMixin:
                 pass  # already handled in phase 0c
             elif isinstance(decl, A.AliasDecl):
                 pass  # transparent — resolved on-demand in _lower_type
+            elif isinstance(decl, A.ImportDecl):
+                pass  # purely a typecheck-time concern; no IR shape
             else:
                 raise CodegenError(
                     f"unsupported top-level: {type(decl).__name__}"
