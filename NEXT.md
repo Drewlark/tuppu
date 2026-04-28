@@ -244,19 +244,49 @@ What works:
 - Type errors with source `line:col`; codegen errors now also carry
   `line:col` via `Codegen._current_loc` tracking.
 - Compile-time warning infrastructure.
-- **Imports v1 — syntax + visibility.** `import x.y` (wildcard form),
-  `from x.y import name [as alias]` (selective), and recursive
-  discovery of `.tpu` files under directory inputs (`tuppu run src/`
-  walks the tree). Each file gets a module path derived from its
-  location (`stdlib/list.tpu` → module `stdlib.list`,
-  `src/sema/typecheck.tpu` → `sema.typecheck`). v1 validates import
-  paths and selected names against the discovered module set, and
-  enforces visibility for `_`-prefixed top-level decls (private to
-  declaring module — reads from another module error). The global
-  flat namespace is preserved for backward compat; **per-module
-  name resolution and module-prefix LLVM mangling are deferred to
-  v2**. The cross-module variant disambiguation (LIMITATIONS.md
-  flat-seal-variant bug) waits on v2.
+- **Modules — file-as-module + import system.** Three import forms:
+  `import x.y` (wildcard: brings every public name into local scope
+  AND registers `y` as a qualifier for `y.foo`), `import x.y as z`
+  (alias-only: `z.foo` is the only access path), `from x.y import
+  a, b as c` (selective). Each `.tpu` file is its own module, named
+  by its path relative to `src/` or `stdlib/` (`stdlib/list.tpu` →
+  `stdlib.list`). Recursive directory discovery: `tuppu run src/`
+  walks the tree.
+
+  Real per-module name resolution: a top-level name in module B is
+  visible in module A only if A has imported it. Cross-module
+  references without an import give a targeted "name X is declared
+  in module 'foo' but not in scope here; add `from foo import X`"
+  error. Visibility for `_`-prefixed top-level decls: private to
+  the declaring module.
+
+  Variant disambiguation across modules — fixes the LIMITATIONS
+  flat-seal-variant bug. Two modules can each declare `seal A { X }`
+  and `seal B { X }`; use sites resolve via the importer's visible
+  variants. Multiple imported seals contributing the same variant
+  name surface as ambiguity at the use site.
+
+  Cycle detection: import graph is walked DFS in phase 0; back-edges
+  trip a `circular import detected: A -> B -> A` error.
+
+  Edubba isolation: edubba blocks can only extend tablets in the
+  same module (the host module owns its tablet's evolution).
+
+  Type-level qualified access: `mod.Tablet` and `mod.Foo<T>` work in
+  type position. Expression-level `mod.fn(args)` works after `import
+  mod` or `import x.y as mod`.
+
+  Script-mode ergonomic shortcut: code in the root module `()`
+  (single-source compiles, ad-hoc scripts in tmp_path, the
+  `examples/` directory) auto-imports every public stdlib decl. Code
+  under `src/` and inside `stdlib/` requires explicit imports. The
+  split keeps script mode one-liner-friendly without abandoning
+  project-mode discipline.
+
+  Tracked v2 follow-ups (in LIMITATIONS.md): module-prefix LLVM
+  mangling so two modules can each declare `fn helper()` /
+  `tablet Foo`, and qualified-name struct literals (`mod.Tablet
+  { ... }`).
 
 What doesn't yet:
 - Fn-as-value / closures — the next planned chunk after dynamic strings.
@@ -267,10 +297,6 @@ What doesn't yet:
 - Escape-analysis rat-fallback for rat-only sex values (**Phase 3c**
   — the big compiler-learning chunk).
 - `--strict-dish` flag (see FUTURE_OPTIMIZATIONS.md for the sketch).
-- Imports v2 — per-module name resolution + module-prefix LLVM
-  mangling + cross-module variant disambiguation. v1 ships the
-  syntax + `_`-prefix visibility on the global flat namespace; the
-  scoping-and-mangling lift is the next chunk.
 - `read_line() -> str` — needs stdin wrapper, not yet added.
 - Expression-level pointer ops (`*p`, `&x`, `p + 1`) — intentional.
 - `impress` reinterpret cast (documented in SPEC §14).
@@ -440,9 +466,9 @@ order, names need not match. Codegen is a no-op bitcast. A third
 mechanism (trait-driven `into`-style conversion) can layer on later
 without colliding with either `as` or `impress`.
 
-## 2. Imports — v1 shipped, v2 queued
+## 2. Imports — shipped (most of the strategy doc), with v2 follow-ups noted
 
-### v1 (shipped)
+### Shipped
 
 The conversation in `scratch/NEXT_BIG_FEATURE.md` chose dotted module
 paths (Python / Rust shape) over the older `use stdlib/rat` slash

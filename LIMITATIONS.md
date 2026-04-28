@@ -48,10 +48,16 @@ Format: each section groups by area. Bullets prefix with severity:
   per stdlib type (`tablets[16]Node<T>` in `list.tpu`,
   `tablets[64]T` in `vec.tpu`, `tablets[64]str/T` in `map.tpu`).
   A user can't write `Vec<T, 16>` vs `Vec<T, 1024>`.
-- **[gap]** Variant names in `seal` declarations must be globally
-  unique. `seal A { X }; seal B { X }` is rejected because the
-  variant lookup is a flat table. Qualified syntax (`A::X`) hasn't
-  been designed.
+- **[gap]** Cross-module same-name decls collide. Two `src/` modules
+  can't both declare `fn helper()` or `tablet Foo` — the second one
+  is rejected with a duplicate-name error at typecheck. Module-
+  prefix LLVM mangling would let both coexist (each module's `Foo`
+  becomes `__M_modA__Foo` / `__M_modB__Foo` at the IR level).
+  Variant-name reuse across modules already works (see
+  `tests/test_modules.py::test_seals_in_different_modules_can_share_variant_names`)
+  because variants don't get standalone LLVM symbols. The fn/tablet
+  case is a real follow-up — the principled fix is to mangle every
+  non-extern decl with its declaring module path.
 - **[gap]** Pattern matching is flat only. No nested patterns
   (`Some(Circle(r))`), no guards (`Some(x) if x > 0`), no or-patterns
   (`Some(1) | Some(2)`). Exhaustiveness for nested patterns is
@@ -122,14 +128,27 @@ Format: each section groups by area. Bullets prefix with severity:
 
 ## Modules / packaging
 
-- **[blocker]** No module / import system. Bundled stdlib is auto-
-  discovered from `stdlib/*.tpu`; user programs are single-file.
-  Multi-file user code requires an `import` story (visibility,
-  circular imports, name resolution).
 - **[gap]** No package manager / external dependency story. Cargo /
-  npm / pip equivalent doesn't exist.
+  npm / pip equivalent doesn't exist. Project-local modules under
+  `src/` only. Vendoring is fine.
 - **[gap]** No conditional compilation. No `cfg` / feature flags
   / target-specific code. Everything compiles for the host triple.
+- **[gap]** No re-exports. `import x.y` brings names into the
+  importer's scope literally; if downstream consumers need to see
+  `x.y`'s names they import them directly. `pub use x.y` /
+  `export from` is the natural follow-up.
+- **[gap]** Module-prefix LLVM mangling. Two modules can't both
+  declare `fn helper()` or `tablet Foo` (typecheck rejects with a
+  duplicate-name error). The principled fix is to mangle every non-
+  extern decl with its declaring module path so both coexist at the
+  IR level. Variant-name collisions across modules already work
+  because variants don't get standalone LLVM symbols.
+- **[gap]** Qualified-name struct literals. `mod.Tablet { ... }` in
+  expression position doesn't parse — the struct-lit parser doesn't
+  see the dotted form as a type-position name. Wildcard `import mod`
+  brings the short name into local scope, so `Tablet { ... }`
+  works directly. Type-position annotations (`step x: mod.Tablet`)
+  do support the qualified form.
 
 ## Tooling
 
