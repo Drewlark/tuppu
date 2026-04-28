@@ -628,6 +628,17 @@ class ExprMixin:
         raise CodegenError(f"unsupported binary op: {op}")
 
     def _gen_call(self, e: A.Call) -> ir.Value | None:
+        # Stdlib method dispatch — `Map<T>` exposes its `map_*` free
+        # functions through method-call syntax. Checked first so the
+        # receiver lowers as an lvalue path (`objs[o].items.set(k, v)`
+        # works without a mut Ident binding).
+        if (
+            isinstance(e.callee, A.Field)
+            and self._checker is not None
+            and id(e) in self._checker.method_dispatch_target
+        ):
+            return self._gen_struct_method_dispatch(e)
+
         # Method call on a tablets receiver — plain Ident or a field
         # chain rooted at one. For the field-chain case (buf.bytes.push)
         # we GEP through the struct to the tablets slot and dispatch on
@@ -874,6 +885,82 @@ class ExprMixin:
             param_mut_list = self._fn_param_mut.get(fn.name)
             if param_mut_list is not None and i < len(param_mut_list):
                 param_is_mut = param_mut_list[i]
+            if self._is_str_value(expected_ty):
+                coerced = self._str_as_borrow(coerced)
+            elif (
+                self._struct_fields_for(expected_ty) is not None
+                and self._struct_needs_cleanup(expected_ty)
+            ):
+                if param_is_mut:
+                    coerced = self._struct_as_borrow(coerced, expected_ty)
+            call_args.append(coerced)
+        return self.builder.call(fn, call_args)
+
+    def _gen_struct_method_dispatch(self, e: A.Call) -> ir.Value | None:
+        """Lower a stdlib method call (e.g. `m.set(k, v)` on `Map<T>`)
+        to its underlying free function. The receiver is the first
+        argument; if its corresponding param is mut, we hand over a
+        pointer to its slot (resolved via `_lvalue_slot` so any of
+        Ident / Field / Index lvalue paths work). Non-mut receivers
+        flow through the normal expression path and are passed by
+        value — same as a regular non-mut struct arg.
+        """
+        assert isinstance(e.callee, A.Field)
+        assert self._checker is not None
+        assert self.builder is not None
+        fn_name = self._checker.method_dispatch_target[id(e)]
+        mono_args = self._checker.mono_call_args.get(id(e))
+        if mono_args is not None:
+            arg_tys_llvm = tuple(self._lower_ty(a) for a in mono_args)
+            fn = self._get_monomorph_fn(fn_name, arg_tys_llvm)
+        else:
+            fn = self.functions.get(fn_name)
+        if fn is None:
+            raise CodegenError(
+                f"method dispatch: cannot resolve {fn_name!r}"
+            )
+        param_mut_list = self._fn_param_mut.get(fn.name, ())
+        receiver_is_mut = bool(param_mut_list) and param_mut_list[0]
+        call_args: list[ir.Value] = []
+        receiver_expr = e.callee.target
+        if receiver_is_mut:
+            # Lower the receiver as an lvalue path. This is the whole
+            # point of method dispatch — the receiver may be a Field /
+            # Index / Ident chain, anything `_lvalue_slot` can resolve
+            # to a stable pointer. Free-function calls reject all but
+            # mut-bound Idents; method calls accept the broader set.
+            slot_ptr, slot_ty = self._lvalue_slot(receiver_expr)
+            expected_pointee = fn.args[0].type.pointee
+            if slot_ty != expected_pointee:
+                raise CodegenError(
+                    f"method dispatch: receiver type {slot_ty} does not "
+                    f"match {fn_name!r} param 0 type {expected_pointee}"
+                )
+            call_args.append(slot_ptr)
+        else:
+            v = self._gen_expr(receiver_expr)
+            if v is None:
+                raise CodegenError(
+                    f"method dispatch: receiver of {fn_name!r} has no value"
+                )
+            coerced = self._coerce(v, fn.args[0].type)
+            # Non-mut struct receiver: same neutering rule as regular
+            # non-mut struct args — pass the SSA value as-is. Callee
+            # registers no cleanup, so no double-free risk.
+            call_args.append(coerced)
+        for i, arg in enumerate(e.args, start=1):
+            expected_ty = fn.args[i].type
+            v = self._gen_expr(arg)
+            if v is None:
+                raise CodegenError(
+                    f"method dispatch: arg {i} of {fn_name!r} has no value"
+                )
+            coerced = self._coerce(v, expected_ty)
+            param_is_mut = bool(
+                param_mut_list
+                and i < len(param_mut_list)
+                and param_mut_list[i]
+            )
             if self._is_str_value(expected_ty):
                 coerced = self._str_as_borrow(coerced)
             elif (

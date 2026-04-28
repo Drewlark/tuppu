@@ -530,8 +530,29 @@ class AliasDecl:
     col:  int = _pos()
 
 
+@dataclass
+class EdubbaDecl:
+    """A methods block: `edubba Map<T> { fn set(mut self, k, v) {...} }`.
+    E-DUB-BA-A was the Sumerian/Akkadian scribal school where students
+    learned to read, write, and work with tablets — so the edubba of a
+    type collects its operations.
+
+    Each method's first param is implicit `self` (or `mut self`); the
+    parser materializes the receiver `Param` from `type_name` +
+    `type_params`. Methods are otherwise plain `FnDecl`s — the body is
+    type-checked and codegen'd through the same path as any free fn,
+    just with a mangled name (`<TypeName>__<method>`).
+
+    Multiple edubba blocks per tablet are allowed; they're additive."""
+    type_name: str
+    type_params: list[str]
+    methods: list[FnDecl]
+    line: int = _pos()
+    col:  int = _pos()
+
+
 Decl = Union[
-    FnDecl, TableDecl, StructDecl, SealDecl, ColophonDecl, GlossDecl, AliasDecl,
+    FnDecl, TableDecl, StructDecl, SealDecl, ColophonDecl, GlossDecl, EdubbaDecl, AliasDecl,
 ]
 
 @dataclass

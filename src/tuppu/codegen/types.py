@@ -390,8 +390,18 @@ class TypesMixin:
         for name, ty in self._struct_types.items():
             if ty is llvm_ty:
                 return name
-        for (name, _args), ty in self._struct_monomorphs.items():
+        for (name, args), ty in self._struct_monomorphs.items():
             if ty is llvm_ty:
+                # Mangle in the type args so distinct monomorphs
+                # (e.g. Box<i64> and Box<str>) get distinct release /
+                # clone symbol names. Strip whitespace and quotes so
+                # the result stays a valid LLVM identifier.
+                if args:
+                    arg_tag = "_".join(
+                        str(a).replace(" ", "").replace('"', "")
+                        for a in args
+                    )
+                    return f"{name}__{arg_tag}"
                 return name
         return None
 

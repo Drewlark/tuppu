@@ -239,6 +239,7 @@ INTRINSIC_NAMES = {
     "bytes_to_str", "buffer_to_str",
 }
 
+
 # The fixed set of operator-overload op names users may declare with
 # `gloss <op>(...)`. Each maps to the operator symbol it implements,
 # an arity ("bin" / "un"), and whether the return type is fixed.
@@ -376,6 +377,16 @@ class Checker:
         self.dvec_elem_at_call: dict[int, "Ty"] = {}
         self.dvec_elem_at_index: dict[int, "Ty"] = {}
         self.dvec_elem_at_for: dict[int, "Ty"] = {}
+        # Method-call dispatch: when a tablet exposes operations through
+        # `edubba T<...> { fn ... }`, each method becomes a regular
+        # mangled fn (`<TypeName>__<method>`) and lands in this registry
+        # under its short name. `_tc_method_call` resolves a receiver's
+        # type to its method table, picks the mangled fn name, and
+        # records both the dispatch target on `method_dispatch_target`
+        # and the mono args (if any) on `mono_call_args` so codegen can
+        # emit the call exactly like a regular generic free fn call.
+        self.tablet_methods: dict[str, dict[str, str]] = {}
+        self.method_dispatch_target: dict[int, str] = {}  # Call → fn name
         # Variadic calls: Call node id → synthesized TabletsLit holding
         # the collected trailing arguments. Codegen consults this to
         # emit the literal once for the last param slot.
@@ -434,6 +445,14 @@ class Checker:
                 self._resolve_struct_fields(d)
             elif isinstance(d, A.SealDecl):
                 self._resolve_seal_variants(d)
+        # Phase 0c: lower edubba blocks to flat FnDecls. By the time we
+        # reach the fn-signature phase, methods need to look like regular
+        # generic fns, so we splice them into `self.prog.decls` here and
+        # populate the method registry. The host tablet must exist (we
+        # validate against `self.structs` collected in 0a). The
+        # EdubbaDecl is dropped — every later phase iterates the new
+        # flat fns directly and never sees the wrapper.
+        self._lower_edubbas()
         # Phase 1: function signatures (parameter and return types can now
         # reference any struct). Colophons declare externs and join the
         # same fn table so call sites resolve uniformly. Gloss decls
@@ -492,6 +511,61 @@ class Checker:
             )
         self.structs[s.name] = TyStruct(name=s.name)
         self.struct_type_params[s.name] = tuple(s.type_params)
+
+    def _lower_edubbas(self) -> None:
+        """Splice each `edubba T<...> { fn ... }` block's methods into
+        the program's top-level decl list as flat FnDecls (with type
+        params copied from the host edubba) and register them in
+        `self.tablet_methods`. The EdubbaDecl wrapper is dropped — by
+        the time later phases iterate `self.prog.decls`, methods look
+        like ordinary generic free fns. Validation here:
+        - Host tablet must exist (registered in phase 0a).
+        - Edubba arity matches the tablet's type-param count.
+        - No two methods on the same tablet share a name.
+        - `mut self` is only allowed when the host tablet is itself
+          a struct codegen lowers to a mut-pointer parameter. (All
+          tablets currently qualify; the check is here so a future
+          built-in-only tablet shape gets a clear error.)
+        """
+        new_decls: list[A.Decl] = []
+        for d in self.prog.decls:
+            if not isinstance(d, A.EdubbaDecl):
+                new_decls.append(d)
+                continue
+            if d.type_name not in self.structs:
+                raise CheckError(
+                    f"edubba {d.type_name!r}: no tablet by that name",
+                    d.line, d.col,
+                )
+            host_params = self.struct_type_params.get(d.type_name, ())
+            if len(d.type_params) != len(host_params):
+                raise CheckError(
+                    f"edubba {d.type_name}: type-param arity {len(d.type_params)} "
+                    f"does not match tablet arity {len(host_params)}",
+                    d.line, d.col,
+                )
+            methods = self.tablet_methods.setdefault(d.type_name, {})
+            for m in d.methods:
+                # The parser mangled the method name as `<Type>__<name>`.
+                # Recover the short name for the registry.
+                if not m.name.startswith(f"{d.type_name}__"):
+                    raise CheckError(
+                        f"edubba {d.type_name}: malformed method name "
+                        f"{m.name!r} (compiler bug — parser should have "
+                        f"mangled this)",
+                        m.line, m.col,
+                    )
+                short = m.name[len(d.type_name) + 2:]
+                if short in methods:
+                    raise CheckError(
+                        f"edubba {d.type_name}: duplicate method "
+                        f"{short!r}",
+                        m.line, m.col,
+                    )
+                m.type_params = list(d.type_params)
+                methods[short] = m.name
+                new_decls.append(m)
+        self.prog.decls[:] = new_decls
 
     def _register_seal_name(self, s: A.SealDecl) -> None:
         if s.name in PRIM_TYPES:
@@ -1968,6 +2042,29 @@ class Checker:
                 f"dvec has no method {method!r}", e.line, e.col,
             )
 
+        # Method dispatch on a tablet receiver — `m.set(k, v)` resolves
+        # through `tablet_methods`, populated when the tablet's
+        # `edubba T { ... }` block was lowered. Receiver becomes the
+        # first arg; for mut methods codegen passes the lvalue pointer
+        # so receivers can be Field/Index paths without forcing the
+        # caller to bind to a mut Ident.
+        if (
+            isinstance(recv_ty, TyStruct)
+            and recv_ty.name in self.tablet_methods
+        ):
+            methods = self.tablet_methods[recv_ty.name]
+            if method in methods:
+                return self._tc_struct_method_dispatch(
+                    e, recv_ty, methods[method],
+                )
+            if methods:
+                available = ", ".join(sorted(methods))
+                raise CheckError(
+                    f"{recv_ty.name} has no method {method!r}; "
+                    f"available: {available}",
+                    e.line, e.col,
+                )
+
         # Struct field that happens to be a fn value — `obj.run(x)` is
         # not a method dispatch but a field-access-then-indirect-call.
         # Resolve the field's type via the struct registry; if it's a
@@ -1982,6 +2079,102 @@ class Checker:
             f"method call: {recv_name!r} is {recv_ty}, not a tablets",
             e.line, e.col,
         )
+
+    def _tc_struct_method_dispatch(
+        self, e: A.Call, recv_ty: "TyStruct", fn_name: str,
+    ) -> Ty:
+        """Route a method call on a stdlib tablet to its underlying free
+        function. The receiver was already typechecked by `_tc_method_call`
+        — we re-run the standard generic-fn unification flow here against
+        the synthetic arg list `[receiver, *e.args]`, pinning the
+        type-parameter substitution from the receiver's type up front so
+        callers don't need to spell `T` explicitly.
+
+        Records `mono_call_args[id(e)]` (when the underlying fn is generic)
+        and `method_dispatch_target[id(e)]` so codegen can find the target
+        and decide whether the receiver gets passed by pointer or value."""
+        fn = self.fns.get(fn_name)
+        if fn is None:
+            raise CheckError(
+                f"method dispatch on {recv_ty}: stdlib fn {fn_name!r} "
+                f"is missing — make sure the matching stdlib file is "
+                f"loaded",
+                e.line, e.col,
+            )
+        if len(fn.params) != len(e.args) + 1:
+            raise CheckError(
+                f"{fn_name} expects {len(fn.params) - 1} arg(s) after "
+                f"the receiver, got {len(e.args)}",
+                e.line, e.col,
+            )
+        type_params = self.fn_type_params.get(fn_name, ())
+        inst_names = [f"{fn_name}.{tp}#{id(e)}" for tp in type_params]
+        inst_subst = {
+            tp: TyVar(fresh)
+            for tp, fresh in zip(type_params, inst_names)
+        }
+        subst: dict[str, Ty] = {}
+        # Pin T from the receiver type before typechecking explicit args
+        # so their hints are concrete (e.g. `Map<JValue>.set(k, v)` knows
+        # v should be a JValue, not an open TyVar).
+        receiver_param = self._substitute(fn.params[0], inst_subst)
+        try:
+            self._unify(receiver_param, recv_ty, subst)
+        except _UnifyError as ex:
+            raise CheckError(
+                f"method dispatch: receiver has type {recv_ty}, but "
+                f"{fn_name}'s first param expects {fn.params[0]}"
+                f"{f' ({ex.detail})' if ex.detail else ''}",
+                e.line, e.col,
+            ) from None
+        arg_hints: list[Ty | None] = []
+        for pty in fn.params[1:]:
+            h = self._substitute(self._substitute(pty, inst_subst), subst)
+            arg_hints.append(
+                h if not self._has_open_tyvar(h, inst_names) else None
+            )
+        arg_tys = [
+            self._tc_expr(a, expected=h)
+            for a, h in zip(e.args, arg_hints)
+        ]
+        for i, (at, pty) in enumerate(zip(arg_tys, fn.params[1:]), start=1):
+            freshened = self._substitute(pty, inst_subst)
+            try:
+                self._unify(freshened, at, subst)
+            except _UnifyError as ex:
+                raise CheckError(
+                    f"call to {fn_name!r}: arg {i} has type {at}, "
+                    f"expected {pty}"
+                    f"{f' ({ex.detail})' if ex.detail else ''}",
+                    e.line, e.col,
+                ) from None
+        for i, (at, pty) in enumerate(zip(arg_tys, fn.params[1:]), start=1):
+            inst = self._substitute(self._substitute(pty, inst_subst), subst)
+            if not _coerces_to(at, inst):
+                raise CheckError(
+                    f"call to {fn_name!r}: arg {i} has type {at}, "
+                    f"expected {inst}",
+                    e.line, e.col,
+                )
+        ret = self._substitute(self._substitute(fn.ret, inst_subst), subst)
+        if type_params:
+            missing = [
+                tp for tp, fresh in zip(type_params, inst_names)
+                if fresh not in subst
+            ]
+            if missing:
+                raise CheckError(
+                    f"call to {fn_name!r}: could not infer type "
+                    f"parameter(s) {', '.join(missing)} from receiver "
+                    f"and argument types",
+                    e.line, e.col,
+                )
+            self.mono_call_args[id(e)] = tuple(
+                self._substitute(subst[fresh], subst)
+                for fresh in inst_names
+            )
+        self.method_dispatch_target[id(e)] = fn_name
+        return ret
 
     def _tc_field(self, e: A.Field) -> Ty:
         target_ty = self._tc_expr(e.target)
