@@ -573,6 +573,71 @@ def test_two_modules_can_each_declare_same_tablet_name(tmp_path):
     assert subprocess.run([str(binary)]).returncode == 42
 
 
+# --- qualified-name struct literals --------------------------------------
+
+
+def test_qualified_struct_lit_via_import_as(tmp_path):
+    """`o.Box { value: 42 }` works after `import other as o`. The
+    aliased form deliberately doesn't pollute local scope, so
+    qualified-lit is the only construction path."""
+    other = write(
+        tmp_path, "src/other.tpu",
+        "tablet Box<T> { value: T }\n",
+    )
+    main = write(
+        tmp_path, "src/main.tpu",
+        "import other as o\n"
+        "fn main() -> i32 {\n"
+        "  step b: o.Box<i64> = o.Box { value: 42 }\n"
+        "  b.value as i32\n"
+        "}\n",
+    )
+    binary = compile_files_to_binary([other, main], tmp_path / "build", name="prog")
+    assert subprocess.run([str(binary)]).returncode == 42
+
+
+def test_qualified_struct_lit_resolves_collision(tmp_path):
+    """When two modules each declare `tablet Counter`, qualified-lit
+    syntax disambiguates which Counter is being constructed even
+    when both are imported under aliases."""
+    foo = write(
+        tmp_path, "src/foo.tpu",
+        "tablet Counter { x: i64 }\n",
+    )
+    bar = write(
+        tmp_path, "src/bar.tpu",
+        "tablet Counter { y: i64 }\n",
+    )
+    main = write(
+        tmp_path, "src/main.tpu",
+        "import foo as f\n"
+        "import bar as b\n"
+        "fn main() -> i32 {\n"
+        "  step a: f.Counter = f.Counter { x: 5 }\n"
+        "  step c: b.Counter = b.Counter { y: 37 }\n"
+        "  (a.x + c.y) as i32\n"
+        "}\n",
+    )
+    binary = compile_files_to_binary([foo, bar, main], tmp_path / "build", name="prog")
+    assert subprocess.run([str(binary)]).returncode == 42
+
+
+def test_qualified_struct_lit_unknown_member_errors(tmp_path):
+    """`o.NoSuchTablet { ... }` after a valid import is a clear
+    'no public tablet' error, not a parse failure."""
+    other = write(tmp_path, "src/other.tpu", "tablet Real { x: i64 }\n")
+    main = write(
+        tmp_path, "src/main.tpu",
+        "import other as o\n"
+        "fn main() -> i32 { step _x: i32 = (o.NoSuchTablet { x: 0 }).x as i32\n 0 }\n",
+    )
+    with pytest.raises(CompileError, match="has no public tablet"):
+        check_sources([
+            (str(other), other.read_text()),
+            (str(main), main.read_text()),
+        ])
+
+
 # --- diagnostics: pretty-printed mangled names --------------------------
 
 

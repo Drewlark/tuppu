@@ -873,8 +873,12 @@ class Checker:
                 f"module {pretty!r} has no public type {tail!r}",
                 line, col,
             )
+        # Use the resolved decl's flat name to key the global tables —
+        # cross-module same-name tablets / seals would otherwise alias
+        # through `tail` and pick the wrong entry.
+        flat = self._flat_name(decl)
         if isinstance(decl, A.StructDecl):
-            params = self.struct_type_params.get(tail, ())
+            params = self.struct_type_params.get(flat, ())
             if type_args is None:
                 if params:
                     raise CheckError(
@@ -883,7 +887,7 @@ class Checker:
                         f"`{dotted}<...>`",
                         line, col,
                     )
-                return self.structs[tail]
+                return self.structs[flat]
             if len(params) != len(type_args):
                 raise CheckError(
                     f"{where or 'type'}: tablet {tail!r} expects "
@@ -895,9 +899,9 @@ class Checker:
                 self._resolve_type(a, f"{where or 'type'} type arg")
                 for a in type_args
             )
-            return TyStruct(name=tail, args=resolved)
+            return TyStruct(name=flat, args=resolved)
         if isinstance(decl, A.SealDecl):
-            params = self.seal_type_params.get(tail, ())
+            params = self.seal_type_params.get(flat, ())
             if type_args is None:
                 if params:
                     raise CheckError(
@@ -906,7 +910,7 @@ class Checker:
                         f"`{dotted}<...>`",
                         line, col,
                     )
-                return self.seals[tail]
+                return self.seals[flat]
             if len(params) != len(type_args):
                 raise CheckError(
                     f"{where or 'type'}: seal {tail!r} expects "
@@ -918,7 +922,7 @@ class Checker:
                 self._resolve_type(a, f"{where or 'type'} type arg")
                 for a in type_args
             )
-            return TySeal(name=tail, args=resolved)
+            return TySeal(name=flat, args=resolved)
         # decl exists but isn't a tablet/seal — type position requires
         # a type-bearing decl.
         raise CheckError(
@@ -1753,10 +1757,16 @@ class Checker:
             if t.name in self._active_type_vars:
                 return self._active_type_vars[t.name]
             # Module-qualified type: `qual.Tablet`. Resolves through
-            # the module_aliases entry the import set up.
+            # the module_aliases entry the import set up. Rewrites
+            # `t.name` to the resolved flat form so codegen
+            # `_lower_type` consumes a name already known to its
+            # struct/seal tables — no parallel qualifier-resolving
+            # path needed in codegen.
             if "." in t.name:
                 resolved = self._resolve_qualified_type(t.name, t.line, t.col)
                 if resolved is not None:
+                    if isinstance(resolved, (TyStruct, TySeal)):
+                        t.name = resolved.name
                     return resolved
             # Translate short name to flat (mangled) form via the
             # current module's visible scope. Falls back to short for
@@ -1803,6 +1813,8 @@ class Checker:
                     t.name, t.line, t.col, type_args=t.args, where=where,
                 )
                 if resolved is not None:
+                    if isinstance(resolved, (TyStruct, TySeal)):
+                        t.name = resolved.name
                     return resolved
             flat = self.module_visible.get(self.current_module, {}).get(t.name, t.name)
             if flat in self.structs:
@@ -3098,6 +3110,38 @@ class Checker:
         )
 
     def _tc_struct_lit(self, e: A.StructLit) -> Ty:
+        # Module-qualified literal: `mod.Tablet { ... }`. Resolve the
+        # qualifier through the current module's import aliases to
+        # find the source module, then take that decl's flat name
+        # directly. We rewrite `e.name` to the flat form (so
+        # downstream codegen consumes a name `_lower_type` /
+        # `_struct_types` already know) and pin `e.name` so the
+        # following short-name fallback looks it up directly in the
+        # global tables (no module_visible pollution — qualified-lit
+        # access is point-in-time per call site).
+        if "." in e.name:
+            qualifier, _, short_name = e.name.rpartition(".")
+            head, _, _rest = qualifier.partition(".")
+            aliases = self.module_aliases.get(self.current_module, {})
+            src_mod = aliases.get(head)
+            if src_mod is None:
+                raise CheckError(
+                    f"struct literal {e.name!r}: unknown module "
+                    f"qualifier {head!r}",
+                    e.line, e.col,
+                )
+            src_decl = self.module_decls.get(src_mod, {}).get(short_name)
+            if not isinstance(src_decl, A.StructDecl):
+                pretty = ".".join(src_mod) or "<root>"
+                raise CheckError(
+                    f"module {pretty!r} has no public tablet "
+                    f"{short_name!r}",
+                    e.line, e.col,
+                )
+            e.name = self._flat_name(src_decl)
+        # `e.name` is now either a short name (translates through
+        # module_visible below) or a flat name (already-resolved
+        # qualified literal — short==flat lookup is the identity).
         flat = self.module_visible.get(self.current_module, {}).get(e.name, e.name)
         if flat not in self.structs:
             raise CheckError(

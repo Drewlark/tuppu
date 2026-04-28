@@ -509,12 +509,13 @@ What v1 ships:
   across modules. Two modules can each declare `fn helper()` /
   `tablet Foo` / `seal Bar`. Single-module code (the common case)
   is unmangled.
-- **Module-qualified access.** Expression-level `parser.parse(x)`
-  works after `import parser` or `import x.y.parser as parser`.
-  Type-level `mod.Tablet` and `mod.Foo<T>` work in annotations.
-  Qualified-name struct literals (`mod.Tablet { ... }`) are the
-  one remaining gap (parser-only); short-name struct lits via
-  wildcard import work fine.
+- **Module-qualified access.** Expression-level `parser.parse(x)`,
+  type-level `mod.Tablet` / `mod.Foo<T>`, AND qualified-name struct
+  literals `mod.Tablet { field: value }` all work after `import
+  mod` or `import x.y.mod as mod`. The literal form disambiguates
+  cross-module same-name tablets unambiguously when both are
+  imported under aliases (alias-only imports don't pollute local
+  scope, so qualified-lit is the only construction path there).
 - **Edubba module isolation.** Edubba blocks can only extend
   tablets in their declaring module — foreign extensions are
   rejected. Multiple edubbas on the same host within one module

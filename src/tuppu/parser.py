@@ -467,6 +467,15 @@ class Parser:
 
     def parse_struct_lit(self) -> A.StructLit:
         name_tok = self.eat(Tok.IDENT, "tablet name")
+        # Dotted module-qualified form: `mod.Tablet { ... }` or
+        # `mod.sub.Tablet { ... }`. Collapse the segments into a single
+        # dotted string on `StructLit.name`; the typechecker splits at
+        # the last `.` to find the qualifier and the short tablet name.
+        full_name = name_tok.value
+        while self.check(Tok.DOT):
+            self.advance()
+            seg = self.eat(Tok.IDENT, "struct-lit segment after '.'")
+            full_name = f"{full_name}.{seg.value}"
         self.eat(Tok.LBRACE)
         fields: list[tuple[str, A.Expr]] = []
         self.skip_newlines()
@@ -483,7 +492,7 @@ class Parser:
                 break
         self.skip_newlines()
         self.eat(Tok.RBRACE)
-        return _at(name_tok, A.StructLit(name=name_tok.value, fields=fields))
+        return _at(name_tok, A.StructLit(name=full_name, fields=fields))
 
     def parse_table(self) -> A.TableDecl:
         start = self.eat(Tok.TABLE)
@@ -761,18 +770,28 @@ class Parser:
         if t.kind is Tok.LOST:
             self.advance(); return _at(t, A.LostLit())
         if t.kind is Tok.IDENT:
-            # `Name { field : ...` is a struct literal. The lookahead
-            # skips any NEWLINE tokens between the `{` and the first
-            # field so multi-line struct literals still trigger the
-            # struct-lit parse path. A block's first token is never
-            # IDENT-COLON because bindings require `step`/`mut`.
-            if self.peek(1).kind is Tok.LBRACE:
-                i = 2
-                while self.peek(i).kind is Tok.NEWLINE:
-                    i += 1
+            # `Name { field : ...` and `mod.Name { field : ...` are
+            # struct literals. The lookahead skips any NEWLINE tokens
+            # between the `{` and the first field so multi-line struct
+            # literals still trigger the struct-lit parse path. A
+            # block's first token is never IDENT-COLON because bindings
+            # require `step`/`mut`. The dotted form is unambiguous —
+            # a field-access chain followed by `{ IDENT :` doesn't
+            # form a valid expression elsewhere in the grammar (block
+            # bodies start with a stmt keyword, not a label).
+            #
+            # Walk past any `.IDENT` segments, then check for the
+            # struct-lit shape.
+            i = 1
+            while self.peek(i).kind is Tok.DOT and self.peek(i + 1).kind is Tok.IDENT:
+                i += 2
+            if self.peek(i).kind is Tok.LBRACE:
+                j = i + 1
+                while self.peek(j).kind is Tok.NEWLINE:
+                    j += 1
                 if (
-                    self.peek(i).kind is Tok.IDENT
-                    and self.peek(i + 1).kind is Tok.COLON
+                    self.peek(j).kind is Tok.IDENT
+                    and self.peek(j + 1).kind is Tok.COLON
                 ):
                     return self.parse_struct_lit()
             self.advance(); return _at(t, A.Ident(name=t.value))

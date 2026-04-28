@@ -134,12 +134,6 @@ Format: each section groups by area. Bullets prefix with severity:
   `__M_<mod>__<short>` mangle — module-prefix mangling is on for
   `fn`, `tablet`, and `seal` decls. Duplicate-name constraints now
   apply only within a single module.)
-- **[gap]** Qualified-name struct literals. `mod.Tablet { ... }` in
-  expression position doesn't parse — the struct-lit parser doesn't
-  see the dotted form as a type-position name. Wildcard `import mod`
-  brings the short name into local scope, so `Tablet { ... }`
-  works directly. Type-position annotations (`step x: mod.Tablet`)
-  do support the qualified form.
 
 ## Tooling
 
