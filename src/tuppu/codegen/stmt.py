@@ -340,6 +340,29 @@ class StmtMixin:
                 self._gc_root_counts.append(0)
             self._gc_root_counts[-1] += 1
 
+    def _register_wedge_root(self, slot: ir.Value) -> None:
+        """Push the shared `__tuppu_wedge` descriptor for a wedge slot.
+        Different from `_register_gc_root` because wedge values share
+        one descriptor regardless of element type — `mark_wedge` does
+        the chunk lookup itself — and the LLVM type at the slot is
+        plain `*T` so the standard `_get_type_desc` path returns None.
+        Counts toward the same frame pop tally."""
+        if not self._cleanup_frames:
+            return
+        b = self.builder
+        assert b is not None
+        desc = self._get_wedge_descriptor()
+        b.call(
+            self._get_gc_push_root(),
+            [
+                b.bitcast(slot, I8.as_pointer()),
+                b.bitcast(desc, I8.as_pointer()),
+            ],
+        )
+        while len(self._gc_root_counts) < len(self._cleanup_frames):
+            self._gc_root_counts.append(0)
+        self._gc_root_counts[-1] += 1
+
     def _push_cleanup_frame(self) -> None:
         """Push a fresh cleanup frame + GC-root counter in lockstep."""
         self._cleanup_frames.append([])
@@ -458,6 +481,10 @@ class StmtMixin:
         self._emit_all_gc_root_pops_for_early_return()
 
     def _gen_binding(self, b: A.Binding) -> None:
+        is_wedge_binding = (
+            self._checker is not None
+            and id(b) in self._checker.wedge_bindings
+        )
         # Uninitialized mut binding with explicit type: zero-initialize.
         if b.init is None:
             assert b.is_mut and b.type_ann is not None  # parser enforces this
@@ -467,6 +494,8 @@ class StmtMixin:
             self.builder.store(ir.Constant(ty, None), slot)
             self._bind(b.name, Variable(is_mut=True, ir_ref=slot, value_ty=ty))
             self._maybe_register_cleanup(b.name, ty, slot)
+            if is_wedge_binding:
+                self._register_wedge_root(slot)
             return
 
         # Tablets literal as initializer: `_gen_tablets_lit_addr` already
@@ -502,6 +531,8 @@ class StmtMixin:
             self.builder.store(init_val, slot)
             self._bind(b.name, Variable(is_mut=True, ir_ref=slot, value_ty=init_val.type))
             self._maybe_register_cleanup(b.name, init_val.type, slot)
+            if is_wedge_binding:
+                self._register_wedge_root(slot)
         else:
             # Step-bound cleanup-bearing values need a slot so the
             # scope-exit release can see them. Covers the built-in str
@@ -562,6 +593,21 @@ class StmtMixin:
                 is_mut=False, ir_ref=init_val, value_ty=init_val.type,
                 transfer_on_tail=transfer_on_tail,
             ))
+            if is_wedge_binding:
+                # `push_root` needs an addressable slot — the wedge
+                # value above is just an SSA pointer. Spill it into
+                # one and push that as the root. The read path (via
+                # the Variable above) is whatever step's convention is
+                # at the time; this side slot only exists for the GC
+                # to scan. If step bindings later become slot-backed
+                # uniformly, this spill collapses into the binding's
+                # main slot.
+                assert self.builder is not None
+                wedge_slot = self._alloca_entry(
+                    init_val.type, f"{b.name}.wedge_root",
+                )
+                self.builder.store(init_val, wedge_slot)
+                self._register_wedge_root(wedge_slot)
 
     def _maybe_register_cleanup(
         self, name: str, value_ty: ir.Type, slot: ir.Value,

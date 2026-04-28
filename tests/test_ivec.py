@@ -586,3 +586,85 @@ fn main() -> i32 {
     rc, stdout = run(src, tmp_path, stress)
     assert rc == 0
     assert stdout == b"33\n"
+
+
+def test_wedge_outlives_source_under_heavy_churn(tmp_path, stress):
+    # Same shape as test_arena_wedge_outlives_source_ivec but with
+    # 5000 caller-side allocations instead of 200. Linux's glibc
+    # allocator is slow to recycle the bytes the swept arena
+    # released, so the lighter test passed on Linux even when the
+    # wedge had no shadow-stack root — the freed bytes hadn't been
+    # overwritten by the read. macOS hit the bug on 200. With heavy
+    # churn the bug surfaces on every platform; the test pins down
+    # the wedge-rooting fix so a future regression can't silently
+    # pass on one OS while corrupting on another.
+    src = """
+tablet Item { v: i64 }
+
+fn build_and_pluck() -> wedge Item {
+  mut iv: ivec<Item>
+  iv.push(Item { v: 11 })
+  iv.push(Item { v: 22 })
+  step h: wedge Item = iv.push(Item { v: 33 })
+  mut i: i64 = 0
+  while i < 100 {
+    iv.push(Item { v: i })
+    i = i + 1
+  }
+  h
+}
+
+fn main() -> i32 {
+  step pluck: wedge Item = build_and_pluck()
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 5000 {
+    acc = acc + "x"
+    i = i + 1
+  }
+  println(pluck.v)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"33\n"
+
+
+def test_mut_wedge_binding_rooted(tmp_path, stress):
+    # Companion to the step-binding case: a `mut` wedge binding goes
+    # through a different `_gen_binding` arm. Under stress mode
+    # without rooting, the chunk would also be swept.
+    src = """
+tablet Item { v: i64 }
+
+fn build() -> wedge Item {
+  mut iv: ivec<Item>
+  iv.push(Item { v: 100 })
+  iv.push(Item { v: 200 })
+  step h: wedge Item = iv.push(Item { v: 999 })
+  mut i: i64 = 0
+  while i < 80 {
+    iv.push(Item { v: i })
+    i = i + 1
+  }
+  h
+}
+
+fn main() -> i32 {
+  mut pluck: wedge Item = build()
+  // Heavy caller-side churn through string concat — the only path
+  // to pluck's chunk is mark_wedge on the rooted slot.
+  mut acc: str = ""
+  mut i: i64 = 0
+  while i < 3000 {
+    acc = acc + "y"
+    i = i + 1
+  }
+  println(pluck.v)
+  0
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 0
+    assert stdout == b"999\n"

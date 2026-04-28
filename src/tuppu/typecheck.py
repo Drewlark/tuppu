@@ -377,6 +377,15 @@ class Checker:
         self.dvec_elem_at_call: dict[int, "Ty"] = {}
         self.dvec_elem_at_index: dict[int, "Ty"] = {}
         self.dvec_elem_at_for: dict[int, "Ty"] = {}
+        # Bindings whose resolved type is `wedge T`. Codegen consults
+        # this set to spill the wedge value to a stack slot and push it
+        # as a GC root with a trace fn that calls `mark_wedge` — without
+        # this, a wedge held across allocations whose source ivec /
+        # tablets has gone out of scope can be the only path to its
+        # chunk, and the chunk is silently swept (the LLVM type is just
+        # a plain pointer, so the chokepoint's `_type_desc_key` returns
+        # None and no root push happens).
+        self.wedge_bindings: set[int] = set()
         # Method-call dispatch: when a tablet exposes operations through
         # `edubba T<...> { fn ... }`, each method becomes a regular
         # mangled fn (`<TypeName>__<method>`) and lands in this registry
@@ -1185,6 +1194,7 @@ class Checker:
         if b.init is None:
             assert declared is not None  # parser enforces this
             self._bind(b.name, declared, b.line, b.col)
+            self._maybe_mark_wedge_binding(b, declared)
             return
         init_ty = self._tc_expr(b.init, expected=declared)
         if declared is not None:
@@ -1195,8 +1205,17 @@ class Checker:
                     b.line, b.col,
                 )
             self._bind(b.name, declared, b.line, b.col)
+            self._maybe_mark_wedge_binding(b, declared)
         else:
             self._bind(b.name, init_ty, b.line, b.col)
+            self._maybe_mark_wedge_binding(b, init_ty)
+
+    def _maybe_mark_wedge_binding(self, b: A.Binding, ty: Ty) -> None:
+        """If the binding holds a `wedge T` value, record it so codegen
+        emits the GC-root spill. The LLVM lowering loses wedge-ness
+        (just a pointer), so we have to surface it from here."""
+        if isinstance(ty, TyHandle):
+            self.wedge_bindings.add(id(b))
 
     def _tc_assign(self, a: A.Assign) -> None:
         # Type-check the target as an expression: this both validates
