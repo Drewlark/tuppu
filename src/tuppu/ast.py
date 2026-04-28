@@ -20,7 +20,14 @@ def _pos():
 
 @dataclass
 class TypeName:
-    name: str                        # "i64", "bool", "rat", or a struct name
+    """A simple type-position name. `name` is the source-level
+    identifier — `"i64"`, `"bool"`, `"rat"`, a tablet/seal name,
+    or a dotted module-qualified form like `"mod.Foo"` (parser
+    collapses dotted segments into one stringly-typed field for
+    minimal AST surface change). The typechecker splits the dot at
+    use sites; a (qualifier, short) tuple shape would be cleaner
+    long-term but isn't load-bearing yet."""
+    name: str                        # "i64", "bool", "rat", "Tablet", or "mod.Foo"
     line: int = _pos()
     col:  int = _pos()
 

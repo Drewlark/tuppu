@@ -512,10 +512,43 @@ def test_two_modules_can_each_declare_same_fn_name(tmp_path):
     assert subprocess.run([str(binary)]).returncode == 42
 
 
+def test_edubba_works_on_cross_module_collision_tablets(tmp_path):
+    """Two modules each declare `tablet Counter` AND an
+    `edubba Counter { ... }` on it. Each tablet's edubba methods need
+    to land in distinct global symbols (`__M_foo__Counter__bump` vs
+    `__M_bar__Counter__bump`) — without the host's flat name flowing
+    through `_lower_edubbas`, the host-not-found check spuriously
+    fired and cross-module same-name edubbas couldn't ship methods at
+    all."""
+    foo = write(
+        tmp_path, "src/foo.tpu",
+        "tablet Counter { x: i64 }\n"
+        "edubba Counter { fn bump(self) -> i64 { self.x + 1 } }\n",
+    )
+    bar = write(
+        tmp_path, "src/bar.tpu",
+        "tablet Counter { y: i64 }\n"
+        "edubba Counter { fn bump(self) -> i64 { self.y * 10 } }\n",
+    )
+    main = write(
+        tmp_path, "src/main.tpu",
+        "from foo import Counter as FC\n"
+        "from bar import Counter as BC\n"
+        "fn main() -> i32 {\n"
+        "  step f: FC = FC { x: 1 }\n"
+        "  step b: BC = BC { y: 4 }\n"
+        "  (f.bump() + b.bump()) as i32\n"
+        "}\n",
+    )
+    binary = compile_files_to_binary([foo, bar, main], tmp_path / "build", name="prog")
+    assert subprocess.run([str(binary)]).returncode == 42
+
+
 def test_two_modules_can_each_declare_same_tablet_name(tmp_path):
-    """`tablet Foo` in two different modules — typecheck accepts both
-    via module-prefix mangling, but codegen rejects the second one
-    because its struct-type tables are still short-name-keyed."""
+    """`tablet Foo` in two different modules coexists end-to-end —
+    each becomes a distinct LLVM identified type via module-prefix
+    mangling. The two `Foo`s are distinct nominal types: a `foo.Foo`
+    value can't be assigned to a `bar.Foo` slot."""
     foo = write(
         tmp_path, "src/foo.tpu",
         "tablet Foo { x: i64 }\n"
@@ -538,6 +571,44 @@ def test_two_modules_can_each_declare_same_tablet_name(tmp_path):
     )
     binary = compile_files_to_binary([foo, bar, main], tmp_path / "build", name="prog")
     assert subprocess.run([str(binary)]).returncode == 42
+
+
+# --- diagnostics: pretty-printed mangled names --------------------------
+
+
+def test_error_messages_prettify_mangled_type_names(tmp_path):
+    """A type mismatch involving cross-module same-name tablets
+    surfaces them as `foo.Counter` / `bar.Counter` in the error,
+    not the raw `__M_foo__Counter` mangle."""
+    foo = write(
+        tmp_path, "src/foo.tpu",
+        "tablet Counter { x: i64 }\n"
+        "fn make_foo() -> Counter { Counter { x: 7 } }\n",
+    )
+    bar = write(
+        tmp_path, "src/bar.tpu",
+        "tablet Counter { y: i64 }\n",
+    )
+    main = write(
+        tmp_path, "src/main.tpu",
+        "from foo import Counter as FC, make_foo\n"
+        "from bar import Counter as BC\n"
+        "fn main() -> i32 {\n"
+        "  step b: BC = make_foo()\n"  # type mismatch
+        "  0\n"
+        "}\n",
+    )
+    with pytest.raises(CompileError) as ei:
+        check_sources([
+            (str(foo), foo.read_text()),
+            (str(bar), bar.read_text()),
+            (str(main), main.read_text()),
+        ])
+    msg = str(ei.value)
+    # The pretty form contains the dotted module path; the raw mangle
+    # has the `__M_` prefix users shouldn't see.
+    assert "__M_" not in msg
+    assert "foo.Counter" in msg or "bar.Counter" in msg
 
 
 # --- regression: existing single-source tests keep working ---------------

@@ -482,57 +482,70 @@ from stdlib.map import Map, get as map_get
 
 What v1 ships:
 - **Lexer / parser / AST** — `import` and `from` keywords, dotted
-  paths, optional `as <local_name>` per imported name.
-  `import x as y` (wildcard alias) reserved for v2 with a clear
-  error message.
+  paths, optional `as <local_name>` per imported name. All three
+  forms are wired end-to-end: `import x.y` (wildcard + qualifier),
+  `import x.y as z` (alias-only qualifier), `from x.y import a, b
+  as c` (selective).
 - **Driver discovery** — `tuppu run src/` (or any directory input)
   walks the tree for `.tpu` files. Each file is assigned a module
   path: `stdlib/list.tpu` → `("stdlib", "list")`,
   `src/sema/typecheck.tpu` → `("sema", "typecheck")`,
-  `<source>` (single-string compiles) → `()` (root).
-- **Import validation** — unknown module path errors at typecheck;
-  `from x import y` checks `y` exists in `x` and isn't private.
+  `<source>` (single-string compiles) and `examples/` files → `()`
+  (root).
+- **Real per-module name resolution.** A top-level name in module B
+  is visible in module A only if A explicitly imports it. Cross-
+  module references without an import give a targeted "name X is
+  declared in module 'foo' but not in scope here; add `from foo
+  import X`" error.
 - **`_`-prefix visibility** — top-level decls whose name starts with
-  `_` are private to their declaring module. Reads from another
-  module error with `"name '_foo' is private to module 'x'..."`.
-- **Backward compat** — global flat namespace preserved. Existing
-  multi-file tests, the auto-included stdlib, and single-source
-  compiles all keep working with no changes. Imports are validated
-  but otherwise semantically a no-op in v1: names already share
-  the global namespace, so `from x import y` is decorative for
-  anything not `_`-prefixed.
+  `_` are private to their declaring module.
+- **Variant disambiguation across modules** — fixes the old flat-
+  seal-variant bug. `seal Foo { X }` and `seal Bar { X }` in
+  different modules coexist; use sites pick the right `X` via the
+  importer's visible variants. Multiple imported seals contributing
+  the same variant name surface as ambiguity at the use site.
+- **Module-prefix LLVM mangling** — `__M_<mod>__<short>` for non-
+  extern user fns / tablets / seals when a short name is shared
+  across modules. Two modules can each declare `fn helper()` /
+  `tablet Foo` / `seal Bar`. Single-module code (the common case)
+  is unmangled.
+- **Module-qualified access.** Expression-level `parser.parse(x)`
+  works after `import parser` or `import x.y.parser as parser`.
+  Type-level `mod.Tablet` and `mod.Foo<T>` work in annotations.
+  Qualified-name struct literals (`mod.Tablet { ... }`) are the
+  one remaining gap (parser-only); short-name struct lits via
+  wildcard import work fine.
+- **Edubba module isolation.** Edubba blocks can only extend
+  tablets in their declaring module — foreign extensions are
+  rejected. Multiple edubbas on the same host within one module
+  are additive (existing behavior).
+- **Cycle detection.** Import graph walked DFS in phase 0; back-
+  edges trip a `circular import detected: A -> B -> A` error.
+- **Script-mode shortcut.** Code in the root module `()` (single-
+  source compiles, ad-hoc scripts in tmp_path, the `examples/`
+  directory) auto-imports every public stdlib decl and every public
+  stdlib variant. Code under `src/` and inside `stdlib/` requires
+  explicit imports. Keeps script mode one-liner-friendly without
+  abandoning project-mode discipline.
+- **Pretty diagnostics.** Mangled names are rendered as `mod.short`
+  in error messages via `_pretty_flat_name` so users never see
+  `__M_foo__Counter`.
 
-Tests: `tests/test_modules.py` (20 cases — lexer, parser, module
-path derivation, import validation, visibility within / across
-modules, single-source regression).
+Tests: `tests/test_modules.py` (37 cases) covers lexer, parser,
+module path derivation, import validation, per-module visibility,
+cross-module variant disambiguation, qualified access (call + type),
+cycle detection, edubba isolation, edubba additivity within a
+module, edubba+collision tablets, cross-module same-name fns and
+tablets.
 
-### v2 (queued)
+### Known gaps (real LIMITATIONS.md entries)
 
-The bigger lift the strategy doc described — what v1 deliberately
-deferred:
-- **Per-module name resolution.** A name in module A is not visible
-  from module B unless explicitly imported. Wildcard `import x.y`
-  expands to bringing every public decl into the current scope,
-  rather than just being a noop (today). Stdlib's auto-include
-  becomes `from stdlib.* import *` semantically rather than "merge
-  the namespaces."
-- **Module-prefix LLVM mangling.** Non-extern user fns / tablets /
-  seals get a `<module>__<name>` symbol mangle, so two modules can
-  each declare `Map<T>` (or `seal A { X }; seal B { X }` —
-  the LIMITATIONS.md flat-seal-variant bug) without collision at
-  the IR level.
-- **Cross-module variant disambiguation.** `variant_lookup` gets
-  keyed by (module, name); a use site searches the current module
-  first, then imported modules, errors on ambiguity.
-- **Qualified module access.** `parser.parse(x)` and `map.Map<T>` —
-  the typechecker recognises `parser` as an imported module name
-  and treats the Field/TypeApply as a module-qualified lookup
-  (rather than an ordinary field/struct access). Needs care so
-  local-binding shadowing wins, and needs parser support for
-  dotted type names in `TypeApply`.
-- **`import x.y as z`.** Currently rejected at parse with a "not
-  yet supported" message. Falls out naturally once qualified
-  access lands — `z.foo` is the alias-prefixed form of `x.y.foo`.
+- **Qualified-name struct literals.** `mod.Tablet { ... }` in
+  expression position doesn't parse — the struct-lit parser doesn't
+  see the dotted form. Use the unqualified form (wildcard import
+  brings the short name into scope) or build via a
+  factory fn. Type-position annotations (`step x: mod.Tablet`)
+  work.
 
 ## 3. Sex Phase 3 — /, escape analysis (3a done)
 

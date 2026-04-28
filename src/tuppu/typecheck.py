@@ -160,25 +160,32 @@ class TyStruct:
     """A user-defined tablet (product) type. Nominally typed — equal
     by name only, with an optional tuple of instantiated type args
     for generic tablets. `Node<i64>` and `Node<str>` are different
-    TyStructs; `Node` (non-generic) has args=()."""
+    TyStructs; `Node` (non-generic) has args=().
+
+    `name` holds the typecheck-assigned flat (possibly module-prefix-
+    mangled) name; `__str__` prettifies it for diagnostics so users
+    see `foo.Counter` rather than `__M_foo__Counter`."""
     name: str
     args: tuple = ()    # tuple of Ty, type arguments for generic tablets
     def __str__(self) -> str:
+        pretty = _pretty_flat_name(self.name)
         if not self.args:
-            return self.name
-        return f"{self.name}<{', '.join(str(a) for a in self.args)}>"
+            return pretty
+        return f"{pretty}<{', '.join(str(a) for a in self.args)}>"
 
 @dataclass(frozen=True)
 class TySeal:
     """A user-defined seal (sum) type. Like TyStruct it's nominal and
     carries an optional tuple of type args for generic seals — so
-    `Option<i64>` and `Option<str>` are distinct TySeals."""
+    `Option<i64>` and `Option<str>` are distinct TySeals. `name` is
+    the flat form; `__str__` prettifies."""
     name: str
     args: tuple = ()
     def __str__(self) -> str:
+        pretty = _pretty_flat_name(self.name)
         if not self.args:
-            return self.name
-        return f"{self.name}<{', '.join(str(a) for a in self.args)}>"
+            return pretty
+        return f"{pretty}<{', '.join(str(a) for a in self.args)}>"
 
 @dataclass(frozen=True)
 class TyVar:
@@ -262,6 +269,21 @@ def _mangle_module_name(module: tuple[str, ...], short: str) -> str:
     if not module or short in BUILTIN_NAMES:
         return short
     return "__M_" + "__".join(module) + "__" + short
+
+
+def _pretty_flat_name(flat: str) -> str:
+    """Render a possibly-mangled flat name for error messages.
+    `__M_stdlib__list__push` becomes `stdlib.list.push`; short forms
+    pass through unchanged so single-module diagnostics are unaffected.
+    Used by `TyStruct.__str__` / `TySeal.__str__` and by the message
+    rendering in `Checker._fmt_name`."""
+    if not flat.startswith("__M_"):
+        return flat
+    body = flat[len("__M_"):]
+    parts = body.split("__")
+    if len(parts) < 2:
+        return flat
+    return ".".join(parts)
 
 
 # The fixed set of operator-overload op names users may declare with
@@ -1183,11 +1205,34 @@ class Checker:
             if not isinstance(d, A.EdubbaDecl):
                 new_decls.append(d)
                 continue
-            if d.type_name not in self.structs:
+            edubba_mod = self.prog.module_of.get(id(d), ())
+            # Find the host tablet. Two modules CAN each declare a
+            # tablet by the same short name (cross-module mangling),
+            # so the search has to be module-aware: try the edubba's
+            # own module first, then fall back to any other module so
+            # the diagnostic-friendly "edubba can only extend tablets
+            # in their host's module" error still fires for foreign
+            # extensions. The first-match-wins ordering matters.
+            host_decl = None
+            host_mod = None
+            same_mod_decls = self.module_decls.get(edubba_mod, {})
+            cand = same_mod_decls.get(d.type_name)
+            if isinstance(cand, A.StructDecl):
+                host_decl = cand
+                host_mod = edubba_mod
+            else:
+                for mod, decls in self.module_decls.items():
+                    cand = decls.get(d.type_name)
+                    if isinstance(cand, A.StructDecl):
+                        host_decl = cand
+                        host_mod = mod
+                        break
+            if host_decl is None:
                 raise CheckError(
                     f"edubba {d.type_name!r}: no tablet by that name",
                     d.line, d.col,
                 )
+            host_flat = self._flat_name(host_decl)
             # An edubba block can only extend a tablet declared in the
             # same module — outside modules can't bolt methods onto
             # someone else's tablet (that's both a module-pollution
@@ -1195,15 +1240,7 @@ class Checker:
             # invariants). Multiple edubba blocks for the same tablet
             # within one module are fine and additive — the existing
             # method registry below catches duplicate method names.
-            edubba_mod = self.prog.module_of.get(id(d), ())
-            host_mod = None
-            for mod, decls in self.module_decls.items():
-                if d.type_name in decls and isinstance(
-                    decls[d.type_name], A.StructDecl,
-                ):
-                    host_mod = mod
-                    break
-            if host_mod is not None and host_mod != edubba_mod:
+            if host_mod != edubba_mod:
                 here = ".".join(edubba_mod) or "<root>"
                 there = ".".join(host_mod) or "<root>"
                 raise CheckError(
@@ -1213,14 +1250,14 @@ class Checker:
                     f"tablet's own module",
                     d.line, d.col,
                 )
-            host_params = self.struct_type_params.get(d.type_name, ())
+            host_params = self.struct_type_params.get(host_flat, ())
             if len(d.type_params) != len(host_params):
                 raise CheckError(
                     f"edubba {d.type_name}: type-param arity {len(d.type_params)} "
                     f"does not match tablet arity {len(host_params)}",
                     d.line, d.col,
                 )
-            methods = self.tablet_methods.setdefault(d.type_name, {})
+            methods = self.tablet_methods.setdefault(host_flat, {})
             for m in d.methods:
                 # The parser mangled the method name as `<Type>__<name>`.
                 # Recover the short name for the registry.
@@ -1239,7 +1276,19 @@ class Checker:
                         m.line, m.col,
                     )
                 m.type_params = list(d.type_params)
-                methods[short] = m.name
+                # Method-mangled name lives in the host's flat
+                # namespace so two modules each declaring `edubba Foo
+                # { fn bar(self) ... }` produce distinct global
+                # symbols. Without this both methods would key into
+                # `self.fns` as `Foo__bar` and the second registration
+                # would error with "duplicate function".
+                method_flat = f"{host_flat}__{short}"
+                self.flat_name_for[id(m)] = method_flat
+                # Preserve the AST-level decl module for the spliced
+                # method so subsequent registration phases set the
+                # right current-module context.
+                self.prog.module_of[id(m)] = edubba_mod
+                methods[short] = method_flat
                 new_decls.append(m)
         self.prog.decls[:] = new_decls
 
