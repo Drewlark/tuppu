@@ -22,6 +22,8 @@
 // be any lvalue path: `bag.items.set(k, v)`, `slots[i].m.set(k, v)`.
 // No `mut` Ident binding required.
 
+from stdlib.str import str_eq
+
 tablet Map<T> {
   keys:   tablets[64]str,
   values: tablets[64]T,

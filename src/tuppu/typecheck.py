@@ -371,11 +371,22 @@ class Checker:
         # seal name → tuple of (variant_name, tuple of field Ty).
         # Order is source order so codegen can assign stable tag indices.
         self.seal_variants: dict[str, tuple[tuple[str, tuple[Ty, ...]], ...]] = {}
-        # variant_name → (seal_name, variant_index, declared_field_tys).
-        # Variant names are globally unique because qualified-variant
-        # syntax (`Seal::Variant`) hasn't been designed yet — ambiguity
-        # would force that decision.
-        self.variant_lookup: dict[str, tuple[str, int, tuple[Ty, ...]]] = {}
+        # variant_name → list of (seal_name, variant_idx, declared_field_tys,
+        # declaring_module). Multi-keyed because two seals in different
+        # modules may declare the same variant name (the LIMITATIONS.md
+        # flat-seal-variant gap is fixed via per-module disambiguation
+        # at use sites). Within a single module two seals still can't
+        # share a variant name.
+        self.variant_lookup: dict[str, list[tuple[str, int, tuple[Ty, ...], tuple[str, ...]]]] = {}
+        # mod → {variant_name: list[(seal_name, idx, field_tys, decl_module)]}.
+        # Populated by `_build_module_visible_variants` after seal
+        # variants are resolved. The list shape lets the use-site
+        # resolver detect ambiguity when two imported seals each
+        # contribute the same variant name into one module's scope.
+        self.module_visible_variants: dict[
+            tuple[str, ...],
+            dict[str, list[tuple[str, int, tuple[Ty, ...], tuple[str, ...]]]],
+        ] = {}
         # Generics: per-tablet type-parameter names, in declaration order.
         self.struct_type_params: dict[str, tuple[str, ...]] = {}
         # Generics: per-fn type-parameter names.
@@ -521,6 +532,11 @@ class Checker:
                 self._resolve_struct_fields(d)
             elif isinstance(d, A.SealDecl):
                 self._resolve_seal_variants(d)
+        # Phase 0b': now that every seal's variants are resolved into
+        # `self.variant_lookup`, build the per-module visible-variants
+        # table. Use sites consult this to pick the right variant when
+        # cross-module variant-name reuse exists.
+        self._build_module_visible_variants()
         # Phase 0c: lower edubba blocks to flat FnDecls. By the time we
         # reach the fn-signature phase, methods need to look like regular
         # generic fns, so we splice them into `self.prog.decls` here and
@@ -626,6 +642,32 @@ class Checker:
             self.module_visible[mod] = scope
             self.module_aliases[mod] = {}
             self.module_qualified_refs[mod] = set()
+
+        # Root-module ergonomic shortcut: when code lives outside `src/`
+        # / `stdlib/` (single-source compiles, ad-hoc scripts in
+        # `tmp_path`, the `examples/` directory), every public stdlib
+        # decl is in scope unprefixed. Inside `src/` and inside
+        # `stdlib/`, the shortcut is OFF — those modules must explicitly
+        # `from stdlib.X import Y`. The split is between "script mode"
+        # (root: ergonomics) and "project mode" (src/, stdlib/: import
+        # discipline). The strategy doc didn't anticipate `<source>`-
+        # style ad-hoc compiles, but the cwd-as-project-root convention
+        # naturally accommodates both: you opt into project mode by
+        # putting code under `src/`.
+        if () in self.module_visible:
+            for mod in list(self._known_modules):
+                if mod and mod[0] == "stdlib":
+                    for short in self.module_decls.get(mod, {}):
+                        if short.startswith("_"):
+                            continue
+                        self.module_visible[()].setdefault(
+                            short, _mangle_module_name(mod, short),
+                        )
+                    # Also register the stdlib module's last segment as
+                    # a module-qualifier in root, so `list.list_push`
+                    # syntax (when qualified access lands) resolves.
+                    self.module_aliases[()].setdefault(mod[-1], mod)
+                    self.module_qualified_refs[()].add(mod)
 
         # Step 2 + 3 + 4: process imports.
         for d in self.prog.decls:
@@ -733,28 +775,177 @@ class Checker:
             return None
         return _mangle_module_name(src_mod, short_name)
 
-    def _check_visibility(self, name: str, line: int, col: int) -> None:
-        """Cross-module visibility for `_`-prefixed names while the full
-        scope refactor is in progress. Once every lookup site routes
-        through `_resolve_top_level`, this becomes redundant — a private
-        name simply isn't in any other module's visible scope, so
-        resolution naturally fails. Until then this gate keeps the
-        contract explicit."""
-        if not name.startswith("_"):
+    def _build_module_visible_variants(self) -> None:
+        """Populate `self.module_visible_variants[mod]` for every known
+        module. The visible variants in module M are:
+          - own seals' variants
+          - variants of seals imported via `from X import SealName` or
+            wildcard `import X` (where X has at least one seal)
+          - (root only) variants of every public stdlib seal — matches
+            the auto-import shortcut in `_build_module_scopes`
+
+        Variant names that resolve to multiple distinct (seal, module)
+        pairs in the same scope land here as the single registered
+        entry; ambiguity is detected at use time when the user picks
+        the name. Per-module same-name-twice is already rejected at
+        registration in `_resolve_seal_variants`."""
+        # Map: (seal_name, decl_mod) -> {variant_name: (seal, idx, fields, mod)}
+        per_seal: dict[tuple[str, tuple[str, ...]], dict[str, tuple[str, int, tuple[Ty, ...], tuple[str, ...]]]] = {}
+        for vname, entries in self.variant_lookup.items():
+            for seal, idx, fields, decl_mod in entries:
+                per_seal.setdefault((seal, decl_mod), {})[vname] = (
+                    seal, idx, fields, decl_mod,
+                )
+
+        def _add(visible_map, vname, info):
+            """Append `info` to visible_map[vname] unless an identical
+            entry is already there (avoids spurious duplicates from
+            wildcard + selective imports of the same seal)."""
+            entries = visible_map.setdefault(vname, [])
+            if info not in entries:
+                entries.append(info)
+
+        for mod in self._known_modules:
+            visible: dict[str, list[tuple[str, int, tuple[Ty, ...], tuple[str, ...]]]] = {}
+            # Own seals.
+            for name, decl in self.module_decls.get(mod, {}).items():
+                if isinstance(decl, A.SealDecl):
+                    for vname, info in per_seal.get((name, mod), {}).items():
+                        _add(visible, vname, info)
+            self.module_visible_variants[mod] = visible
+
+        # Process imports: bring in the variants of every imported seal.
+        for d in self.prog.decls:
+            if not isinstance(d, A.ImportDecl):
+                continue
+            importer = self.prog.module_of.get(id(d), ())
+            src_mod = tuple(d.path)
+            src_decls = self.module_decls.get(src_mod, {})
+            if d.names is None and d.wildcard_alias is None:
+                # `import x.y` (wildcard) — every public seal's variants.
+                for sname, decl in src_decls.items():
+                    if sname.startswith("_"):
+                        continue
+                    if not isinstance(decl, A.SealDecl):
+                        continue
+                    for vname, info in per_seal.get((sname, src_mod), {}).items():
+                        _add(self.module_visible_variants[importer], vname, info)
+            elif d.names is not None:
+                # `from x import a, b as c` — only the named decls.
+                for src_name, _alias in d.names:
+                    decl = src_decls.get(src_name)
+                    if not isinstance(decl, A.SealDecl):
+                        continue
+                    for vname, info in per_seal.get((src_name, src_mod), {}).items():
+                        _add(self.module_visible_variants[importer], vname, info)
+
+        # Root-mode auto-stdlib: bring every public stdlib seal's variants
+        # into root's visible variants. Mirrors the auto-import
+        # shortcut for top-level decls in `_build_module_scopes`.
+        for mod in list(self._known_modules):
+            if mod and mod[0] == "stdlib":
+                for sname, decl in self.module_decls.get(mod, {}).items():
+                    if sname.startswith("_"):
+                        continue
+                    if not isinstance(decl, A.SealDecl):
+                        continue
+                    for vname, info in per_seal.get((sname, mod), {}).items():
+                        _add(self.module_visible_variants.setdefault((), {}), vname, info)
+
+    def _resolve_variant(
+        self, name: str, line: int, col: int,
+    ) -> tuple[str, int, tuple[Ty, ...], tuple[str, ...]] | None:
+        """Look up `name` in the current module's visible variants.
+
+        Outcomes:
+          - exactly one entry → returns (seal, idx, fields, decl_mod)
+          - zero entries, registered elsewhere → CheckError telling the
+            user to import the seal that contains it
+          - zero entries, not registered → returns None (caller continues
+            to "undefined name" path)
+          - more than one entry (ambiguous) → CheckError listing the
+            candidate seals so the user can be specific
+        """
+        visible = self.module_visible_variants.get(self.current_module, {}).get(name)
+        if visible:
+            if len(visible) == 1:
+                return visible[0]
+            # Ambiguity: more than one imported seal contributes a
+            # variant by this name. Tell the user which seals collide.
+            choices = ", ".join(
+                f"seal {seal!r} in module {('.'.join(mod) or '<root>')!r}"
+                for seal, _idx, _f, mod in visible
+            )
+            raise CheckError(
+                f"variant {name!r} is declared in multiple seals; "
+                f"import the specific seal you mean: {choices}",
+                line, col,
+            )
+        # Not visible. Is it declared anywhere?
+        registered = self.variant_lookup.get(name, [])
+        if not registered:
+            return None
+        # Variant exists but isn't in scope. Point the user at one of
+        # the seals that contains it.
+        seals = sorted({(seal, mod) for seal, _idx, _f, mod in registered})
+        if len(seals) == 1:
+            seal, mod = seals[0]
+            pretty = ".".join(mod) or "<root>"
+            raise CheckError(
+                f"variant {name!r} (of seal {seal!r}) is declared in "
+                f"module {pretty!r} but the seal isn't in scope here; "
+                f"add `from {pretty} import {seal}` (or `import "
+                f"{pretty}`) at the top of this file",
+                line, col,
+            )
+        # Multiple seals declare it elsewhere — list them.
+        choices = ", ".join(
+            f"seal {seal!r} in module {('.'.join(mod) or '<root>')!r}"
+            for seal, mod in seals
+        )
+        raise CheckError(
+            f"variant {name!r} is declared in multiple seals; import "
+            f"the specific seal you mean: {choices}",
+            line, col,
+        )
+
+    def _check_module_scope(self, name: str, line: int, col: int) -> None:
+        """Enforce per-module visibility for top-level user-defined
+        names. The name must be in the current module's visible scope
+        (own decls + imports + builtins), or be a non-top-level
+        thing the caller will handle (a not-yet-bound local, or the
+        `not declared anywhere` case). Raises with a targeted message
+        if the name is declared in some other module but not imported
+        here; otherwise returns silently and lets the caller continue
+        its existing not-found path."""
+        scope = self.module_visible.get(self.current_module, {})
+        if name in scope:
             return
-        # Find which module declared this name (if any). The new module
-        # tables are the source of truth.
+        # Find where this name is declared, if anywhere. If it lives in
+        # a different module, the user almost certainly forgot to
+        # import it.
         for mod, decls in self.module_decls.items():
             if name in decls:
-                if mod != self.current_module:
-                    here = ".".join(self.current_module) or "<root>"
-                    there = ".".join(mod) or "<root>"
+                if mod == self.current_module:
+                    # Decl exists in this module but isn't visible —
+                    # only happens if `_build_module_scopes` skipped
+                    # it (shouldn't); fall through to the generic path.
+                    return
+                pretty = ".".join(mod) or "<root>"
+                if name.startswith("_"):
                     raise CheckError(
-                        f"name {name!r} is private to module {there!r} "
-                        f"and not visible from module {here!r}",
+                        f"name {name!r} is private to module {pretty!r} "
+                        f"and cannot be imported",
                         line, col,
                     )
-                return
+                here = ".".join(self.current_module) or "<root>"
+                raise CheckError(
+                    f"name {name!r} is declared in module {pretty!r} "
+                    f"but not in scope here ({here!r}); add `from "
+                    f"{pretty} import {name}` (or `import {pretty}`) at "
+                    f"the top of this file",
+                    line, col,
+                )
 
     # --- registration ------------------------------------------------
 
@@ -871,6 +1062,7 @@ class Checker:
         resolved_variants: list[tuple[str, tuple[Ty, ...]]] = []
         saved = self._active_type_vars
         self._active_type_vars = {name: TyVar(name) for name in s.type_params}
+        decl_mod = self.prog.module_of.get(id(s), ())
         try:
             for idx, v in enumerate(s.variants):
                 if v.name in seen_names:
@@ -879,13 +1071,17 @@ class Checker:
                         v.line, v.col,
                     )
                 seen_names.add(v.name)
-                if v.name in self.variant_lookup:
-                    prev_seal = self.variant_lookup[v.name][0]
+                # Within a single module two seals can't share a variant
+                # name (one flat namespace per module). Across modules
+                # is fine — disambiguation happens at use site via the
+                # importer's visible-variants table.
+                existing = self.variant_lookup.get(v.name, [])
+                same_mod = [e for e in existing if e[3] == decl_mod]
+                if same_mod:
+                    prev_seal = same_mod[0][0]
                     raise CheckError(
                         f"variant {v.name!r} is already declared in seal "
-                        f"{prev_seal!r}; variant names must be globally "
-                        f"unique (qualified-variant syntax is not yet "
-                        f"designed)",
+                        f"{prev_seal!r} in this module",
                         v.line, v.col,
                     )
                 field_tys = tuple(
@@ -895,7 +1091,9 @@ class Checker:
                     for ft in v.fields
                 )
                 resolved_variants.append((v.name, field_tys))
-                self.variant_lookup[v.name] = (s.name, idx, field_tys)
+                self.variant_lookup.setdefault(v.name, []).append(
+                    (s.name, idx, field_tys, decl_mod),
+                )
         finally:
             self._active_type_vars = saved
         self.seal_variants[s.name] = tuple(resolved_variants)
@@ -1306,7 +1504,7 @@ class Checker:
                         f"write `{t.name}<...>`",
                         t.line, t.col,
                     )
-                self._check_visibility(t.name, t.line, t.col)
+                self._check_module_scope(t.name, t.line, t.col)
                 return self.structs[t.name]
             if t.name in self.seals:
                 params = self.seal_type_params.get(t.name, ())
@@ -1317,7 +1515,7 @@ class Checker:
                         f"write `{t.name}<...>`",
                         t.line, t.col,
                     )
-                self._check_visibility(t.name, t.line, t.col)
+                self._check_module_scope(t.name, t.line, t.col)
                 return self.seals[t.name]
             raise CheckError(
                 f"{where}: unknown type {t.name!r}", t.line, t.col,
@@ -1331,7 +1529,7 @@ class Checker:
                         f"{len(params)} type argument(s), got {len(t.args)}",
                         t.line, t.col,
                     )
-                self._check_visibility(t.name, t.line, t.col)
+                self._check_module_scope(t.name, t.line, t.col)
                 resolved_args = tuple(
                     self._resolve_type(a, f"{where} type arg") for a in t.args
                 )
@@ -1344,7 +1542,7 @@ class Checker:
                         f"{len(params)} type argument(s), got {len(t.args)}",
                         t.line, t.col,
                     )
-                self._check_visibility(t.name, t.line, t.col)
+                self._check_module_scope(t.name, t.line, t.col)
                 resolved_args = tuple(
                     self._resolve_type(a, f"{where} type arg") for a in t.args
                 )
@@ -1429,10 +1627,18 @@ class Checker:
         for scope in reversed(self.scopes):
             if name in scope:
                 return scope[name]
-        # Top-level visibility check: a `_`-prefixed name resolved
-        # outside its declaring module is a private-access error.
-        # Locals shadow this, so the scope walk above runs first.
-        self._check_visibility(name, line, col)
+        # Variant-not-in-scope check. If `name` is a registered variant
+        # but the seal that contains it isn't imported, give a targeted
+        # "import the seal" error before the generic "undefined name".
+        if name in self.variant_lookup:
+            self._resolve_variant(name, line, col)
+        # Top-level visibility: the name must be in the current
+        # module's visible scope (own decls + imports + builtins).
+        # If `name` is a top-level decl declared elsewhere but not
+        # imported, raise a clear "not in scope" error rather than
+        # falling through to the generic "undefined name" — directs
+        # users to add an import.
+        self._check_module_scope(name, line, col)
         # Gather everything nameable in this program so the suggestion
         # can point to a function / struct / table if the user typo'd
         # across categories, not just a local.
@@ -1601,9 +1807,11 @@ class Checker:
             return self.structs["str"]
         if isinstance(e, A.Ident):
             # Nullary variants look like bare identifiers. Check the
-            # variant registry first so `None` / `Circle` etc. resolve
-            # to their seal type rather than "undefined name".
-            if e.name in self.variant_lookup:
+            # current module's visible variants first so `None` /
+            # `Circle` etc. resolve to their seal type rather than
+            # "undefined name". Cross-module variant-name reuse is
+            # disambiguated here too.
+            if e.name in self.module_visible_variants.get(self.current_module, {}):
                 return self._tc_variant_ident(e, expected)
             # Bare fn name used as an expression = first-class function
             # value. Its type is the fn signature (TyFn). Local
@@ -1957,7 +2165,8 @@ class Checker:
         name = e.callee.name
 
         # Variant constructor: `Some(42)`, `Circle(rat(1, 2))`, etc.
-        if name in self.variant_lookup:
+        # Resolved via current module's visible variants.
+        if name in self.module_visible_variants.get(self.current_module, {}):
             return self._tc_variant_call(e, expected)
 
         if name in ("print", "println"):
@@ -2033,7 +2242,7 @@ class Checker:
                 f"{_suggest(name, self.fns)}",
                 e.line, e.col,
             )
-        self._check_visibility(name, e.line, e.col)
+        self._check_module_scope(name, e.line, e.col)
         # Variadic call: split args into (fixed, tail). The fixed args
         # typecheck against the first (n-1) params; the tail becomes a
         # synthesized TabletsLit that gets typechecked against the last
@@ -2840,7 +3049,9 @@ class Checker:
     def _tc_variant_ident(self, e: A.Ident, expected: Ty | None) -> Ty:
         """Typecheck a bare variant name like `None`. Must be nullary;
         generic seals require `expected` to pin their type parameters."""
-        seal_name, vidx, field_tys = self.variant_lookup[e.name]
+        info = self._resolve_variant(e.name, e.line, e.col)
+        assert info is not None  # caller already checked visibility
+        seal_name, vidx, field_tys, _decl_mod = info
         if field_tys:
             raise CheckError(
                 f"variant {e.name!r} takes {len(field_tys)} argument(s); "
@@ -2872,7 +3083,9 @@ class Checker:
     def _tc_variant_call(self, e: A.Call, expected: Ty | None) -> Ty:
         assert isinstance(e.callee, A.Ident)
         vname = e.callee.name
-        seal_name, vidx, field_tys = self.variant_lookup[vname]
+        info = self._resolve_variant(vname, e.line, e.col)
+        assert info is not None  # caller already checked visibility
+        seal_name, vidx, field_tys, _decl_mod = info
         self.variant_of_node[id(e)] = (seal_name, vname, vidx)
         if len(e.args) != len(field_tys):
             raise CheckError(

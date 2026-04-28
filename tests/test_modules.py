@@ -161,11 +161,27 @@ def test_wildcard_import_to_known_module_ok(tmp_path):
         tmp_path, "src/main.tpu",
         "import helper\nfn main() -> i32 { add(1, 2) as i32 }\n",
     )
-    # Should not raise.
+    # Should not raise — wildcard `import helper` brings `add` into scope.
     check_sources([
         (str(helper), helper.read_text()),
         (str(main), main.read_text()),
     ])
+
+
+def test_unimported_name_rejected_in_src(tmp_path):
+    """Project-shaped code under `src/` requires explicit imports;
+    cross-module names without an import are rejected with a targeted
+    message that points at the fix."""
+    helper = write(tmp_path, "src/helper.tpu", "fn add(a: i64, b: i64) -> i64 { a + b }\n")
+    main = write(
+        tmp_path, "src/main.tpu",
+        "fn main() -> i32 { add(1, 2) as i32 }\n",
+    )
+    with pytest.raises(CompileError, match="not in scope"):
+        check_sources([
+            (str(helper), helper.read_text()),
+            (str(main), main.read_text()),
+        ])
 
 
 # --- visibility: `_`-prefix is private to declaring module ---------------
@@ -179,6 +195,7 @@ def test_private_fn_visible_within_module(tmp_path):
     )
     main = write(
         tmp_path, "src/main.tpu",
+        "from helper import add\n"
         "fn main() -> i32 { add(1, 2) as i32 }\n",
     )
     binary = compile_files_to_binary([helper, main], tmp_path / "build", name="prog")
@@ -215,16 +232,101 @@ def test_private_tablet_invisible_from_other_module(tmp_path):
 
 
 def test_public_fn_visible_across_modules(tmp_path):
-    # No `_` prefix → still visible everywhere (v1 keeps the global
-    # flat namespace; visibility is only restricted for `_`-prefixed
-    # names).
+    """Cross-module reference works through an explicit `from` import."""
     helper = write(tmp_path, "src/helper.tpu", "fn add(a: i64, b: i64) -> i64 { a + b }\n")
     main = write(
         tmp_path, "src/main.tpu",
+        "from helper import add\n"
         "fn main() -> i32 { add(40, 2) as i32 }\n",
     )
     binary = compile_files_to_binary([helper, main], tmp_path / "build", name="prog")
     assert subprocess.run([str(binary)]).returncode == 42
+
+
+# --- cross-module variant disambiguation (LIMITATIONS.md fix) ------------
+
+
+def test_seals_in_different_modules_can_share_variant_names(tmp_path):
+    """`seal A { X }; seal B { X }` works as long as the seals live
+    in different modules. Previously rejected by the flat variant
+    table — the LIMITATIONS.md gap. Each importer picks the variant
+    via its own visible seals (only the seal it imports brings X
+    into scope)."""
+    foo = write(
+        tmp_path, "src/foo.tpu",
+        "seal Foo { X, Y }\n"
+        "fn make_foo() -> Foo { X }\n",
+    )
+    bar = write(
+        tmp_path, "src/bar.tpu",
+        "seal Bar { X, Z }\n"
+        "fn make_bar() -> Bar { X }\n",
+    )
+    main = write(
+        tmp_path, "src/main.tpu",
+        "from foo import Foo, make_foo\n"
+        "from bar import Bar, make_bar\n"
+        "fn main() -> i32 {\n"
+        "  step f: Foo = make_foo()\n"
+        "  step b: Bar = make_bar()\n"
+        "  match f { X => 0, Y => 1 }\n"
+        "}\n",
+    )
+    binary = compile_files_to_binary([foo, bar, main], tmp_path / "build", name="prog")
+    assert subprocess.run([str(binary)]).returncode == 0
+
+
+def test_variant_ambiguity_when_both_seals_imported(tmp_path):
+    """If a use site imports two seals that each have variant X, using
+    bare `X` is ambiguous and rejected with a message that names the
+    candidate seals."""
+    foo = write(tmp_path, "src/foo.tpu", "seal Foo { X }\n")
+    bar = write(tmp_path, "src/bar.tpu", "seal Bar { X }\n")
+    main = write(
+        tmp_path, "src/main.tpu",
+        "from foo import Foo\n"
+        "from bar import Bar\n"
+        "fn main() -> i32 {\n"
+        "  step f: Foo = X\n"
+        "  0\n"
+        "}\n",
+    )
+    with pytest.raises(CompileError, match="multiple seals"):
+        check_sources([
+            (str(foo), foo.read_text()),
+            (str(bar), bar.read_text()),
+            (str(main), main.read_text()),
+        ])
+
+
+def test_variant_unimported_seal_errors_with_hint(tmp_path):
+    """Using a variant whose seal isn't imported gives a targeted
+    'add `from X import Seal`' message, not a generic 'undefined name'."""
+    foo = write(tmp_path, "src/foo.tpu", "seal Foo { X, Y }\n")
+    main = write(
+        tmp_path, "src/main.tpu",
+        "fn main() -> i32 { step f: i64 = 0\n match f { 0 => 0, _ => 1 } }\n",
+    )
+    # Compile succeeds (main doesn't reference X). Now try to use X
+    # without importing Foo — should error with the hint.
+    main2 = write(
+        tmp_path, "src/main.tpu",
+        "fn main() -> i32 { step _: i64 = 0\n 0 }\n",
+    )
+    main3 = write(
+        tmp_path, "src/main3.tpu",
+        "seal Local { Q }\n"
+        "fn main() -> i32 {\n"
+        "  step l: Local = Q\n"
+        "  step l2: Local = X\n"  # X is from foo, not imported
+        "  0\n"
+        "}\n",
+    )
+    with pytest.raises(CompileError, match="seal isn't in scope here"):
+        check_sources([
+            (str(foo), foo.read_text()),
+            (str(main3), main3.read_text()),
+        ])
 
 
 # --- regression: existing single-source tests keep working ---------------
