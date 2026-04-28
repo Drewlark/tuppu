@@ -899,6 +899,71 @@ class Codegen(
         fty = ir.FunctionType(ir.VoidType(), [I8.as_pointer()])
         return ir.Function(self.module, fty, "__tuppu_gc_mark_wedge")
 
+    def _get_wedge_trace_fn(self) -> ir.Function:
+        """Trace fn for the shared wedge descriptor. Loads the wedge
+        pointer out of the rooted slot and dispatches to mark_wedge so
+        the GC reaches the chunk the wedge points into. Without this,
+        a wedge held across allocations whose source ivec / tablets has
+        gone out of scope (the marquee arena property) is the only
+        path to its chunk — and the chunk is silently swept."""
+        cached = self.module.globals.get("__tuppu_wedge_trace")
+        if isinstance(cached, ir.Function):
+            return cached
+        fn = ir.Function(self.module, self._trace_fn_ty, "__tuppu_wedge_trace")
+        fn.linkage = "internal"
+        entry = fn.append_basic_block("entry")
+        b = ir.IRBuilder(entry)
+        slot_i8 = fn.args[0]
+        # Slot holds an i8* (the wedge value). Load it and mark.
+        ptr_ptr = b.bitcast(slot_i8, I8.as_pointer().as_pointer())
+        wedge_val = b.load(ptr_ptr)
+        b.call(self._get_gc_mark_wedge(), [wedge_val])
+        b.ret_void()
+        return fn
+
+    def _get_wedge_descriptor(self) -> ir.GlobalVariable:
+        """Single shared `tuppu_type_t` for any `wedge T` value: the
+        wedge descriptor is T-independent because mark_wedge does its
+        own interior-pointer chunk lookup. Size 8 (one pointer), no
+        flat ptr_offsets — the trace fn takes over and dispatches
+        through mark_wedge."""
+        key = "__tuppu_wedge"
+        cached = self._type_descs.get(key)
+        if cached is not None:
+            return cached
+        # Empty offsets array (n_ptrs = 0; the trace fn supersedes it).
+        offsets_arr_ty = ir.ArrayType(I64, 1)
+        offsets_arr = ir.GlobalVariable(
+            self.module, offsets_arr_ty, f"{key}_offsets",
+        )
+        offsets_arr.linkage = "internal"
+        offsets_arr.global_constant = True
+        offsets_arr.initializer = ir.Constant(
+            offsets_arr_ty, [ir.Constant(I64, 0)],
+        )
+        name_bytes = (key + "\0").encode("utf-8")
+        name_arr_ty = ir.ArrayType(I8, len(name_bytes))
+        name_arr = ir.GlobalVariable(
+            self.module, name_arr_ty, f"{key}_name",
+        )
+        name_arr.linkage = "internal"
+        name_arr.global_constant = True
+        name_arr.initializer = ir.Constant(
+            name_arr_ty, bytearray(name_bytes),
+        )
+        desc = ir.GlobalVariable(self.module, self._type_desc_ty, key)
+        desc.linkage = "internal"
+        desc.global_constant = True
+        desc.initializer = ir.Constant(self._type_desc_ty, [
+            name_arr.bitcast(I8.as_pointer()),
+            ir.Constant(I64, 8),  # size: a single pointer
+            ir.Constant(I64, 0),  # n_ptrs: 0 — trace fn supersedes
+            offsets_arr.bitcast(I64.as_pointer()),
+            self._get_wedge_trace_fn(),
+        ])
+        self._type_descs[key] = desc
+        return desc
+
     def _emit_gc_push_root(self, slot: ir.Value, value_ty: ir.Type) -> bool:
         """Emit a `__tuppu_gc_push_root(slot, type_desc)` call if the
         type has pointer fields to trace. Returns True on emit so the
