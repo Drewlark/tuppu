@@ -137,12 +137,18 @@ Format: each section groups by area. Bullets prefix with severity:
   importer's scope literally; if downstream consumers need to see
   `x.y`'s names they import them directly. `pub use x.y` /
   `export from` is the natural follow-up.
-- **[gap]** Module-prefix LLVM mangling. Two modules can't both
-  declare `fn helper()` or `tablet Foo` (typecheck rejects with a
-  duplicate-name error). The principled fix is to mangle every non-
-  extern decl with its declaring module path so both coexist at the
-  IR level. Variant-name collisions across modules already work
-  because variants don't get standalone LLVM symbols.
+- **[gap]** Cross-module tablet/seal name collisions. Two modules
+  CAN both declare `fn helper()` (the typecheck + codegen both
+  mangle these now via `__M_<mod>__<name>` — see
+  `tests/test_modules.py::test_two_modules_can_each_declare_same_fn_name`).
+  But `tablet Foo` in two modules trips a `duplicate struct 'Foo'`
+  error in codegen because `_struct_types` and the field-accessor
+  paths are still keyed by short name. The typecheck side already
+  mangles tablet names; the remaining work is the parallel codegen
+  refactor — `_struct_types`, `_seal_types`, `_get_monomorph_struct`,
+  and the field-access lowering all need to route lookups through
+  the checker's `flat_name_for` sideband. See xfail
+  `test_two_modules_can_each_declare_same_tablet_name`.
 - **[gap]** Qualified-name struct literals. `mod.Tablet { ... }` in
   expression position doesn't parse — the struct-lit parser doesn't
   see the dotted form as a type-position name. Wildcard `import mod`

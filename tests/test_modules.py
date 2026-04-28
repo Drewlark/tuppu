@@ -493,6 +493,59 @@ def test_edubba_cannot_extend_foreign_tablet(tmp_path):
         ])
 
 
+# --- cross-module same-name decls (LLVM mangling) -----------------------
+
+
+def test_two_modules_can_each_declare_same_fn_name(tmp_path):
+    """`fn helper()` in two different modules coexists. Each module's
+    `helper` is mangled to `__M_<mod>__helper` at the global symbol
+    layer; importers reach the right one through their visible scope."""
+    foo = write(tmp_path, "src/foo.tpu", "fn helper() -> i64 { 10 }\n")
+    bar = write(tmp_path, "src/bar.tpu", "fn helper() -> i64 { 32 }\n")
+    main = write(
+        tmp_path, "src/main.tpu",
+        "from foo import helper as foo_helper\n"
+        "from bar import helper as bar_helper\n"
+        "fn main() -> i32 { (foo_helper() + bar_helper()) as i32 }\n",
+    )
+    binary = compile_files_to_binary([foo, bar, main], tmp_path / "build", name="prog")
+    assert subprocess.run([str(binary)]).returncode == 42
+
+
+@pytest.mark.xfail(
+    reason="Codegen tablet-type tables are still keyed by short name; "
+    "the typecheck side mangles, but `_struct_types` and field-accessor "
+    "paths in codegen need a parallel refactor before two modules can "
+    "each declare `tablet Foo`. Tracked as a follow-up in LIMITATIONS.md."
+)
+def test_two_modules_can_each_declare_same_tablet_name(tmp_path):
+    """`tablet Foo` in two different modules — typecheck accepts both
+    via module-prefix mangling, but codegen rejects the second one
+    because its struct-type tables are still short-name-keyed."""
+    foo = write(
+        tmp_path, "src/foo.tpu",
+        "tablet Foo { x: i64 }\n"
+        "fn make_foo_x() -> Foo { Foo { x: 7 } }\n",
+    )
+    bar = write(
+        tmp_path, "src/bar.tpu",
+        "tablet Foo { y: i64 }\n"
+        "fn make_bar_y() -> Foo { Foo { y: 35 } }\n",
+    )
+    main = write(
+        tmp_path, "src/main.tpu",
+        "from foo import Foo as FFoo, make_foo_x\n"
+        "from bar import Foo as BFoo, make_bar_y\n"
+        "fn main() -> i32 {\n"
+        "  step a: FFoo = make_foo_x()\n"
+        "  step b: BFoo = make_bar_y()\n"
+        "  (a.x + b.y) as i32\n"
+        "}\n",
+    )
+    binary = compile_files_to_binary([foo, bar, main], tmp_path / "build", name="prog")
+    assert subprocess.run([str(binary)]).returncode == 42
+
+
 # --- regression: existing single-source tests keep working ---------------
 
 
