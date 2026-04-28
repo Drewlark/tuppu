@@ -239,6 +239,21 @@ INTRINSIC_NAMES = {
     "bytes_to_str", "buffer_to_str",
 }
 
+# Stdlib `Map<T>` exposes its free functions through method-call syntax.
+# `m.set(k, v)` becomes a call to `map_set` with `m` as the first arg —
+# the only mut method, lowered with the receiver as an lvalue pointer so
+# Field/Index receivers (`objs[o].items.set(k, v)`) work without binding
+# the map to a mut Ident. The other entries are pure reads. New stdlib
+# methods land here; the underlying free fn must already exist in
+# stdlib/map.tpu.
+_MAP_METHODS = {
+    "set":   "map_set",
+    "get":   "map_get",
+    "has":   "map_has",
+    "len":   "map_len",
+    "index": "map_index",
+}
+
 # The fixed set of operator-overload op names users may declare with
 # `gloss <op>(...)`. Each maps to the operator symbol it implements,
 # an arity ("bin" / "un"), and whether the return type is fixed.
@@ -376,6 +391,13 @@ class Checker:
         self.dvec_elem_at_call: dict[int, "Ty"] = {}
         self.dvec_elem_at_index: dict[int, "Ty"] = {}
         self.dvec_elem_at_for: dict[int, "Ty"] = {}
+        # Method-call dispatch: when a stdlib tablet (e.g. `Map<T>`)
+        # exposes its free functions through method-call syntax, the
+        # checker resolves the receiver's type, picks the underlying
+        # free fn, and records the source name here for codegen. The
+        # mono args (if any) ride along on `mono_call_args` like a
+        # regular generic call.
+        self.method_dispatch_target: dict[int, str] = {}  # Call → fn name
         # Variadic calls: Call node id → synthesized TabletsLit holding
         # the collected trailing arguments. Codegen consults this to
         # emit the literal once for the last param slot.
@@ -1968,6 +1990,23 @@ class Checker:
                 f"dvec has no method {method!r}", e.line, e.col,
             )
 
+        # Stdlib `Map<T>` method dispatch — `m.set(k, v)`, `m.get(k, fb)`,
+        # `m.has(k)`, `m.len()`, `m.index(k)` route to the corresponding
+        # `map_*` free function. Receiver becomes the first arg; for the
+        # one mut method (`set`), codegen lowers the receiver as an lvalue
+        # pointer so `objs[o].items.set(k, v)` works without forcing the
+        # caller to bind the map to a mut Ident first.
+        if isinstance(recv_ty, TyStruct) and recv_ty.name == "Map":
+            if method in _MAP_METHODS:
+                return self._tc_struct_method_dispatch(
+                    e, recv_ty, _MAP_METHODS[method],
+                )
+            available = ", ".join(sorted(_MAP_METHODS))
+            raise CheckError(
+                f"Map has no method {method!r}; available: {available}",
+                e.line, e.col,
+            )
+
         # Struct field that happens to be a fn value — `obj.run(x)` is
         # not a method dispatch but a field-access-then-indirect-call.
         # Resolve the field's type via the struct registry; if it's a
@@ -1982,6 +2021,102 @@ class Checker:
             f"method call: {recv_name!r} is {recv_ty}, not a tablets",
             e.line, e.col,
         )
+
+    def _tc_struct_method_dispatch(
+        self, e: A.Call, recv_ty: "TyStruct", fn_name: str,
+    ) -> Ty:
+        """Route a method call on a stdlib tablet to its underlying free
+        function. The receiver was already typechecked by `_tc_method_call`
+        — we re-run the standard generic-fn unification flow here against
+        the synthetic arg list `[receiver, *e.args]`, pinning the
+        type-parameter substitution from the receiver's type up front so
+        callers don't need to spell `T` explicitly.
+
+        Records `mono_call_args[id(e)]` (when the underlying fn is generic)
+        and `method_dispatch_target[id(e)]` so codegen can find the target
+        and decide whether the receiver gets passed by pointer or value."""
+        fn = self.fns.get(fn_name)
+        if fn is None:
+            raise CheckError(
+                f"method dispatch on {recv_ty}: stdlib fn {fn_name!r} "
+                f"is missing — make sure the matching stdlib file is "
+                f"loaded",
+                e.line, e.col,
+            )
+        if len(fn.params) != len(e.args) + 1:
+            raise CheckError(
+                f"{fn_name} expects {len(fn.params) - 1} arg(s) after "
+                f"the receiver, got {len(e.args)}",
+                e.line, e.col,
+            )
+        type_params = self.fn_type_params.get(fn_name, ())
+        inst_names = [f"{fn_name}.{tp}#{id(e)}" for tp in type_params]
+        inst_subst = {
+            tp: TyVar(fresh)
+            for tp, fresh in zip(type_params, inst_names)
+        }
+        subst: dict[str, Ty] = {}
+        # Pin T from the receiver type before typechecking explicit args
+        # so their hints are concrete (e.g. `Map<JValue>.set(k, v)` knows
+        # v should be a JValue, not an open TyVar).
+        receiver_param = self._substitute(fn.params[0], inst_subst)
+        try:
+            self._unify(receiver_param, recv_ty, subst)
+        except _UnifyError as ex:
+            raise CheckError(
+                f"method dispatch: receiver has type {recv_ty}, but "
+                f"{fn_name}'s first param expects {fn.params[0]}"
+                f"{f' ({ex.detail})' if ex.detail else ''}",
+                e.line, e.col,
+            ) from None
+        arg_hints: list[Ty | None] = []
+        for pty in fn.params[1:]:
+            h = self._substitute(self._substitute(pty, inst_subst), subst)
+            arg_hints.append(
+                h if not self._has_open_tyvar(h, inst_names) else None
+            )
+        arg_tys = [
+            self._tc_expr(a, expected=h)
+            for a, h in zip(e.args, arg_hints)
+        ]
+        for i, (at, pty) in enumerate(zip(arg_tys, fn.params[1:]), start=1):
+            freshened = self._substitute(pty, inst_subst)
+            try:
+                self._unify(freshened, at, subst)
+            except _UnifyError as ex:
+                raise CheckError(
+                    f"call to {fn_name!r}: arg {i} has type {at}, "
+                    f"expected {pty}"
+                    f"{f' ({ex.detail})' if ex.detail else ''}",
+                    e.line, e.col,
+                ) from None
+        for i, (at, pty) in enumerate(zip(arg_tys, fn.params[1:]), start=1):
+            inst = self._substitute(self._substitute(pty, inst_subst), subst)
+            if not _coerces_to(at, inst):
+                raise CheckError(
+                    f"call to {fn_name!r}: arg {i} has type {at}, "
+                    f"expected {inst}",
+                    e.line, e.col,
+                )
+        ret = self._substitute(self._substitute(fn.ret, inst_subst), subst)
+        if type_params:
+            missing = [
+                tp for tp, fresh in zip(type_params, inst_names)
+                if fresh not in subst
+            ]
+            if missing:
+                raise CheckError(
+                    f"call to {fn_name!r}: could not infer type "
+                    f"parameter(s) {', '.join(missing)} from receiver "
+                    f"and argument types",
+                    e.line, e.col,
+                )
+            self.mono_call_args[id(e)] = tuple(
+                self._substitute(subst[fresh], subst)
+                for fresh in inst_names
+            )
+        self.method_dispatch_target[id(e)] = fn_name
+        return ret
 
     def _tc_field(self, e: A.Field) -> Ty:
         target_ty = self._tc_expr(e.target)
