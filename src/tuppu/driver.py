@@ -56,17 +56,70 @@ def _parse_labeled(sources: list[tuple[str, str]]) -> A.Program:
     source context. Type-checker and codegen errors don't currently get
     the path attached — see LIMITATIONS.md — they fall back to the bare
     line:col format. Built-in declarations (e.g. the `str` seal) are
-    prepended automatically."""
+    prepended automatically.
+
+    Each label is also mapped to a module path (a tuple of segments
+    derived from the file's location relative to the project root or
+    stdlib) and stamped onto every parsed decl in the program's
+    `module_of` sideband. Built-in injections live in the root module
+    (empty tuple). Single-string sources (the simple test path) get a
+    synthetic root-module label."""
     decls: list[A.Decl] = list(_builtin_decls())
-    # Built-in `str` tablet is auto-prepended above.
+    module_of: dict[int, tuple[str, ...]] = {}
     for label, text in sources:
         try:
             prog = parse(lex(text))
         except (LexError, ParseError) as e:
             e.path = label
             raise
+        mod_path = _module_path_for_label(label)
+        for d in prog.decls:
+            module_of[id(d)] = mod_path
         decls.extend(prog.decls)
-    return A.Program(decls=decls)
+    return A.Program(decls=decls, module_of=module_of)
+
+
+def _module_path_for_label(label: str) -> tuple[str, ...]:
+    """Derive a dotted module path (as a tuple of segments) from a
+    file's label. Labels are absolute or repo-relative paths to .tpu
+    files; the path is taken relative to its containing 'src/' or
+    'stdlib/' directory, with the .tpu extension stripped.
+
+    Examples:
+        /repo/stdlib/list.tpu              -> ('stdlib', 'list')
+        /repo/stdlib/sub/foo.tpu           -> ('stdlib', 'sub', 'foo')
+        /repo/src/parser.tpu               -> ('parser',)
+        /repo/src/sema/typecheck.tpu       -> ('sema', 'typecheck')
+        /tmp/a.tpu                         -> ()    (root — no anchor)
+        /tmp/b.tpu                         -> ()    (root — same)
+        <source>                           -> ()    (root)
+
+    Files outside any recognized root (`stdlib/` or `src/`) all collapse
+    to the root module so multi-file scripts in tmp_path behave like
+    one program (matching the existing single-namespace expectation
+    test_multifile depends on). Project-shaped code that wants
+    real module isolation lives under `src/` or `stdlib/`."""
+    if not label or label == "<source>":
+        return ()
+    p = Path(label)
+    parts = list(p.parts)
+    # Strip .tpu suffix off the final segment.
+    stem = p.stem
+    parts[-1] = stem
+    # Anchor at the first 'stdlib' or 'src' segment we see; any path
+    # prefix above that is the project root and isn't part of the
+    # module name. For 'src/...' the 'src' itself is dropped (it's a
+    # build convention, not a module). For 'stdlib/...' we keep
+    # 'stdlib' as the leading segment so user-imported names like
+    # 'stdlib.list' line up with how callers spell them.
+    for i, seg in enumerate(parts):
+        if seg == "stdlib":
+            return tuple(parts[i:])
+        if seg == "src":
+            return tuple(parts[i + 1:])
+    # No recognized root — root module. Multi-file ad-hoc scripts share
+    # one namespace.
+    return ()
 
 
 def compile_sources_to_ir(sources: list[tuple[str, str]]) -> str:

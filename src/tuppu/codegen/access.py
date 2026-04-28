@@ -224,19 +224,27 @@ class AccessMixin:
         assert self.builder is not None
         # Generic tablet: consult the checker's mono_struct_args to
         # find the concrete type-arg tuple inferred for this literal,
-        # then monomorphize.
+        # then monomorphize. Translate `e.name` (short) to the flat
+        # form via the current module's visible scope so cross-module
+        # same-name tablets dispatch correctly.
+        flat = e.name
+        if self._checker is not None:
+            scope = self._checker.module_visible.get(
+                self._codegen_current_module, {},
+            )
+            flat = scope.get(e.name, e.name)
         mono_args = None
         if self._checker is not None:
             mono_args = self._checker.mono_struct_args.get(id(e))
         if mono_args is not None:
             arg_tys = tuple(self._lower_ty(a) for a in mono_args)
-            struct_ty = self._get_monomorph_struct(e.name, arg_tys)
-            fields = self._struct_mono_fields[(e.name, arg_tys)]
+            struct_ty = self._get_monomorph_struct(flat, arg_tys)
+            fields = self._struct_mono_fields[(flat, arg_tys)]
         else:
-            if e.name not in self._struct_types:
+            if flat not in self._struct_types:
                 raise CodegenError(f"unknown tablet {e.name!r}")
-            struct_ty = self._struct_types[e.name]
-            fields = self._struct_fields[e.name]
+            struct_ty = self._struct_types[flat]
+            fields = self._struct_fields[flat]
         provided: dict[str, A.Expr] = dict(e.fields)
         value: ir.Value = ir.Constant(struct_ty, ir.Undefined)
         for i, (fname, fty) in enumerate(fields):

@@ -127,6 +127,11 @@ class Codegen(
         # one. `_gen_fn_body` reads this to transfer the return value's
         # cleanup out by slot identity rather than by frame-position.
         self._last_rvalue_root_slot: ir.Value | None = None
+        # Module context for type-name lookup. Set by phase-emit
+        # callers per-decl so `_lower_type(TypeName(name="Foo"))`
+        # consults the right module's visible scope to translate
+        # `Foo` to its mangled flat key in `_struct_types`.
+        self._codegen_current_module: tuple[str, ...] = ()
         self._struct_types: dict[str, ir.LiteralStructType] = {}
         self._struct_fields: dict[str, list[tuple[str, ir.Type]]] = {}
         # Per-struct set of field indices declared as `wedge T` at the

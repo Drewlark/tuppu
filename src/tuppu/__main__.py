@@ -25,10 +25,21 @@ from .errors import CompileError, format_error
 
 def _resolve_inputs(user_files: list[Path], include_stdlib: bool) -> list[Path]:
     """Stdlib first so user code can forward-reference it and collisions
-    surface as duplicate-definition errors against user code, not stdlib."""
+    surface as duplicate-definition errors against user code, not stdlib.
+
+    Each user input may be a file or a directory; directories are walked
+    recursively for `.tpu` files (sorted for determinism). This is the
+    foundation for project-shaped Tuppu code where one `tuppu run src/`
+    invocation compiles every module under `src/`."""
+    expanded: list[Path] = []
+    for f in user_files:
+        if f.is_dir():
+            expanded.extend(sorted(f.rglob("*.tpu")))
+        else:
+            expanded.append(f)
     if include_stdlib:
-        return stdlib_files() + list(user_files)
-    return list(user_files)
+        return stdlib_files() + expanded
+    return expanded
 
 
 def main(argv: list[str] | None = None) -> int:

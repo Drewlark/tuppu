@@ -20,7 +20,14 @@ def _pos():
 
 @dataclass
 class TypeName:
-    name: str                        # "i64", "bool", "rat", or a struct name
+    """A simple type-position name. `name` is the source-level
+    identifier — `"i64"`, `"bool"`, `"rat"`, a tablet/seal name,
+    or a dotted module-qualified form like `"mod.Foo"` (parser
+    collapses dotted segments into one stringly-typed field for
+    minimal AST surface change). The typechecker splits the dot at
+    use sites; a (qualifier, short) tuple shape would be cleaner
+    long-term but isn't load-bearing yet."""
+    name: str                        # "i64", "bool", "rat", "Tablet", or "mod.Foo"
     line: int = _pos()
     col:  int = _pos()
 
@@ -531,6 +538,32 @@ class AliasDecl:
 
 
 @dataclass
+class ImportDecl:
+    """A top-level import: brings public names from another module into
+    the current file's scope. Three surface forms:
+
+      `import x.y`            — wildcard: every public name from x.y
+                                becomes available unqualified in this
+                                file (equivalent to `from x.y import *`).
+      `import x.y as z`       — wildcard with a prefix on every imported
+                                name (`z_<name>`)? Reserved for future;
+                                currently rejected with a clear error.
+      `from x.y import a, b`  — pull just `a` and `b` into this file.
+      `from x.y import a as a2`
+                              — same, with a local rename.
+
+    `path` is the module path as a list of segments (`["stdlib", "list"]`
+    for `stdlib.list`). `names` is None for the wildcard form, or a list
+    of (source_name, local_alias_or_None) pairs for the `from` form.
+    `wildcard_alias` is reserved for the future `import x as z` form."""
+    path: list[str]
+    names: list[tuple[str, "str | None"]] | None
+    wildcard_alias: "str | None" = None
+    line: int = _pos()
+    col:  int = _pos()
+
+
+@dataclass
 class EdubbaDecl:
     """A methods block: `edubba Map<T> { fn set(mut self, k, v) {...} }`.
     E-DUB-BA-A was the Sumerian/Akkadian scribal school where students
@@ -553,8 +586,18 @@ class EdubbaDecl:
 
 Decl = Union[
     FnDecl, TableDecl, StructDecl, SealDecl, ColophonDecl, GlossDecl, EdubbaDecl, AliasDecl,
+    ImportDecl,
 ]
 
 @dataclass
 class Program:
     decls: list[Decl] = field(default_factory=list)
+    # Module-of-decl sideband. Keyed by `id(decl)`, value is the dotted
+    # module path the decl was declared in (e.g. `("stdlib", "list")`).
+    # Decls without an entry — including built-in injections like the
+    # `str` tablet, and any decls produced by a single-source compile
+    # path that doesn't go through the file driver — live in the root
+    # module (empty tuple). The driver populates this when bundling
+    # multiple files; later phases (typecheck visibility checks, codegen
+    # mangling) consult it but tolerate missing keys.
+    module_of: dict[int, tuple[str, ...]] = field(default_factory=dict, compare=False, repr=False)

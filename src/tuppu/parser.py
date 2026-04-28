@@ -108,12 +108,16 @@ class Parser:
                 decls.append(self.parse_edubba())
             elif self.check(Tok.TYPE_ALIAS):
                 decls.append(self.parse_type_alias())
+            elif self.check(Tok.IMPORT):
+                decls.append(self.parse_import())
+            elif self.check(Tok.FROM):
+                decls.append(self.parse_from_import())
             else:
                 t = self.peek()
                 raise ParseError(
                     f"expected 'fn', 'table', 'tablet', 'seal', 'colophon', "
-                    f"'gloss', 'edubba', or 'type' at top level, got "
-                    f"{t.kind.name}",
+                    f"'gloss', 'edubba', 'type', 'import', or 'from' at top "
+                    f"level, got {t.kind.name}",
                     t.line, t.col,
                 )
             self.skip_newlines()
@@ -247,6 +251,62 @@ class Parser:
             body=body,
             type_params=[],  # filled in at lowering from the host edubba
         ))
+
+    def parse_import(self) -> A.ImportDecl:
+        """`import x.y.z` — wildcard form: every public top-level name
+        from `x.y.z` is brought into the current file's scope, AND the
+        last segment `z` becomes a module-qualifier (`z.foo` works at
+        use sites for module-qualified access).
+
+        `import x.y.z as w` — same as above but `w` (rather than `z`)
+        is the qualifier alias, and the wildcard names are NOT brought
+        into local scope (the alias is the only access path).
+        """
+        start = self.eat(Tok.IMPORT)
+        path = self._parse_module_path()
+        alias: str | None = None
+        if self.check(Tok.AS):
+            self.advance()
+            alias_tok = self.eat(Tok.IDENT, "alias name after 'as'")
+            alias = alias_tok.value
+        return _at(start, A.ImportDecl(
+            path=path, names=None, wildcard_alias=alias,
+        ))
+
+    def parse_from_import(self) -> A.ImportDecl:
+        """`from x.y import a, b as c` — selective form. Brings only the
+        named decls into scope, optionally with a local alias each."""
+        start = self.eat(Tok.FROM)
+        path = self._parse_module_path()
+        self.eat(Tok.IMPORT, "expected 'import' after module path")
+        names: list[tuple[str, str | None]] = []
+        names.append(self._parse_import_name())
+        while self.check(Tok.COMMA):
+            self.advance()
+            names.append(self._parse_import_name())
+        return _at(start, A.ImportDecl(path=path, names=names))
+
+    def _parse_module_path(self) -> list[str]:
+        """Read a dotted identifier path like `stdlib.list` into a list
+        of segments. Each segment is a plain IDENT; the dots are pure
+        path separators (no expression-level meaning)."""
+        first = self.eat(Tok.IDENT, "module path segment")
+        path = [first.value]
+        while self.check(Tok.DOT):
+            self.advance()
+            seg = self.eat(Tok.IDENT, "module path segment after '.'")
+            path.append(seg.value)
+        return path
+
+    def _parse_import_name(self) -> tuple[str, str | None]:
+        """One entry in a `from ... import ...` list: `name` or
+        `name as alias`. Returns (source_name, local_alias_or_None)."""
+        n = self.eat(Tok.IDENT, "imported name").value
+        alias: str | None = None
+        if self.check(Tok.AS):
+            self.advance()
+            alias = self.eat(Tok.IDENT, "alias name after 'as'").value
+        return (n, alias)
 
     def parse_colophon(self) -> A.ColophonDecl:
         """`colophon fn name(params) -> type` — declare an external C
@@ -407,6 +467,15 @@ class Parser:
 
     def parse_struct_lit(self) -> A.StructLit:
         name_tok = self.eat(Tok.IDENT, "tablet name")
+        # Dotted module-qualified form: `mod.Tablet { ... }` or
+        # `mod.sub.Tablet { ... }`. Collapse the segments into a single
+        # dotted string on `StructLit.name`; the typechecker splits at
+        # the last `.` to find the qualifier and the short tablet name.
+        full_name = name_tok.value
+        while self.check(Tok.DOT):
+            self.advance()
+            seg = self.eat(Tok.IDENT, "struct-lit segment after '.'")
+            full_name = f"{full_name}.{seg.value}"
         self.eat(Tok.LBRACE)
         fields: list[tuple[str, A.Expr]] = []
         self.skip_newlines()
@@ -423,7 +492,7 @@ class Parser:
                 break
         self.skip_newlines()
         self.eat(Tok.RBRACE)
-        return _at(name_tok, A.StructLit(name=name_tok.value, fields=fields))
+        return _at(name_tok, A.StructLit(name=full_name, fields=fields))
 
     def parse_table(self) -> A.TableDecl:
         start = self.eat(Tok.TABLE)
@@ -451,6 +520,15 @@ class Parser:
             return _at(t, A.TypeName(name=t.value))
         if t.kind is Tok.IDENT:
             self.advance()
+            # Module-qualified type name: `mod.Foo` or `mod.Foo<T>`. The
+            # name is collapsed into a single dotted string here so the
+            # downstream typechecker can split it once and look up the
+            # qualifier in `module_aliases`.
+            full_name = t.value
+            while self.check(Tok.DOT):
+                self.advance()
+                seg = self.eat(Tok.IDENT, "type-name segment after '.'")
+                full_name = f"{full_name}.{seg.value}"
             # Generic type application: `Name<arg1, arg2>`. In type
             # position the `<` is always the type-arg-list bracket —
             # no ambiguity with less-than because type positions don't
@@ -464,8 +542,8 @@ class Parser:
                         self.advance()
                         args.append(self.parse_type())
                 self.eat(Tok.GT)
-                return _at(t, A.TypeApply(name=t.value, args=args))
-            return _at(t, A.TypeName(name=t.value))
+                return _at(t, A.TypeApply(name=full_name, args=args))
+            return _at(t, A.TypeName(name=full_name))
         if t.kind is Tok.TABLETS:
             self.advance()
             self.eat(Tok.LBRACKET)
@@ -692,18 +770,28 @@ class Parser:
         if t.kind is Tok.LOST:
             self.advance(); return _at(t, A.LostLit())
         if t.kind is Tok.IDENT:
-            # `Name { field : ...` is a struct literal. The lookahead
-            # skips any NEWLINE tokens between the `{` and the first
-            # field so multi-line struct literals still trigger the
-            # struct-lit parse path. A block's first token is never
-            # IDENT-COLON because bindings require `step`/`mut`.
-            if self.peek(1).kind is Tok.LBRACE:
-                i = 2
-                while self.peek(i).kind is Tok.NEWLINE:
-                    i += 1
+            # `Name { field : ...` and `mod.Name { field : ...` are
+            # struct literals. The lookahead skips any NEWLINE tokens
+            # between the `{` and the first field so multi-line struct
+            # literals still trigger the struct-lit parse path. A
+            # block's first token is never IDENT-COLON because bindings
+            # require `step`/`mut`. The dotted form is unambiguous —
+            # a field-access chain followed by `{ IDENT :` doesn't
+            # form a valid expression elsewhere in the grammar (block
+            # bodies start with a stmt keyword, not a label).
+            #
+            # Walk past any `.IDENT` segments, then check for the
+            # struct-lit shape.
+            i = 1
+            while self.peek(i).kind is Tok.DOT and self.peek(i + 1).kind is Tok.IDENT:
+                i += 2
+            if self.peek(i).kind is Tok.LBRACE:
+                j = i + 1
+                while self.peek(j).kind is Tok.NEWLINE:
+                    j += 1
                 if (
-                    self.peek(i).kind is Tok.IDENT
-                    and self.peek(i + 1).kind is Tok.COLON
+                    self.peek(j).kind is Tok.IDENT
+                    and self.peek(j + 1).kind is Tok.COLON
                 ):
                     return self.parse_struct_lit()
             self.advance(); return _at(t, A.Ident(name=t.value))

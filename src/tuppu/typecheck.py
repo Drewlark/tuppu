@@ -160,25 +160,32 @@ class TyStruct:
     """A user-defined tablet (product) type. Nominally typed — equal
     by name only, with an optional tuple of instantiated type args
     for generic tablets. `Node<i64>` and `Node<str>` are different
-    TyStructs; `Node` (non-generic) has args=()."""
+    TyStructs; `Node` (non-generic) has args=().
+
+    `name` holds the typecheck-assigned flat (possibly module-prefix-
+    mangled) name; `__str__` prettifies it for diagnostics so users
+    see `foo.Counter` rather than `__M_foo__Counter`."""
     name: str
     args: tuple = ()    # tuple of Ty, type arguments for generic tablets
     def __str__(self) -> str:
+        pretty = _pretty_flat_name(self.name)
         if not self.args:
-            return self.name
-        return f"{self.name}<{', '.join(str(a) for a in self.args)}>"
+            return pretty
+        return f"{pretty}<{', '.join(str(a) for a in self.args)}>"
 
 @dataclass(frozen=True)
 class TySeal:
     """A user-defined seal (sum) type. Like TyStruct it's nominal and
     carries an optional tuple of type args for generic seals — so
-    `Option<i64>` and `Option<str>` are distinct TySeals."""
+    `Option<i64>` and `Option<str>` are distinct TySeals. `name` is
+    the flat form; `__str__` prettifies."""
     name: str
     args: tuple = ()
     def __str__(self) -> str:
+        pretty = _pretty_flat_name(self.name)
         if not self.args:
-            return self.name
-        return f"{self.name}<{', '.join(str(a) for a in self.args)}>"
+            return pretty
+        return f"{pretty}<{', '.join(str(a) for a in self.args)}>"
 
 @dataclass(frozen=True)
 class TyVar:
@@ -238,6 +245,45 @@ INTRINSIC_NAMES = {
     "int_to_str", "sex_to_str",
     "bytes_to_str", "buffer_to_str",
 }
+
+# Names that are universally visible regardless of module context.
+# These are language-level: the built-in `str` tablet that the driver
+# auto-prepends, plus the keywords-but-actually-names like `lost`. The
+# primitive types (i64, bool, ...) are handled separately in
+# `_resolve_type` because they aren't stored in `self.structs`.
+BUILTIN_NAMES: set[str] = {"str"}
+
+
+def _mangle_module_name(module: tuple[str, ...], short: str) -> str:
+    """Compose a module-qualified flat name for the global symbol
+    tables. Built-in names (universally visible) and decls in the
+    root module are not mangled — they keep their short form so
+    single-source compiles, the auto-prepended `str` tablet, and
+    LLVM-level intrinsic / extern symbols all remain unambiguous.
+
+    Module segments are joined with `__` so the resulting symbol is a
+    valid C / LLVM identifier; the leading `__M_` distinguishes
+    compiler-mangled names from user-chosen ones (which can't start
+    with `__M_` because lex disallows the prefix? no — they can, but
+    by convention the user-namespace doesn't collide here)."""
+    if not module or short in BUILTIN_NAMES:
+        return short
+    return "__M_" + "__".join(module) + "__" + short
+
+
+def _pretty_flat_name(flat: str) -> str:
+    """Render a possibly-mangled flat name for error messages.
+    `__M_stdlib__list__push` becomes `stdlib.list.push`; short forms
+    pass through unchanged so single-module diagnostics are unaffected.
+    Used by `TyStruct.__str__` / `TySeal.__str__` and by the message
+    rendering in `Checker._fmt_name`."""
+    if not flat.startswith("__M_"):
+        return flat
+    body = flat[len("__M_"):]
+    parts = body.split("__")
+    if len(parts) < 2:
+        return flat
+    return ".".join(parts)
 
 
 # The fixed set of operator-overload op names users may declare with
@@ -347,11 +393,22 @@ class Checker:
         # seal name → tuple of (variant_name, tuple of field Ty).
         # Order is source order so codegen can assign stable tag indices.
         self.seal_variants: dict[str, tuple[tuple[str, tuple[Ty, ...]], ...]] = {}
-        # variant_name → (seal_name, variant_index, declared_field_tys).
-        # Variant names are globally unique because qualified-variant
-        # syntax (`Seal::Variant`) hasn't been designed yet — ambiguity
-        # would force that decision.
-        self.variant_lookup: dict[str, tuple[str, int, tuple[Ty, ...]]] = {}
+        # variant_name → list of (seal_name, variant_idx, declared_field_tys,
+        # declaring_module). Multi-keyed because two seals in different
+        # modules may declare the same variant name (the LIMITATIONS.md
+        # flat-seal-variant gap is fixed via per-module disambiguation
+        # at use sites). Within a single module two seals still can't
+        # share a variant name.
+        self.variant_lookup: dict[str, list[tuple[str, int, tuple[Ty, ...], tuple[str, ...]]]] = {}
+        # mod → {variant_name: list[(seal_name, idx, field_tys, decl_module)]}.
+        # Populated by `_build_module_visible_variants` after seal
+        # variants are resolved. The list shape lets the use-site
+        # resolver detect ambiguity when two imported seals each
+        # contribute the same variant name into one module's scope.
+        self.module_visible_variants: dict[
+            tuple[str, ...],
+            dict[str, list[tuple[str, int, tuple[Ty, ...], tuple[str, ...]]]],
+        ] = {}
         # Generics: per-tablet type-parameter names, in declaration order.
         self.struct_type_params: dict[str, tuple[str, ...]] = {}
         # Generics: per-fn type-parameter names.
@@ -431,16 +488,76 @@ class Checker:
         # any escape rule (smart wedges trace through GC instead).
         self._fn_params: set[str] = set()
 
+        # --- module support --------------------------------------------
+        # Each top-level decl is tagged with its declaring module path
+        # via `Program.module_of`. Phase 0 builds per-module tables and
+        # all subsequent lookups go through them.
+
+        # All module paths that contributed at least one decl. The root
+        # module `()` is included implicitly so single-source compiles
+        # still resolve the auto-prepended `str` tablet.
+        self._known_modules: set[tuple[str, ...]] = {()}
+        # mod -> {short_name: decl}. Decls declared IN that module,
+        # by their parser-given short name. Includes `_`-prefixed
+        # private decls (visibility filtering happens at use-site).
+        self.module_decls: dict[tuple[str, ...], dict[str, A.Decl]] = {}
+        # `id(decl) -> flat_name`. The global-symbol-table key for
+        # each top-level decl. Mangled (`__M_mod__short`) when the
+        # short name collides across modules; otherwise the short
+        # form so existing single-module code paths stay untouched.
+        # All `self.fns` / `self.structs` / etc. registrations and
+        # lookups go through this — it's how cross-module same-name
+        # decls coexist.
+        self.flat_name_for: dict[int, str] = {}
+        # mod -> {short_name: mangled_name}. The visible scope of each
+        # module: own decls + imports + universally-visible builtins.
+        # Lookups for top-level user names route through this table.
+        # `mangled_name` is what's keyed in `self.fns` / `self.structs`
+        # / `self.seals`. Builtins map to their unmangled form.
+        self.module_visible: dict[tuple[str, ...], dict[str, str]] = {}
+        # Set of Call-node ids whose callee was rewritten by the
+        # module-qualified-access branch in `_tc_call`. The downstream
+        # `_check_module_scope` skips these — the qualifier already
+        # validated visibility against the source module's exports.
+        self._qualified_call_resolved: set[int] = set()
+        # mod -> {alias: source_module_path}. Populated from
+        # `import x.y as z` (so `z.foo` becomes a module-qualified
+        # reference into module x.y at use sites).
+        self.module_aliases: dict[tuple[str, ...], dict[str, tuple[str, ...]]] = {}
+        # mod -> set of source modules referenced by wildcard `import x`
+        # (so `x.foo` works as a module-qualified reference). The
+        # wildcard form also pulls every public name into the local
+        # visible scope; this set just records that the prefix `x`
+        # itself is also valid as a qualifier.
+        self.module_qualified_refs: dict[tuple[str, ...], set[tuple[str, ...]]] = {}
+        # Updated at every top-level decl visit so name resolution
+        # knows whose visible scope to consult. Body-checking phases
+        # set this at the start of each fn / gloss; phase-0 already
+        # sets it per-decl.
+        self.current_module: tuple[str, ...] = ()
+
     def _warn(self, message: str, line: int = 0, col: int = 0) -> None:
         self.warnings.append(CompileWarning(message=message, line=line, col=col))
 
     def check(self) -> None:
+        # Phase 0-modules: catalogue all module paths, validate imports,
+        # build per-module visible scopes (own decls + imports +
+        # universally-visible builtins). After this every later phase
+        # can resolve top-level names via `_resolve_top_level` and
+        # `_resolve_module_qualified`.
+        self._build_module_scopes()
+        # Phase 0-cycles: import graph must be acyclic. The strategy
+        # doc explicitly lists circular imports as a non-goal for v1
+        # (see `scratch/NEXT_BIG_FEATURE.md`); rejecting them now keeps
+        # later passes' single-traversal model honest.
+        self._reject_import_cycles()
         # Phase 0a: collect struct + seal names so type bodies can refer
         # to each other and to user types regardless of source order.
         # Aliases register their target AST eagerly; the target gets
         # resolved lazily on first use so it can name struct / seal /
         # alias siblings declared later in the file.
         for d in self.prog.decls:
+            self.current_module = self.prog.module_of.get(id(d), ())
             if isinstance(d, A.StructDecl):
                 self._register_struct_name(d)
             elif isinstance(d, A.SealDecl):
@@ -450,10 +567,16 @@ class Checker:
         # Phase 0b: resolve fields (structs) and variants (seals) now
         # that all user type names are in scope.
         for d in self.prog.decls:
+            self.current_module = self.prog.module_of.get(id(d), ())
             if isinstance(d, A.StructDecl):
                 self._resolve_struct_fields(d)
             elif isinstance(d, A.SealDecl):
                 self._resolve_seal_variants(d)
+        # Phase 0b': now that every seal's variants are resolved into
+        # `self.variant_lookup`, build the per-module visible-variants
+        # table. Use sites consult this to pick the right variant when
+        # cross-module variant-name reuse exists.
+        self._build_module_visible_variants()
         # Phase 0c: lower edubba blocks to flat FnDecls. By the time we
         # reach the fn-signature phase, methods need to look like regular
         # generic fns, so we splice them into `self.prog.decls` here and
@@ -468,20 +591,563 @@ class Checker:
         # register in both the fn table (under a mangled name) and the
         # operator dispatch table.
         for d in self.prog.decls:
+            self.current_module = self.prog.module_of.get(id(d), ())
             if isinstance(d, A.FnDecl):
                 self._register_fn(d)
             elif isinstance(d, A.ColophonDecl):
                 self._register_colophon(d)
             elif isinstance(d, A.GlossDecl):
                 self._register_gloss(d)
+                # Gloss decls don't expose a user-named top-level slot;
+                # their mangled name is internal-only, so we skip the
+                # visibility table for them.
         for d in self.prog.decls:
+            self.current_module = self.prog.module_of.get(id(d), ())
             if isinstance(d, A.TableDecl):
                 self._register_table(d)
         for d in self.prog.decls:
+            self.current_module = self.prog.module_of.get(id(d), ())
             if isinstance(d, A.FnDecl):
                 self._check_fn_body(d)
             elif isinstance(d, A.GlossDecl):
                 self._check_gloss_body(d)
+        # Reset to the root module after all decls have been visited so
+        # any subsequent invocations (e.g. tests reusing the Checker
+        # instance) start from a clean slate.
+        self.current_module = ()
+
+    def _build_module_scopes(self) -> None:
+        """Build the per-module decl tables and visible scopes.
+
+        Phase 0 of the checker. After this, every later phase can
+        consult `self.module_visible[mod]` to translate a short name
+        into the global mangled name keyed in `self.fns` /
+        `self.structs` / `self.seals` / etc.
+
+        Steps:
+
+        1. Catalogue every (module, short_name) pair from the program's
+           non-import top-level decls. This is `module_decls`.
+        2. Validate import paths and selected names. Unknown modules,
+           unknown names, and private (`_`-prefixed) names referenced
+           in `from ... import` forms are rejected here.
+        3. Build `module_visible` per module:
+             - own decls (including private)
+             - explicit imports (`from x import a [as b]`)
+             - explicit wildcard imports (`import x.y` — every public
+               name of x.y in scope; AND `y` registered as a qualifier
+               for module-qualified access)
+             - aliased imports (`import x.y as z` — only `z` registered
+               as a qualifier; no flat-name pollution)
+             - the universally-visible builtin `str`
+        4. Record module-qualifier aliases in `module_aliases` and
+           `module_qualified_refs` so module-qualified access (e.g.
+           `parser.parse(x)` after `import parser`) can resolve.
+        """
+        # Step 1: catalogue decls per module. First pass: every decl
+        # contributes its module path to `_known_modules` (so files that
+        # contain only edubbas / imports / gloss still get a visible-
+        # scope entry).
+        for d in self.prog.decls:
+            mod = self.prog.module_of.get(id(d), ())
+            self._known_modules.add(mod)
+        # Second pass: populate `module_decls` with the user-named
+        # top-level decls. Skip imports (no decl name), gloss (mangled
+        # internally), and edubba (lowered to `<Type>__<method>` fns
+        # by phase 0c).
+        for d in self.prog.decls:
+            if isinstance(d, (A.ImportDecl, A.GlossDecl, A.EdubbaDecl)):
+                continue
+            name = getattr(d, "name", None)
+            if not name:
+                continue
+            mod = self.prog.module_of.get(id(d), ())
+            decls = self.module_decls.setdefault(mod, {})
+            # Tolerate duplicates here — the per-decl-type registration
+            # phases (`_register_fn`, `_register_struct_name`, etc.)
+            # raise their own typed error messages that callers depend
+            # on for diagnostics. We just record the first one we see
+            # so module_visible has something to point at.
+            decls.setdefault(name, d)
+
+        # Compute the flat (global-symbol-table) name for every decl.
+        # When two modules each declare the same short name, both
+        # decls get module-prefix-mangled so they coexist in the global
+        # tables. When a short name is unique across the program, no
+        # mangling is needed and the short form is used as-is — keeps
+        # existing single-module code paths untouched.
+        short_count: dict[str, int] = {}
+        for mod, decls in self.module_decls.items():
+            for short in decls:
+                short_count[short] = short_count.get(short, 0) + 1
+        # Builtins are universally visible by their short name and
+        # never get mangled (the auto-prepended `str` tablet has its
+        # own global symbol).
+        for b in BUILTIN_NAMES:
+            short_count[b] = 1
+        for mod, decls in self.module_decls.items():
+            for short, decl in decls.items():
+                # Colophons are externs — their C-ABI symbol is the
+                # short name, period. Never mangled. (Two modules
+                # declaring the same colophon name will collide at the
+                # global fn table, which is the right behavior — only
+                # one extern can claim a given C symbol.)
+                if isinstance(decl, A.ColophonDecl):
+                    self.flat_name_for[id(decl)] = short
+                elif short in BUILTIN_NAMES or short_count.get(short, 0) <= 1:
+                    self.flat_name_for[id(decl)] = short
+                else:
+                    self.flat_name_for[id(decl)] = _mangle_module_name(mod, short)
+
+        # Initialize each known module's visible scope with its own
+        # decls. The visible mapping is short → flat (global-symbol)
+        # name. Private decls (`_`-prefixed) are visible only within
+        # their declaring module — their entry lands here but not in
+        # any other module's scope.
+        for mod in self._known_modules:
+            scope = {}
+            for short, decl in self.module_decls.get(mod, {}).items():
+                scope[short] = self.flat_name_for.get(id(decl), short)
+            # Builtins always visible.
+            for b in BUILTIN_NAMES:
+                scope.setdefault(b, b)
+            self.module_visible[mod] = scope
+            self.module_aliases[mod] = {}
+            self.module_qualified_refs[mod] = set()
+
+        # Root-module ergonomic shortcut: when code lives outside `src/`
+        # / `stdlib/` (single-source compiles, ad-hoc scripts in
+        # `tmp_path`, the `examples/` directory), every public stdlib
+        # decl is in scope unprefixed. Inside `src/` and inside
+        # `stdlib/`, the shortcut is OFF — those modules must explicitly
+        # `from stdlib.X import Y`. The split is between "script mode"
+        # (root: ergonomics) and "project mode" (src/, stdlib/: import
+        # discipline). The strategy doc didn't anticipate `<source>`-
+        # style ad-hoc compiles, but the cwd-as-project-root convention
+        # naturally accommodates both: you opt into project mode by
+        # putting code under `src/`.
+        if () in self.module_visible:
+            for mod in list(self._known_modules):
+                if mod and mod[0] == "stdlib":
+                    for short, decl in self.module_decls.get(mod, {}).items():
+                        if short.startswith("_"):
+                            continue
+                        self.module_visible[()].setdefault(
+                            short, self.flat_name_for.get(id(decl), short),
+                        )
+                    # Also register the stdlib module's last segment as
+                    # a module-qualifier in root, so `list.list_push`
+                    # syntax (when qualified access lands) resolves.
+                    self.module_aliases[()].setdefault(mod[-1], mod)
+                    self.module_qualified_refs[()].add(mod)
+
+        # Step 2 + 3 + 4: process imports.
+        for d in self.prog.decls:
+            if not isinstance(d, A.ImportDecl):
+                continue
+            importer = self.prog.module_of.get(id(d), ())
+            src_mod = tuple(d.path)
+            if src_mod not in self._known_modules:
+                pretty = ".".join(d.path)
+                raise CheckError(
+                    f"unknown module {pretty!r} in import",
+                    d.line, d.col,
+                )
+            src_decls = self.module_decls.get(src_mod, {})
+
+            pretty = ".".join(d.path)
+            if d.names is None:
+                # Wildcard `import x.y` (or `import x.y as z`).
+                if d.wildcard_alias is None:
+                    # Bring every public name into local scope.
+                    for short, decl in src_decls.items():
+                        if short.startswith("_"):
+                            continue
+                        new_flat = self.flat_name_for.get(id(decl), short)
+                        existing = self.module_visible[importer].get(short)
+                        if existing is not None and existing != new_flat:
+                            raise CheckError(
+                                f"import of {short!r} from {pretty!r} "
+                                f"conflicts with an existing name in "
+                                f"this file",
+                                d.line, d.col,
+                            )
+                        self.module_visible[importer][short] = new_flat
+                    # The last segment of the path is also registered
+                    # as a module-qualifier so `<seg>.foo` works at use
+                    # sites.
+                    last = src_mod[-1]
+                    self.module_aliases[importer][last] = src_mod
+                    self.module_qualified_refs[importer].add(src_mod)
+                else:
+                    # `import x.y as z` — alias-only. No flat-name
+                    # pollution; access is exclusively via `z.foo`.
+                    alias = d.wildcard_alias
+                    if alias in self.module_aliases[importer]:
+                        raise CheckError(
+                            f"duplicate import alias {alias!r}",
+                            d.line, d.col,
+                        )
+                    self.module_aliases[importer][alias] = src_mod
+                    self.module_qualified_refs[importer].add(src_mod)
+            else:
+                # `from x.y import a, b as c` — selective.
+                for src_name, alias in d.names:
+                    if src_name.startswith("_"):
+                        raise CheckError(
+                            f"cannot import private name {src_name!r} "
+                            f"from {pretty!r} (names beginning with "
+                            f"'_' are private to their module)",
+                            d.line, d.col,
+                        )
+                    if src_name not in src_decls:
+                        raise CheckError(
+                            f"module {pretty!r} has no export named "
+                            f"{src_name!r}",
+                            d.line, d.col,
+                        )
+                    local = alias or src_name
+                    src_decl = src_decls[src_name]
+                    new_flat = self.flat_name_for.get(id(src_decl), src_name)
+                    existing = self.module_visible[importer].get(local)
+                    if existing is not None and existing != new_flat:
+                        raise CheckError(
+                            f"import of {local!r} from {pretty!r} "
+                            f"conflicts with an existing name in this "
+                            f"file",
+                            d.line, d.col,
+                        )
+                    self.module_visible[importer][local] = new_flat
+
+    def _resolve_top_level(self, short_name: str) -> str | None:
+        """Map a short name to its mangled global form via the current
+        module's visible scope. Returns None when the name isn't
+        visible — callers either fall back to other tables (locals,
+        intrinsics, primitives) or raise."""
+        scope = self.module_visible.get(self.current_module)
+        if scope is None:
+            return None
+        return scope.get(short_name)
+
+    def _resolve_module_qualified(
+        self, qualifier: str, short_name: str,
+    ) -> str | None:
+        """Resolve `qualifier.short_name` against the current module's
+        registered module aliases. Returns the mangled global name if
+        `qualifier` matches an `import x.y` (last segment) or
+        `import x.y as qualifier` entry AND `short_name` is a public
+        decl of that source module. Returns None otherwise."""
+        aliases = self.module_aliases.get(self.current_module, {})
+        src_mod = aliases.get(qualifier)
+        if src_mod is None:
+            return None
+        src_decls = self.module_decls.get(src_mod, {})
+        if short_name not in src_decls:
+            return None
+        if short_name.startswith("_"):
+            return None
+        return _mangle_module_name(src_mod, short_name)
+
+    def _resolve_qualified_type(
+        self, dotted: str, line: int, col: int,
+        type_args: "list[A.TypeExpr] | None" = None,
+        where: str = "",
+    ) -> "Ty | None":
+        """Resolve a dotted type name like `qual.Map` (or `qual.Map<T>`
+        when `type_args` is given) against the current module's import
+        aliases. The qualifier is the leading segment; the rest is the
+        short type name. Returns the resolved `Ty` or None if the
+        qualifier isn't a registered import alias (caller falls
+        through to the unknown-type error)."""
+        head, _, tail = dotted.partition(".")
+        if not tail:
+            return None
+        aliases = self.module_aliases.get(self.current_module, {})
+        src_mod = aliases.get(head)
+        if src_mod is None:
+            return None
+        decl = self.module_decls.get(src_mod, {}).get(tail)
+        if decl is None:
+            pretty = ".".join(src_mod) or "<root>"
+            raise CheckError(
+                f"module {pretty!r} has no public type {tail!r}",
+                line, col,
+            )
+        # Use the resolved decl's flat name to key the global tables —
+        # cross-module same-name tablets / seals would otherwise alias
+        # through `tail` and pick the wrong entry.
+        flat = self._flat_name(decl)
+        if isinstance(decl, A.StructDecl):
+            params = self.struct_type_params.get(flat, ())
+            if type_args is None:
+                if params:
+                    raise CheckError(
+                        f"{where or 'type'}: tablet {tail!r} expects "
+                        f"{len(params)} type argument(s); write "
+                        f"`{dotted}<...>`",
+                        line, col,
+                    )
+                return self.structs[flat]
+            if len(params) != len(type_args):
+                raise CheckError(
+                    f"{where or 'type'}: tablet {tail!r} expects "
+                    f"{len(params)} type argument(s), got "
+                    f"{len(type_args)}",
+                    line, col,
+                )
+            resolved = tuple(
+                self._resolve_type(a, f"{where or 'type'} type arg")
+                for a in type_args
+            )
+            return TyStruct(name=flat, args=resolved)
+        if isinstance(decl, A.SealDecl):
+            params = self.seal_type_params.get(flat, ())
+            if type_args is None:
+                if params:
+                    raise CheckError(
+                        f"{where or 'type'}: seal {tail!r} expects "
+                        f"{len(params)} type argument(s); write "
+                        f"`{dotted}<...>`",
+                        line, col,
+                    )
+                return self.seals[flat]
+            if len(params) != len(type_args):
+                raise CheckError(
+                    f"{where or 'type'}: seal {tail!r} expects "
+                    f"{len(params)} type argument(s), got "
+                    f"{len(type_args)}",
+                    line, col,
+                )
+            resolved = tuple(
+                self._resolve_type(a, f"{where or 'type'} type arg")
+                for a in type_args
+            )
+            return TySeal(name=flat, args=resolved)
+        # decl exists but isn't a tablet/seal — type position requires
+        # a type-bearing decl.
+        raise CheckError(
+            f"{where or 'type'}: {dotted!r} resolves to a "
+            f"{type(decl).__name__}, not a tablet or seal",
+            line, col,
+        )
+
+    def _reject_import_cycles(self) -> None:
+        """Reject any cycle in the module import graph. The graph
+        edge `A → B` means module A has an `import B` or `from B import
+        ...` decl. Cycles are detected with a depth-first traversal.
+
+        v1 doesn't need a topological order to typecheck — the existing
+        flat-namespace pass already sees all decls — but rejecting
+        cycles now keeps the door open for a real per-module-scope
+        typecheck that walks modules in dependency order. See the
+        strategy doc's explicit non-goal: 'No circular imports.
+        Reject at link time.'"""
+        edges: dict[tuple[str, ...], list[tuple[tuple[str, ...], int, int]]] = {}
+        for d in self.prog.decls:
+            if not isinstance(d, A.ImportDecl):
+                continue
+            src = self.prog.module_of.get(id(d), ())
+            dst = tuple(d.path)
+            edges.setdefault(src, []).append((dst, d.line, d.col))
+
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color: dict[tuple[str, ...], int] = {m: WHITE for m in self._known_modules}
+        stack: list[tuple[str, ...]] = []
+
+        def visit(node: tuple[str, ...]) -> None:
+            if color.get(node, WHITE) == BLACK:
+                return
+            if color.get(node) == GRAY:
+                # Cycle. Slice the stack from the recurrence point.
+                idx = stack.index(node)
+                cycle = stack[idx:] + [node]
+                pretty = " -> ".join(".".join(m) or "<root>" for m in cycle)
+                raise CheckError(
+                    f"circular import detected: {pretty}",
+                    0, 0,
+                )
+            color[node] = GRAY
+            stack.append(node)
+            for tgt, _line, _col in edges.get(node, []):
+                visit(tgt)
+            stack.pop()
+            color[node] = BLACK
+
+        for mod in list(self._known_modules):
+            if color.get(mod, WHITE) == WHITE:
+                visit(mod)
+
+    def _build_module_visible_variants(self) -> None:
+        """Populate `self.module_visible_variants[mod]` for every known
+        module. The visible variants in module M are:
+          - own seals' variants
+          - variants of seals imported via `from X import SealName` or
+            wildcard `import X` (where X has at least one seal)
+          - (root only) variants of every public stdlib seal — matches
+            the auto-import shortcut in `_build_module_scopes`
+
+        Variant names that resolve to multiple distinct (seal, module)
+        pairs in the same scope land here as the single registered
+        entry; ambiguity is detected at use time when the user picks
+        the name. Per-module same-name-twice is already rejected at
+        registration in `_resolve_seal_variants`."""
+        # Map: (seal_name, decl_mod) -> {variant_name: (seal, idx, fields, mod)}
+        per_seal: dict[tuple[str, tuple[str, ...]], dict[str, tuple[str, int, tuple[Ty, ...], tuple[str, ...]]]] = {}
+        for vname, entries in self.variant_lookup.items():
+            for seal, idx, fields, decl_mod in entries:
+                per_seal.setdefault((seal, decl_mod), {})[vname] = (
+                    seal, idx, fields, decl_mod,
+                )
+
+        def _add(visible_map, vname, info):
+            """Append `info` to visible_map[vname] unless an identical
+            entry is already there (avoids spurious duplicates from
+            wildcard + selective imports of the same seal)."""
+            entries = visible_map.setdefault(vname, [])
+            if info not in entries:
+                entries.append(info)
+
+        for mod in self._known_modules:
+            visible: dict[str, list[tuple[str, int, tuple[Ty, ...], tuple[str, ...]]]] = {}
+            # Own seals.
+            for name, decl in self.module_decls.get(mod, {}).items():
+                if isinstance(decl, A.SealDecl):
+                    for vname, info in per_seal.get((name, mod), {}).items():
+                        _add(visible, vname, info)
+            self.module_visible_variants[mod] = visible
+
+        # Process imports: bring in the variants of every imported seal.
+        for d in self.prog.decls:
+            if not isinstance(d, A.ImportDecl):
+                continue
+            importer = self.prog.module_of.get(id(d), ())
+            src_mod = tuple(d.path)
+            src_decls = self.module_decls.get(src_mod, {})
+            if d.names is None and d.wildcard_alias is None:
+                # `import x.y` (wildcard) — every public seal's variants.
+                for sname, decl in src_decls.items():
+                    if sname.startswith("_"):
+                        continue
+                    if not isinstance(decl, A.SealDecl):
+                        continue
+                    for vname, info in per_seal.get((sname, src_mod), {}).items():
+                        _add(self.module_visible_variants[importer], vname, info)
+            elif d.names is not None:
+                # `from x import a, b as c` — only the named decls.
+                for src_name, _alias in d.names:
+                    decl = src_decls.get(src_name)
+                    if not isinstance(decl, A.SealDecl):
+                        continue
+                    for vname, info in per_seal.get((src_name, src_mod), {}).items():
+                        _add(self.module_visible_variants[importer], vname, info)
+
+        # Root-mode auto-stdlib: bring every public stdlib seal's variants
+        # into root's visible variants. Mirrors the auto-import
+        # shortcut for top-level decls in `_build_module_scopes`.
+        for mod in list(self._known_modules):
+            if mod and mod[0] == "stdlib":
+                for sname, decl in self.module_decls.get(mod, {}).items():
+                    if sname.startswith("_"):
+                        continue
+                    if not isinstance(decl, A.SealDecl):
+                        continue
+                    for vname, info in per_seal.get((sname, mod), {}).items():
+                        _add(self.module_visible_variants.setdefault((), {}), vname, info)
+
+    def _resolve_variant(
+        self, name: str, line: int, col: int,
+    ) -> tuple[str, int, tuple[Ty, ...], tuple[str, ...]] | None:
+        """Look up `name` in the current module's visible variants.
+
+        Outcomes:
+          - exactly one entry → returns (seal, idx, fields, decl_mod)
+          - zero entries, registered elsewhere → CheckError telling the
+            user to import the seal that contains it
+          - zero entries, not registered → returns None (caller continues
+            to "undefined name" path)
+          - more than one entry (ambiguous) → CheckError listing the
+            candidate seals so the user can be specific
+        """
+        visible = self.module_visible_variants.get(self.current_module, {}).get(name)
+        if visible:
+            if len(visible) == 1:
+                return visible[0]
+            # Ambiguity: more than one imported seal contributes a
+            # variant by this name. Tell the user which seals collide.
+            choices = ", ".join(
+                f"seal {seal!r} in module {('.'.join(mod) or '<root>')!r}"
+                for seal, _idx, _f, mod in visible
+            )
+            raise CheckError(
+                f"variant {name!r} is declared in multiple seals; "
+                f"import the specific seal you mean: {choices}",
+                line, col,
+            )
+        # Not visible. Is it declared anywhere?
+        registered = self.variant_lookup.get(name, [])
+        if not registered:
+            return None
+        # Variant exists but isn't in scope. Point the user at one of
+        # the seals that contains it.
+        seals = sorted({(seal, mod) for seal, _idx, _f, mod in registered})
+        if len(seals) == 1:
+            seal, mod = seals[0]
+            pretty = ".".join(mod) or "<root>"
+            raise CheckError(
+                f"variant {name!r} (of seal {seal!r}) is declared in "
+                f"module {pretty!r} but the seal isn't in scope here; "
+                f"add `from {pretty} import {seal}` (or `import "
+                f"{pretty}`) at the top of this file",
+                line, col,
+            )
+        # Multiple seals declare it elsewhere — list them.
+        choices = ", ".join(
+            f"seal {seal!r} in module {('.'.join(mod) or '<root>')!r}"
+            for seal, mod in seals
+        )
+        raise CheckError(
+            f"variant {name!r} is declared in multiple seals; import "
+            f"the specific seal you mean: {choices}",
+            line, col,
+        )
+
+    def _check_module_scope(self, name: str, line: int, col: int) -> None:
+        """Enforce per-module visibility for top-level user-defined
+        names. The name must be in the current module's visible scope
+        (own decls + imports + builtins), or be a non-top-level
+        thing the caller will handle (a not-yet-bound local, or the
+        `not declared anywhere` case). Raises with a targeted message
+        if the name is declared in some other module but not imported
+        here; otherwise returns silently and lets the caller continue
+        its existing not-found path."""
+        scope = self.module_visible.get(self.current_module, {})
+        if name in scope:
+            return
+        # Find where this name is declared, if anywhere. If it lives in
+        # a different module, the user almost certainly forgot to
+        # import it.
+        for mod, decls in self.module_decls.items():
+            if name in decls:
+                if mod == self.current_module:
+                    # Decl exists in this module but isn't visible —
+                    # only happens if `_build_module_scopes` skipped
+                    # it (shouldn't); fall through to the generic path.
+                    return
+                pretty = ".".join(mod) or "<root>"
+                if name.startswith("_"):
+                    raise CheckError(
+                        f"name {name!r} is private to module {pretty!r} "
+                        f"and cannot be imported",
+                        line, col,
+                    )
+                here = ".".join(self.current_module) or "<root>"
+                raise CheckError(
+                    f"name {name!r} is declared in module {pretty!r} "
+                    f"but not in scope here ({here!r}); add `from "
+                    f"{pretty} import {name}` (or `import {pretty}`) at "
+                    f"the top of this file",
+                    line, col,
+                )
 
     # --- registration ------------------------------------------------
 
@@ -491,35 +1157,37 @@ class Checker:
                 f"type alias {a.name!r}: name shadows a built-in type",
                 a.line, a.col,
             )
-        if a.name in self.structs or a.name in self.seals:
+        flat = self._flat_name(a)
+        if flat in self.structs or flat in self.seals:
             raise CheckError(
                 f"type alias {a.name!r}: name collides with an existing "
                 f"tablet or seal",
                 a.line, a.col,
             )
-        if a.name in self.type_aliases:
+        if flat in self.type_aliases:
             raise CheckError(
                 f"duplicate type alias {a.name!r}", a.line, a.col,
             )
-        self.type_aliases[a.name] = a.target
+        self.type_aliases[flat] = a.target
 
     def _register_struct_name(self, s: A.StructDecl) -> None:
         if s.name in PRIM_TYPES:
             raise CheckError(
                 f"tablet {s.name!r}: name shadows a built-in type", s.line, s.col,
             )
-        if s.name in self.structs:
+        flat = self.flat_name_for.get(id(s), s.name)
+        if flat in self.structs:
             raise CheckError(
                 f"duplicate tablet {s.name!r}", s.line, s.col,
             )
-        if s.name in self.type_aliases:
+        if flat in self.type_aliases:
             raise CheckError(
                 f"tablet {s.name!r}: name collides with an existing "
                 f"type alias",
                 s.line, s.col,
             )
-        self.structs[s.name] = TyStruct(name=s.name)
-        self.struct_type_params[s.name] = tuple(s.type_params)
+        self.structs[flat] = TyStruct(name=flat)
+        self.struct_type_params[flat] = tuple(s.type_params)
 
     def _lower_edubbas(self) -> None:
         """Splice each `edubba T<...> { fn ... }` block's methods into
@@ -541,19 +1209,59 @@ class Checker:
             if not isinstance(d, A.EdubbaDecl):
                 new_decls.append(d)
                 continue
-            if d.type_name not in self.structs:
+            edubba_mod = self.prog.module_of.get(id(d), ())
+            # Find the host tablet. Two modules CAN each declare a
+            # tablet by the same short name (cross-module mangling),
+            # so the search has to be module-aware: try the edubba's
+            # own module first, then fall back to any other module so
+            # the diagnostic-friendly "edubba can only extend tablets
+            # in their host's module" error still fires for foreign
+            # extensions. The first-match-wins ordering matters.
+            host_decl = None
+            host_mod = None
+            same_mod_decls = self.module_decls.get(edubba_mod, {})
+            cand = same_mod_decls.get(d.type_name)
+            if isinstance(cand, A.StructDecl):
+                host_decl = cand
+                host_mod = edubba_mod
+            else:
+                for mod, decls in self.module_decls.items():
+                    cand = decls.get(d.type_name)
+                    if isinstance(cand, A.StructDecl):
+                        host_decl = cand
+                        host_mod = mod
+                        break
+            if host_decl is None:
                 raise CheckError(
                     f"edubba {d.type_name!r}: no tablet by that name",
                     d.line, d.col,
                 )
-            host_params = self.struct_type_params.get(d.type_name, ())
+            host_flat = self._flat_name(host_decl)
+            # An edubba block can only extend a tablet declared in the
+            # same module — outside modules can't bolt methods onto
+            # someone else's tablet (that's both a module-pollution
+            # vector and an evolution-trap for the host module's
+            # invariants). Multiple edubba blocks for the same tablet
+            # within one module are fine and additive — the existing
+            # method registry below catches duplicate method names.
+            if host_mod != edubba_mod:
+                here = ".".join(edubba_mod) or "<root>"
+                there = ".".join(host_mod) or "<root>"
+                raise CheckError(
+                    f"edubba {d.type_name!r}: tablet is declared in "
+                    f"module {there!r}, but this edubba block lives in "
+                    f"{here!r}; methods can only be added in the host "
+                    f"tablet's own module",
+                    d.line, d.col,
+                )
+            host_params = self.struct_type_params.get(host_flat, ())
             if len(d.type_params) != len(host_params):
                 raise CheckError(
                     f"edubba {d.type_name}: type-param arity {len(d.type_params)} "
                     f"does not match tablet arity {len(host_params)}",
                     d.line, d.col,
                 )
-            methods = self.tablet_methods.setdefault(d.type_name, {})
+            methods = self.tablet_methods.setdefault(host_flat, {})
             for m in d.methods:
                 # The parser mangled the method name as `<Type>__<name>`.
                 # Recover the short name for the registry.
@@ -572,7 +1280,19 @@ class Checker:
                         m.line, m.col,
                     )
                 m.type_params = list(d.type_params)
-                methods[short] = m.name
+                # Method-mangled name lives in the host's flat
+                # namespace so two modules each declaring `edubba Foo
+                # { fn bar(self) ... }` produce distinct global
+                # symbols. Without this both methods would key into
+                # `self.fns` as `Foo__bar` and the second registration
+                # would error with "duplicate function".
+                method_flat = f"{host_flat}__{short}"
+                self.flat_name_for[id(m)] = method_flat
+                # Preserve the AST-level decl module for the spliced
+                # method so subsequent registration phases set the
+                # right current-module context.
+                self.prog.module_of[id(m)] = edubba_mod
+                methods[short] = method_flat
                 new_decls.append(m)
         self.prog.decls[:] = new_decls
 
@@ -581,23 +1301,26 @@ class Checker:
             raise CheckError(
                 f"seal {s.name!r}: name shadows a built-in type", s.line, s.col,
             )
-        if s.name in self.structs:
+        flat = self._flat_name(s)
+        if flat in self.structs:
             raise CheckError(
                 f"seal {s.name!r}: name collides with an existing tablet",
                 s.line, s.col,
             )
-        if s.name in self.seals:
+        if flat in self.seals:
             raise CheckError(
                 f"duplicate seal {s.name!r}", s.line, s.col,
             )
-        self.seals[s.name] = TySeal(name=s.name)
-        self.seal_type_params[s.name] = tuple(s.type_params)
+        self.seals[flat] = TySeal(name=flat)
+        self.seal_type_params[flat] = tuple(s.type_params)
 
     def _resolve_seal_variants(self, s: A.SealDecl) -> None:
         seen_names: set[str] = set()
         resolved_variants: list[tuple[str, tuple[Ty, ...]]] = []
         saved = self._active_type_vars
         self._active_type_vars = {name: TyVar(name) for name in s.type_params}
+        decl_mod = self.prog.module_of.get(id(s), ())
+        flat = self._flat_name(s)
         try:
             for idx, v in enumerate(s.variants):
                 if v.name in seen_names:
@@ -606,13 +1329,17 @@ class Checker:
                         v.line, v.col,
                     )
                 seen_names.add(v.name)
-                if v.name in self.variant_lookup:
-                    prev_seal = self.variant_lookup[v.name][0]
+                # Within a single module two seals can't share a variant
+                # name (one flat namespace per module). Across modules
+                # is fine — disambiguation happens at use site via the
+                # importer's visible-variants table.
+                existing = self.variant_lookup.get(v.name, [])
+                same_mod = [e for e in existing if e[3] == decl_mod]
+                if same_mod:
+                    prev_seal = same_mod[0][0]
                     raise CheckError(
                         f"variant {v.name!r} is already declared in seal "
-                        f"{prev_seal!r}; variant names must be globally "
-                        f"unique (qualified-variant syntax is not yet "
-                        f"designed)",
+                        f"{prev_seal!r} in this module",
                         v.line, v.col,
                     )
                 field_tys = tuple(
@@ -622,10 +1349,19 @@ class Checker:
                     for ft in v.fields
                 )
                 resolved_variants.append((v.name, field_tys))
-                self.variant_lookup[v.name] = (s.name, idx, field_tys)
+                self.variant_lookup.setdefault(v.name, []).append(
+                    (s.name, idx, field_tys, decl_mod),
+                )
         finally:
             self._active_type_vars = saved
-        self.seal_variants[s.name] = tuple(resolved_variants)
+        self.seal_variants[flat] = tuple(resolved_variants)
+
+    def _flat_name(self, decl: A.Decl) -> str:
+        """Convenience: return the flat (global-table) name for a decl,
+        defaulting to its short name if no module-prefix mangle is
+        needed. Always-visible callers should prefer this over
+        manually consulting `flat_name_for`."""
+        return self.flat_name_for.get(id(decl), decl.name)
 
     def _resolve_struct_fields(self, s: A.StructDecl) -> None:
         seen: set[str] = set()
@@ -656,7 +1392,7 @@ class Checker:
                 resolved.append((fname, fty))
         finally:
             self._active_type_vars = saved
-        self.struct_fields[s.name] = tuple(resolved)
+        self.struct_fields[self._flat_name(s)] = tuple(resolved)
 
     def _register_fn(self, fn: A.FnDecl) -> None:
         if fn.name in INTRINSIC_NAMES:
@@ -664,13 +1400,12 @@ class Checker:
                 f"cannot define {fn.name!r}: it is a built-in intrinsic",
                 fn.line, fn.col,
             )
-        if fn.name in self.fns:
-            raise CheckError(
-                f"duplicate function {fn.name!r}", fn.line, fn.col,
-            )
         # Generic fns: type parameters are in scope as TyVars while we
-        # resolve the signature and (later) check the body.
-        self.fn_type_params[fn.name] = tuple(fn.type_params)
+        # resolve the signature and (later) check the body. Duplicate
+        # detection moved below to use the flat name (so cross-module
+        # same-name fns coexist via mangling).
+        flat = self._flat_name(fn)
+        self.fn_type_params[flat] = tuple(fn.type_params)
         saved = self._active_type_vars
         self._active_type_vars = {name: TyVar(name) for name in fn.type_params}
         try:
@@ -703,7 +1438,11 @@ class Checker:
                 f"would dangle — use a str or tablets instead)",
                 fn.line, fn.col,
             )
-        self.fns[fn.name] = TyFn(
+        if flat in self.fns:
+            raise CheckError(
+                f"duplicate function {fn.name!r}", fn.line, fn.col,
+            )
+        self.fns[flat] = TyFn(
             params=params, ret=ret, is_variadic=is_variadic,
             param_muts=tuple(p.is_mut for p in fn.params),
         )
@@ -742,7 +1481,7 @@ class Checker:
                 f"cannot declare colophon {c.name!r}: name is a built-in intrinsic",
                 c.line, c.col,
             )
-        if c.name in self.fns:
+        if self._flat_name(c) in self.fns:
             raise CheckError(
                 f"duplicate declaration {c.name!r}", c.line, c.col,
             )
@@ -805,13 +1544,14 @@ class Checker:
         )
         if c.return_type is not None:
             check_ffi_type(ret, "return type", is_return=True)
-        self.fns[c.name] = TyFn(
+        flat = self._flat_name(c)
+        self.fns[flat] = TyFn(
             params=params, ret=ret,
             param_muts=tuple(p.is_mut for p in c.params),
         )
         # Tracked so codegen can emit extern declarations instead of
         # trying to lower a body.
-        self.colophons.add(c.name)
+        self.colophons.add(self._flat_name(c))
 
     def _register_gloss(self, g: A.GlossDecl) -> None:
         """Validate a gloss decl, register it in the dispatch table
@@ -948,7 +1688,7 @@ class Checker:
             raise CheckError(
                 f"duplicate table {t.name!r}", t.line, t.col,
             )
-        self.tables[t.name] = TyTable(element=elem)
+        self.tables[self._flat_name(t)] = TyTable(element=elem)
         if not isinstance(t.generator, A.Ident):
             raise CheckError(
                 f"table {t.name!r}: generator must be a function name",
@@ -976,14 +1716,14 @@ class Checker:
     # --- function bodies --------------------------------------------
 
     def _check_fn_body(self, fn: A.FnDecl) -> None:
-        self.current_fn = fn.name
+        self.current_fn = self._flat_name(fn)
         self.scopes = [{}]
         self._fn_params = {p.name for p in fn.params}
         # Type params are in scope while we check the body so local
         # bindings with annotations like `mut cur: wedge Node<T>` work.
         saved = self._active_type_vars
         self._active_type_vars = {name: TyVar(name) for name in fn.type_params}
-        fn_ty = self.fns[fn.name]
+        fn_ty = self.fns[self.current_fn]
         try:
             for param, pty in zip(fn.params, fn_ty.params):
                 self.scopes[0][param.name] = pty
@@ -1016,16 +1756,33 @@ class Checker:
             # in scope as fresh type variables.
             if t.name in self._active_type_vars:
                 return self._active_type_vars[t.name]
-            if t.name in self.type_aliases:
+            # Module-qualified type: `qual.Tablet`. Resolves through
+            # the module_aliases entry the import set up. Rewrites
+            # `t.name` to the resolved flat form so codegen
+            # `_lower_type` consumes a name already known to its
+            # struct/seal tables — no parallel qualifier-resolving
+            # path needed in codegen.
+            if "." in t.name:
+                resolved = self._resolve_qualified_type(t.name, t.line, t.col)
+                if resolved is not None:
+                    if isinstance(resolved, (TyStruct, TySeal)):
+                        t.name = resolved.name
+                    return resolved
+            # Translate short name to flat (mangled) form via the
+            # current module's visible scope. Falls back to short for
+            # cases where module scoping isn't engaged (e.g. type-aliases
+            # whose short name isn't in any module table).
+            flat = self.module_visible.get(self.current_module, {}).get(t.name, t.name)
+            if flat in self.type_aliases:
                 # Aliases are transparent: resolve the target in the
                 # alias's stead. Cycles surface as RecursionError —
                 # cheap detection but the user gets a stack trace
                 # rather than a clean diagnostic. Improve later.
-                return self._resolve_type(self.type_aliases[t.name], where)
-            if t.name in self.structs:
+                return self._resolve_type(self.type_aliases[flat], where)
+            if flat in self.structs:
                 # Using a generic tablet's name without type args is
                 # only valid if the tablet is non-generic.
-                params = self.struct_type_params.get(t.name, ())
+                params = self.struct_type_params.get(flat, ())
                 if params:
                     raise CheckError(
                         f"{where}: tablet {t.name!r} expects "
@@ -1033,9 +1790,10 @@ class Checker:
                         f"write `{t.name}<...>`",
                         t.line, t.col,
                     )
-                return self.structs[t.name]
-            if t.name in self.seals:
-                params = self.seal_type_params.get(t.name, ())
+                self._check_module_scope(t.name, t.line, t.col)
+                return self.structs[flat]
+            if flat in self.seals:
+                params = self.seal_type_params.get(flat, ())
                 if params:
                     raise CheckError(
                         f"{where}: seal {t.name!r} expects "
@@ -1043,35 +1801,48 @@ class Checker:
                         f"write `{t.name}<...>`",
                         t.line, t.col,
                     )
-                return self.seals[t.name]
+                self._check_module_scope(t.name, t.line, t.col)
+                return self.seals[flat]
             raise CheckError(
                 f"{where}: unknown type {t.name!r}", t.line, t.col,
             )
         if isinstance(t, A.TypeApply):
-            if t.name in self.structs:
-                params = self.struct_type_params.get(t.name, ())
+            # Module-qualified generic application: `qual.Map<T>`.
+            if "." in t.name:
+                resolved = self._resolve_qualified_type(
+                    t.name, t.line, t.col, type_args=t.args, where=where,
+                )
+                if resolved is not None:
+                    if isinstance(resolved, (TyStruct, TySeal)):
+                        t.name = resolved.name
+                    return resolved
+            flat = self.module_visible.get(self.current_module, {}).get(t.name, t.name)
+            if flat in self.structs:
+                params = self.struct_type_params.get(flat, ())
                 if len(params) != len(t.args):
                     raise CheckError(
                         f"{where}: tablet {t.name!r} expects "
                         f"{len(params)} type argument(s), got {len(t.args)}",
                         t.line, t.col,
                     )
+                self._check_module_scope(t.name, t.line, t.col)
                 resolved_args = tuple(
                     self._resolve_type(a, f"{where} type arg") for a in t.args
                 )
-                return TyStruct(name=t.name, args=resolved_args)
-            if t.name in self.seals:
-                params = self.seal_type_params.get(t.name, ())
+                return TyStruct(name=flat, args=resolved_args)
+            if flat in self.seals:
+                params = self.seal_type_params.get(flat, ())
                 if len(params) != len(t.args):
                     raise CheckError(
                         f"{where}: seal {t.name!r} expects "
                         f"{len(params)} type argument(s), got {len(t.args)}",
                         t.line, t.col,
                     )
+                self._check_module_scope(t.name, t.line, t.col)
                 resolved_args = tuple(
                     self._resolve_type(a, f"{where} type arg") for a in t.args
                 )
-                return TySeal(name=t.name, args=resolved_args)
+                return TySeal(name=flat, args=resolved_args)
             raise CheckError(
                 f"{where}: unknown type {t.name!r}",
                 t.line, t.col,
@@ -1152,6 +1923,18 @@ class Checker:
         for scope in reversed(self.scopes):
             if name in scope:
                 return scope[name]
+        # Variant-not-in-scope check. If `name` is a registered variant
+        # but the seal that contains it isn't imported, give a targeted
+        # "import the seal" error before the generic "undefined name".
+        if name in self.variant_lookup:
+            self._resolve_variant(name, line, col)
+        # Top-level visibility: the name must be in the current
+        # module's visible scope (own decls + imports + builtins).
+        # If `name` is a top-level decl declared elsewhere but not
+        # imported, raise a clear "not in scope" error rather than
+        # falling through to the generic "undefined name" — directs
+        # users to add an import.
+        self._check_module_scope(name, line, col)
         # Gather everything nameable in this program so the suggestion
         # can point to a function / struct / table if the user typo'd
         # across categories, not just a local.
@@ -1320,9 +2103,11 @@ class Checker:
             return self.structs["str"]
         if isinstance(e, A.Ident):
             # Nullary variants look like bare identifiers. Check the
-            # variant registry first so `None` / `Circle` etc. resolve
-            # to their seal type rather than "undefined name".
-            if e.name in self.variant_lookup:
+            # current module's visible variants first so `None` /
+            # `Circle` etc. resolve to their seal type rather than
+            # "undefined name". Cross-module variant-name reuse is
+            # disambiguated here too.
+            if e.name in self.module_visible_variants.get(self.current_module, {}):
                 return self._tc_variant_ident(e, expected)
             # Bare fn name used as an expression = first-class function
             # value. Its type is the fn signature (TyFn). Local
@@ -1586,10 +2371,13 @@ class Checker:
             return
         if isinstance(pattern, TyStruct) and isinstance(concrete, TyStruct):
             if pattern.name != concrete.name:
-                raise _UnifyError(f"{pattern.name} vs {concrete.name}")
+                raise _UnifyError(
+                    f"{_pretty_flat_name(pattern.name)} vs "
+                    f"{_pretty_flat_name(concrete.name)}",
+                )
             if len(pattern.args) != len(concrete.args):
                 raise _UnifyError(
-                    f"{pattern.name}: arity mismatch "
+                    f"{_pretty_flat_name(pattern.name)}: arity mismatch "
                     f"{len(pattern.args)} vs {len(concrete.args)}",
                 )
             for p, c in zip(pattern.args, concrete.args):
@@ -1597,10 +2385,13 @@ class Checker:
             return
         if isinstance(pattern, TySeal) and isinstance(concrete, TySeal):
             if pattern.name != concrete.name:
-                raise _UnifyError(f"{pattern.name} vs {concrete.name}")
+                raise _UnifyError(
+                    f"{_pretty_flat_name(pattern.name)} vs "
+                    f"{_pretty_flat_name(concrete.name)}",
+                )
             if len(pattern.args) != len(concrete.args):
                 raise _UnifyError(
-                    f"{pattern.name}: arity mismatch "
+                    f"{_pretty_flat_name(pattern.name)}: arity mismatch "
                     f"{len(pattern.args)} vs {len(concrete.args)}",
                 )
             for p, c in zip(pattern.args, concrete.args):
@@ -1662,6 +2453,47 @@ class Checker:
         return ty
 
     def _tc_call(self, e: A.Call, expected: Ty | None = None) -> Ty:
+        # Module-qualified call: `parser.parse(x)` after `import parser`
+        # (or `import x.y.parser as parser`). Dispatches to the resolved
+        # public fn in the source module, bypassing the method-call path
+        # below. Detected before the Field-as-method case because module
+        # qualifiers shadow the same-name local-binding rule (a local
+        # named `parser` shadows the import; method dispatch then fires).
+        if (
+            isinstance(e.callee, A.Field)
+            and isinstance(e.callee.target, A.Ident)
+            and not any(e.callee.target.name in s for s in self.scopes)
+        ):
+            qualifier = e.callee.target.name
+            method = e.callee.name
+            aliases = self.module_aliases.get(self.current_module, {})
+            if qualifier in aliases:
+                src_mod = aliases[qualifier]
+                src_decls = self.module_decls.get(src_mod, {})
+                target = src_decls.get(method)
+                if target is None or method.startswith("_"):
+                    pretty = ".".join(src_mod) or "<root>"
+                    raise CheckError(
+                        f"module {pretty!r} has no public name "
+                        f"{method!r}",
+                        e.line, e.col,
+                    )
+                # Dispatch as a regular call by substituting the callee
+                # with a bare Ident pointing at the resolved name (which
+                # is in the global flat fn table because cross-module
+                # mangling isn't on yet — that's the next commit). The
+                # `_qualified_call_resolved` flag tells
+                # `_check_module_scope` to trust the qualifier-side
+                # check we just did instead of re-checking visibility
+                # against the importer's local scope (where the
+                # method name doesn't appear, by design of `import x as y`).
+                new_ident = A.Ident(name=method)
+                new_ident.line = e.callee.line
+                new_ident.col = e.callee.col
+                e.callee = new_ident
+                self._qualified_call_resolved.add(id(e))
+                # Drop through to the regular fn-call path below.
+
         # Method call on a tablets receiver. The receiver may be a bare
         # Ident (t.push) or a field chain rooted at one (buf.bytes.push);
         # _tc_method_call routes through _tc_expr on the receiver so
@@ -1676,7 +2508,8 @@ class Checker:
         name = e.callee.name
 
         # Variant constructor: `Some(42)`, `Circle(rat(1, 2))`, etc.
-        if name in self.variant_lookup:
+        # Resolved via current module's visible variants.
+        if name in self.module_visible_variants.get(self.current_module, {}):
             return self._tc_variant_call(e, expected)
 
         if name in ("print", "println"):
@@ -1745,13 +2578,29 @@ class Checker:
                     )
                 return self._tc_fn_value_call(e, bound)
 
-        fn = self.fns.get(name)
+        # Translate the short name through the current module's
+        # visible scope to find the mangled flat key in self.fns.
+        # When no collision exists across modules, mangled == short
+        # and this is a no-op. When two modules each declare the
+        # same fn name, this picks the right one for the caller.
+        flat = self.module_visible.get(self.current_module, {}).get(name, name)
+        fn = self.fns.get(flat)
         if fn is None:
             raise CheckError(
                 f"in fn {self.current_fn!r}: unknown function {name!r}"
                 f"{_suggest(name, self.fns)}",
                 e.line, e.col,
             )
+        # Rewrite the callee to the flat name so codegen sees the
+        # exact LLVM symbol to dispatch to.
+        if flat != name:
+            e.callee.name = flat
+        # Skip the local-scope visibility check when the call was
+        # dispatched via module-qualified access — qualifier resolution
+        # already validated the source module's exports.
+        if id(e) not in self._qualified_call_resolved:
+            self._check_module_scope(name, e.line, e.col)
+        name = flat
         # Variadic call: split args into (fixed, tail). The fixed args
         # typecheck against the first (n-1) params; the tail becomes a
         # synthesized TabletsLit that gets typechecked against the last
@@ -2267,19 +3116,52 @@ class Checker:
         )
 
     def _tc_struct_lit(self, e: A.StructLit) -> Ty:
-        if e.name not in self.structs:
+        # Module-qualified literal: `mod.Tablet { ... }`. Resolve the
+        # qualifier through the current module's import aliases to
+        # find the source module, then take that decl's flat name
+        # directly. We rewrite `e.name` to the flat form (so
+        # downstream codegen consumes a name `_lower_type` /
+        # `_struct_types` already know) and pin `e.name` so the
+        # following short-name fallback looks it up directly in the
+        # global tables (no module_visible pollution — qualified-lit
+        # access is point-in-time per call site).
+        if "." in e.name:
+            qualifier, _, short_name = e.name.rpartition(".")
+            head, _, _rest = qualifier.partition(".")
+            aliases = self.module_aliases.get(self.current_module, {})
+            src_mod = aliases.get(head)
+            if src_mod is None:
+                raise CheckError(
+                    f"struct literal {e.name!r}: unknown module "
+                    f"qualifier {head!r}",
+                    e.line, e.col,
+                )
+            src_decl = self.module_decls.get(src_mod, {}).get(short_name)
+            if not isinstance(src_decl, A.StructDecl):
+                pretty = ".".join(src_mod) or "<root>"
+                raise CheckError(
+                    f"module {pretty!r} has no public tablet "
+                    f"{short_name!r}",
+                    e.line, e.col,
+                )
+            e.name = self._flat_name(src_decl)
+        # `e.name` is now either a short name (translates through
+        # module_visible below) or a flat name (already-resolved
+        # qualified literal — short==flat lookup is the identity).
+        flat = self.module_visible.get(self.current_module, {}).get(e.name, e.name)
+        if flat not in self.structs:
             raise CheckError(
                 f"unknown tablet {e.name!r}"
                 f"{_suggest(e.name, self.structs)}",
                 e.line, e.col,
             )
-        declared = self.struct_fields[e.name]
-        type_params = self.struct_type_params.get(e.name, ())
+        declared = self.struct_fields[flat]
+        type_params = self.struct_type_params.get(flat, ())
         # Instantiate fresh type variables for the tablet's type params
         # so unification doesn't alias them to identically-named TyVars
         # from the enclosing fn's scope. `Node.T#<id(e)>` is unique
         # per literal, so inferred bindings stay scoped to this site.
-        fresh_names = [f"{e.name}.{tp}#{id(e)}" for tp in type_params]
+        fresh_names = [f"{flat}.{tp}#{id(e)}" for tp in type_params]
         inst_subst = {tp: TyVar(fresh) for tp, fresh in zip(type_params, fresh_names)}
         declared_map = {n: self._substitute(t, inst_subst) for n, t in declared}
         seen: set[str] = set()
@@ -2338,8 +3220,8 @@ class Checker:
                 self._substitute(subst[fresh], subst) for fresh in fresh_names
             )
             self.mono_struct_args[id(e)] = concrete_args
-            return TyStruct(name=e.name, args=concrete_args)
-        return self.structs[e.name]
+            return TyStruct(name=flat, args=concrete_args)
+        return self.structs[flat]
 
     def _tc_tablets_lit(self, e: A.TabletsLit, expected: Ty | None) -> Ty:
         """`tablets[N]T { a, b, c }` — typecheck each element against T
@@ -2558,7 +3440,9 @@ class Checker:
     def _tc_variant_ident(self, e: A.Ident, expected: Ty | None) -> Ty:
         """Typecheck a bare variant name like `None`. Must be nullary;
         generic seals require `expected` to pin their type parameters."""
-        seal_name, vidx, field_tys = self.variant_lookup[e.name]
+        info = self._resolve_variant(e.name, e.line, e.col)
+        assert info is not None  # caller already checked visibility
+        seal_name, vidx, field_tys, _decl_mod = info
         if field_tys:
             raise CheckError(
                 f"variant {e.name!r} takes {len(field_tys)} argument(s); "
@@ -2590,7 +3474,9 @@ class Checker:
     def _tc_variant_call(self, e: A.Call, expected: Ty | None) -> Ty:
         assert isinstance(e.callee, A.Ident)
         vname = e.callee.name
-        seal_name, vidx, field_tys = self.variant_lookup[vname]
+        info = self._resolve_variant(vname, e.line, e.col)
+        assert info is not None  # caller already checked visibility
+        seal_name, vidx, field_tys, _decl_mod = info
         self.variant_of_node[id(e)] = (seal_name, vname, vidx)
         if len(e.args) != len(field_tys):
             raise CheckError(

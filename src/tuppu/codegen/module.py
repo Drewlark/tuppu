@@ -49,6 +49,7 @@ class ModuleMixin:
         # colophon externs (C functions the compiler marshals to / from
         # at each call site).
         for decl in prog.decls:
+            self._codegen_current_module = prog.module_of.get(id(decl), ())
             if isinstance(decl, A.FnDecl):
                 if decl.type_params:
                     continue
@@ -65,6 +66,8 @@ class ModuleMixin:
                 pass  # already handled in phase 0c
             elif isinstance(decl, A.AliasDecl):
                 pass  # transparent — resolved on-demand in _lower_type
+            elif isinstance(decl, A.ImportDecl):
+                pass  # purely a typecheck-time concern; no IR shape
             else:
                 raise CodegenError(
                     f"unsupported top-level: {type(decl).__name__}"
@@ -74,6 +77,7 @@ class ModuleMixin:
         # globals. Done in declaration order so later tables may reference
         # earlier ones.
         for decl in prog.decls:
+            self._codegen_current_module = prog.module_of.get(id(decl), ())
             if isinstance(decl, A.TableDecl):
                 self._emit_table(decl)
 
@@ -81,6 +85,7 @@ class ModuleMixin:
         # specializations are emitted on demand when we see a call to
         # them (see `_get_monomorph_fn`).
         for decl in prog.decls:
+            self._codegen_current_module = prog.module_of.get(id(decl), ())
             if isinstance(decl, A.FnDecl):
                 if decl.type_params:
                     continue
@@ -94,7 +99,14 @@ class ModuleMixin:
             raise CodegenError(
                 f"cannot define {fn.name!r}: it is a built-in intrinsic"
             )
-        if fn.name in self.functions:
+        # Use the typecheck-assigned flat name so cross-module same-name
+        # fns get distinct LLVM symbols. Falls back to fn.name for
+        # decls without a sideband entry (intrinsics, root-module).
+        flat = (
+            self._checker.flat_name_for.get(id(fn), fn.name)
+            if self._checker is not None else fn.name
+        )
+        if flat in self.functions:
             raise CodegenError(f"duplicate function {fn.name!r}")
         param_types = []
         for p in fn.params:
@@ -128,11 +140,11 @@ class ModuleMixin:
             param_types.append(t)
         ret_type = self._lower_type(fn.return_type) if fn.return_type else ir.VoidType()
         fn_type = ir.FunctionType(ret_type, param_types)
-        llvm_fn = ir.Function(self.module, fn_type, name=fn.name)
+        llvm_fn = ir.Function(self.module, fn_type, name=flat)
         for i, p in enumerate(fn.params):
             llvm_fn.args[i].name = p.name
-        self.functions[fn.name] = llvm_fn
-        self._fn_param_mut[fn.name] = [p.is_mut for p in fn.params]
+        self.functions[flat] = llvm_fn
+        self._fn_param_mut[flat] = [p.is_mut for p in fn.params]
 
     def _declare_gloss(self, g: A.GlossDecl) -> None:
         """Forward-declare a gloss fn under its mangled internal name.
@@ -449,7 +461,11 @@ class ModuleMixin:
             if not (isinstance(fn.return_type, A.TypeName) and fn.return_type.name == "i32"):
                 raise CodegenError("main must declare -> i32")
 
-        llvm_fn = self.functions[fn.name]
+        flat = (
+            self._checker.flat_name_for.get(id(fn), fn.name)
+            if self._checker is not None else fn.name
+        )
+        llvm_fn = self.functions[flat]
         entry = llvm_fn.append_basic_block("entry")
         self.builder = ir.IRBuilder(entry)
         self.scopes = [{}]

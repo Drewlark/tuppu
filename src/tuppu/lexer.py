@@ -56,6 +56,8 @@ class Tok(Enum):
     EDUBBA = auto()      # emitted by `edubba` keyword — methods block
     COPY = auto()        # emitted by `copy` keyword — deep-clone prefix op
     TYPE_ALIAS = auto()  # emitted by `type` keyword — alias decl
+    IMPORT = auto()      # emitted by `import` keyword — module import
+    FROM = auto()        # emitted by `from` keyword — selective import
 
     # type keywords (value: str — "i64", "bool", etc.)
     TYPE_KW = auto()
@@ -174,6 +176,13 @@ KEYWORDS: dict[str, Tok] = {
     # transparent — the alias name is interchangeable with its target
     # at every use site, no nominal-type wrapping.
     "type": Tok.TYPE_ALIAS,
+    # `import path.to.module` and `from path.to.module import name [as alias]`
+    # bring decls from another file's module into the current file's scope.
+    # `import x.y` is sugar for `from x.y import *` (all public decls).
+    # Visibility within a module is public-by-default; names starting with
+    # `_` (Python convention) are private to the declaring module.
+    "import": Tok.IMPORT,
+    "from": Tok.FROM,
     "true": Tok.TRUE,
     "false": Tok.FALSE,
 }

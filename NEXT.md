@@ -244,6 +244,49 @@ What works:
 - Type errors with source `line:col`; codegen errors now also carry
   `line:col` via `Codegen._current_loc` tracking.
 - Compile-time warning infrastructure.
+- **Modules — file-as-module + import system.** Three import forms:
+  `import x.y` (wildcard: brings every public name into local scope
+  AND registers `y` as a qualifier for `y.foo`), `import x.y as z`
+  (alias-only: `z.foo` is the only access path), `from x.y import
+  a, b as c` (selective). Each `.tpu` file is its own module, named
+  by its path relative to `src/` or `stdlib/` (`stdlib/list.tpu` →
+  `stdlib.list`). Recursive directory discovery: `tuppu run src/`
+  walks the tree.
+
+  Real per-module name resolution: a top-level name in module B is
+  visible in module A only if A has imported it. Cross-module
+  references without an import give a targeted "name X is declared
+  in module 'foo' but not in scope here; add `from foo import X`"
+  error. Visibility for `_`-prefixed top-level decls: private to
+  the declaring module.
+
+  Variant disambiguation across modules — fixes the LIMITATIONS
+  flat-seal-variant bug. Two modules can each declare `seal A { X }`
+  and `seal B { X }`; use sites resolve via the importer's visible
+  variants. Multiple imported seals contributing the same variant
+  name surface as ambiguity at the use site.
+
+  Cycle detection: import graph is walked DFS in phase 0; back-edges
+  trip a `circular import detected: A -> B -> A` error.
+
+  Edubba isolation: edubba blocks can only extend tablets in the
+  same module (the host module owns its tablet's evolution).
+
+  Type-level qualified access: `mod.Tablet` and `mod.Foo<T>` work in
+  type position. Expression-level `mod.fn(args)` works after `import
+  mod` or `import x.y as mod`.
+
+  Script-mode ergonomic shortcut: code in the root module `()`
+  (single-source compiles, ad-hoc scripts in tmp_path, the
+  `examples/` directory) auto-imports every public stdlib decl. Code
+  under `src/` and inside `stdlib/` requires explicit imports. The
+  split keeps script mode one-liner-friendly without abandoning
+  project-mode discipline.
+
+  Tracked v2 follow-ups (in LIMITATIONS.md): module-prefix LLVM
+  mangling so two modules can each declare `fn helper()` /
+  `tablet Foo`, and qualified-name struct literals (`mod.Tablet
+  { ... }`).
 
 What doesn't yet:
 - Fn-as-value / closures — the next planned chunk after dynamic strings.
@@ -254,7 +297,6 @@ What doesn't yet:
 - Escape-analysis rat-fallback for rat-only sex values (**Phase 3c**
   — the big compiler-learning chunk).
 - `--strict-dish` flag (see FUTURE_OPTIMIZATIONS.md for the sketch).
-- Imports / namespacing.
 - `read_line() -> str` — needs stdin wrapper, not yet added.
 - Expression-level pointer ops (`*p`, `&x`, `p + 1`) — intentional.
 - `impress` reinterpret cast (documented in SPEC §14).
@@ -424,43 +466,87 @@ order, names need not match. Codegen is a no-op bitcast. A third
 mechanism (trait-driven `into`-style conversion) can layer on later
 without colliding with either `as` or `impress`.
 
-## 2. Imports — design sketch
+## 2. Imports — shipped (most of the strategy doc), with v2 follow-ups noted
 
-### Grammar
+### Shipped
+
+The conversation in `scratch/NEXT_BIG_FEATURE.md` chose dotted module
+paths (Python / Rust shape) over the older `use stdlib/rat` slash
+form. v1 lands the syntax + visibility, with namespacing semantics
+deferred to v2 so the change is backward-compatible.
+
+```tuppu
+import stdlib.list
+from stdlib.map import Map, get as map_get
 ```
-use_decl = "use" path
-path     = IDENT ("/" IDENT)*
-```
-Example: `use stdlib/rat` imports all public decls from that file.
 
-### Visibility
-- `fn foo(...)` is file-local by default.
-- `pub fn foo(...)` is exported / visible to `use`rs.
-- Same for `tablet` / `tablet` with a `pub` prefix.
+What v1 ships:
+- **Lexer / parser / AST** — `import` and `from` keywords, dotted
+  paths, optional `as <local_name>` per imported name. All three
+  forms are wired end-to-end: `import x.y` (wildcard + qualifier),
+  `import x.y as z` (alias-only qualifier), `from x.y import a, b
+  as c` (selective).
+- **Driver discovery** — `tuppu run src/` (or any directory input)
+  walks the tree for `.tpu` files. Each file is assigned a module
+  path: `stdlib/list.tpu` → `("stdlib", "list")`,
+  `src/sema/typecheck.tpu` → `("sema", "typecheck")`,
+  `<source>` (single-string compiles) and `examples/` files → `()`
+  (root).
+- **Real per-module name resolution.** A top-level name in module B
+  is visible in module A only if A explicitly imports it. Cross-
+  module references without an import give a targeted "name X is
+  declared in module 'foo' but not in scope here; add `from foo
+  import X`" error.
+- **`_`-prefix visibility** — top-level decls whose name starts with
+  `_` are private to their declaring module.
+- **Variant disambiguation across modules** — fixes the old flat-
+  seal-variant bug. `seal Foo { X }` and `seal Bar { X }` in
+  different modules coexist; use sites pick the right `X` via the
+  importer's visible variants. Multiple imported seals contributing
+  the same variant name surface as ambiguity at the use site.
+- **Module-prefix LLVM mangling** — `__M_<mod>__<short>` for non-
+  extern user fns / tablets / seals when a short name is shared
+  across modules. Two modules can each declare `fn helper()` /
+  `tablet Foo` / `seal Bar`. Single-module code (the common case)
+  is unmangled.
+- **Module-qualified access.** Expression-level `parser.parse(x)`,
+  type-level `mod.Tablet` / `mod.Foo<T>`, AND qualified-name struct
+  literals `mod.Tablet { field: value }` all work after `import
+  mod` or `import x.y.mod as mod`. The literal form disambiguates
+  cross-module same-name tablets unambiguously when both are
+  imported under aliases (alias-only imports don't pollute local
+  scope, so qualified-lit is the only construction path there).
+- **Edubba module isolation.** Edubba blocks can only extend
+  tablets in their declaring module — foreign extensions are
+  rejected. Multiple edubbas on the same host within one module
+  are additive (existing behavior).
+- **Cycle detection.** Import graph walked DFS in phase 0; back-
+  edges trip a `circular import detected: A -> B -> A` error.
+- **Script-mode shortcut.** Code in the root module `()` (single-
+  source compiles, ad-hoc scripts in tmp_path, the `examples/`
+  directory) auto-imports every public stdlib decl and every public
+  stdlib variant. Code under `src/` and inside `stdlib/` requires
+  explicit imports. Keeps script mode one-liner-friendly without
+  abandoning project-mode discipline.
+- **Pretty diagnostics.** Mangled names are rendered as `mod.short`
+  in error messages via `_pretty_flat_name` so users never see
+  `__M_foo__Counter`.
 
-### Name resolution
-Simplest: `use stdlib/rat` copies all `pub` names from
-`stdlib/rat.tpu` into the current file's namespace unqualified (Go's
-dot import, Python's `from x import *`). Qualified
-`use stdlib/rat as r` + `r.rat_abs(x)` comes later.
+Tests: `tests/test_modules.py` (37 cases) covers lexer, parser,
+module path derivation, import validation, per-module visibility,
+cross-module variant disambiguation, qualified access (call + type),
+cycle detection, edubba isolation, edubba additivity within a
+module, edubba+collision tablets, cross-module same-name fns and
+tablets.
 
-### Driver changes
-When the driver sees `use stdlib/rat` it resolves the file:
-- Same-directory relative — fine for single-project.
-- `TUPPU_PATH` env var — search path for modules.
-- Bundled stdlib lives at `stdlib/`, resolve as
-  `stdlib/rat` → `stdlib/rat.tpu`.
-- Existing stdlib auto-include becomes opt-in via `use`.
+### Known gaps (real LIMITATIONS.md entries)
 
-### Files to touch
-- `src/tuppu/ast.py` — `UseDecl(path: list[str])`, `pub: bool` on
-  FnDecl/StructDecl.
-- `src/tuppu/parser.py` — parse `use`.
-- `src/tuppu/driver.py` — resolve `use` to additional source files;
-  parse/typecheck in dependency order.
-- `src/tuppu/typecheck.py` — per-file visibility, import resolution.
-- Migration: existing stdlib functions marked `pub`; examples add
-  `use stdlib/rat` / `use stdlib/sex` at top.
+- **Qualified-name struct literals.** `mod.Tablet { ... }` in
+  expression position doesn't parse — the struct-lit parser doesn't
+  see the dotted form. Use the unqualified form (wildcard import
+  brings the short name into scope) or build via a
+  factory fn. Type-position annotations (`step x: mod.Tablet`)
+  work.
 
 ## 3. Sex Phase 3 — /, escape analysis (3a done)
 
