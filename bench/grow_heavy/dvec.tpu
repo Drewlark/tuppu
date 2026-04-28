@@ -1,0 +1,42 @@
+// Grow-heavy bench: repeated build/drop with no reads.
+//
+// On each iteration: alloc a fresh vec, push 4000 elements (forces
+// ~9 grow events from cap 8), drop. The dropped vec gets swept on
+// the next collection — no explicit free needed.
+//
+// 64-byte struct chosen as a midpoint: large enough that dvec's
+// memcpy-on-grow has real work to do, small enough that total
+// memory pressure stays modest. ivec's grow is constant-T-size
+// (8 bytes per slot pointer); dvec's is sizeof(T) per slot. The
+// gap should widen with T size — sweep that axis here too with
+// the existing ivec_vs_dvec/ harness.
+
+tablet Mid {
+  a: i64, b: i64, c: i64, d: i64,
+  e: i64, f: i64, g: i64, h: i64
+}
+
+fn build_and_drop(n: i64) -> i64 {
+  mut v: dvec<Mid>
+  mut i: i64 = 0
+  while i < n {
+    v.push(Mid {
+      a: i, b: i, c: i, d: i, e: i, f: i, g: i, h: i,
+    })
+    i = i + 1
+  }
+  v.len
+}
+
+fn main() -> i32 {
+  step iters: i64 = 5000
+  step per_iter: i64 = 4000
+  mut total: i64 = 0
+  mut k: i64 = 0
+  while k < iters {
+    total = total + build_and_drop(per_iter)
+    k = k + 1
+  }
+  println(total)
+  0
+}

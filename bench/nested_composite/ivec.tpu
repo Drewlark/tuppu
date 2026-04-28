@@ -1,0 +1,39 @@
+// Mirror of dvec.tpu — composite Entry payload, ivec storage.
+
+tablet Entry {
+  name: str,
+  count: i64,
+  flags: i64,
+  rank: i64,
+}
+
+fn make(i: i64) -> Entry {
+  Entry {
+    name: "item_" + int_to_str(i),
+    count: i,
+    flags: i % 7,
+    rank: i / 100,
+  }
+}
+
+fn main() -> i32 {
+  mut v: ivec<Entry>
+  mut i: i64 = 0
+  while i < 50000 {
+    v.push(make(i))
+    i = i + 1
+  }
+  mut total: i64 = 0
+  mut iters: i64 = 50
+  mut k: i64 = 0
+  while k < iters {
+    mut j: i64 = 0
+    while j < v.len {
+      total = total + v[j].count + v[j].flags + v[j].rank + v[j].name.len
+      j = j + 1
+    }
+    k = k + 1
+  }
+  println(total)
+  0
+}

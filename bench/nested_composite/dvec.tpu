@@ -1,0 +1,52 @@
+// Nested composite bench: vec<Entry> with heap-bearing fields.
+//
+// Each Entry holds a heap-owned `str` plus a small i64 footprint.
+// Tests the trace path that has to recurse into per-element struct
+// layouts, marking the str's bytes through the buf trace fn (dvec)
+// or per-chunk (ivec). Closer to a JSON-shape workload than the
+// flat-i64 benches: realistic agent / parser usage stresses heap
+// composites this way.
+//
+// Built once, then iterated and field-summed. Caps the total at
+// 50k entries so the str heap (each push allocates) doesn't dominate
+// the wall time over the actual vec mechanics we're measuring.
+
+tablet Entry {
+  name: str,
+  count: i64,
+  flags: i64,
+  rank: i64,
+}
+
+fn make(i: i64) -> Entry {
+  Entry {
+    name: "item_" + int_to_str(i),
+    count: i,
+    flags: i % 7,
+    rank: i / 100,
+  }
+}
+
+fn main() -> i32 {
+  mut v: dvec<Entry>
+  mut i: i64 = 0
+  while i < 50000 {
+    v.push(make(i))
+    i = i + 1
+  }
+  // Sum across fields and string lengths — exercises both the inline
+  // T fields and the str heap byte reads.
+  mut total: i64 = 0
+  mut iters: i64 = 50
+  mut k: i64 = 0
+  while k < iters {
+    mut j: i64 = 0
+    while j < v.len {
+      total = total + v[j].count + v[j].flags + v[j].rank + v[j].name.len
+      j = j + 1
+    }
+    k = k + 1
+  }
+  println(total)
+  0
+}

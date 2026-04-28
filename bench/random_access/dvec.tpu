@@ -1,0 +1,36 @@
+// Random-access bench: defeat the prefetcher.
+//
+// Sequential reads (read_iter) are the prefetcher's best case — both
+// dvec and ivec benefit from streaming-friendly memory access. This
+// bench picks indices via a linear-congruential walk that doesn't
+// look like a stride to the hardware. Misses become real, and the
+// "one load vs two" delta has fewer cycles to hide behind.
+//
+// N = 1M elements × 8B = 8 MB, sized to live mostly in L3 / spill
+// to DRAM under random access patterns. 10M lookups total. The
+// modular step (i * 31 + 17 mod N) hits every index exactly once
+// per N steps when gcd(31, N) = 1.
+
+fn random_sum(v: dvec<i64>, lookups: i64) -> i64 {
+  mut total: i64 = 0
+  mut idx: i64 = 1
+  mut k: i64 = 0
+  step n: i64 = v.len
+  while k < lookups {
+    total = total + v[idx]
+    idx = (idx * 31 + 17) % n
+    k = k + 1
+  }
+  total
+}
+
+fn main() -> i32 {
+  mut v: dvec<i64>
+  mut i: i64 = 0
+  while i < 1000000 {
+    v.push(i * 7 + 3)
+    i = i + 1
+  }
+  println(random_sum(v, 10000000))
+  0
+}
