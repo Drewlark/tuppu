@@ -2371,10 +2371,13 @@ class Checker:
             return
         if isinstance(pattern, TyStruct) and isinstance(concrete, TyStruct):
             if pattern.name != concrete.name:
-                raise _UnifyError(f"{pattern.name} vs {concrete.name}")
+                raise _UnifyError(
+                    f"{_pretty_flat_name(pattern.name)} vs "
+                    f"{_pretty_flat_name(concrete.name)}",
+                )
             if len(pattern.args) != len(concrete.args):
                 raise _UnifyError(
-                    f"{pattern.name}: arity mismatch "
+                    f"{_pretty_flat_name(pattern.name)}: arity mismatch "
                     f"{len(pattern.args)} vs {len(concrete.args)}",
                 )
             for p, c in zip(pattern.args, concrete.args):
@@ -2382,10 +2385,13 @@ class Checker:
             return
         if isinstance(pattern, TySeal) and isinstance(concrete, TySeal):
             if pattern.name != concrete.name:
-                raise _UnifyError(f"{pattern.name} vs {concrete.name}")
+                raise _UnifyError(
+                    f"{_pretty_flat_name(pattern.name)} vs "
+                    f"{_pretty_flat_name(concrete.name)}",
+                )
             if len(pattern.args) != len(concrete.args):
                 raise _UnifyError(
-                    f"{pattern.name}: arity mismatch "
+                    f"{_pretty_flat_name(pattern.name)}: arity mismatch "
                     f"{len(pattern.args)} vs {len(concrete.args)}",
                 )
             for p, c in zip(pattern.args, concrete.args):

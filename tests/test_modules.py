@@ -676,6 +676,44 @@ def test_error_messages_prettify_mangled_type_names(tmp_path):
     assert "foo.Counter" in msg or "bar.Counter" in msg
 
 
+def test_unify_detail_prettifies_mangled_type_names(tmp_path):
+    """The fn-call argument-unify path threads the mismatch as a
+    `_UnifyError` parenthetical detail. Without prettification it
+    leaked the raw `__M_x__Counter` mangle alongside the `__str__`-
+    formatted leading message. Distinct from the binding-annotation
+    path covered above — that goes through `_coerces_to` and never
+    constructs a `_UnifyError`."""
+    x = write(
+        tmp_path, "src/x.tpu",
+        "tablet Counter { x: i64 }\n"
+        "fn make_x() -> Counter { Counter { x: 1 } }\n",
+    )
+    y = write(
+        tmp_path, "src/y.tpu",
+        "tablet Counter { y: i64 }\n"
+        "fn id_y(c: Counter) -> Counter { c }\n",
+    )
+    main = write(
+        tmp_path, "src/main.tpu",
+        "from x import Counter, make_x\n"
+        "from y import id_y\n"
+        "fn main() -> i32 {\n"
+        "  step c: Counter = make_x()\n"
+        "  id_y(c)\n"  # arg-unify path: x.Counter vs y.Counter
+        "  0\n"
+        "}\n",
+    )
+    with pytest.raises(CompileError) as ei:
+        check_sources([
+            (str(x), x.read_text()),
+            (str(y), y.read_text()),
+            (str(main), main.read_text()),
+        ])
+    msg = str(ei.value)
+    assert "__M_" not in msg
+    assert "x.Counter" in msg and "y.Counter" in msg
+
+
 # --- regression: existing single-source tests keep working ---------------
 
 
