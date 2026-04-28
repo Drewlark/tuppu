@@ -511,6 +511,15 @@ class Parser:
             return _at(t, A.TypeName(name=t.value))
         if t.kind is Tok.IDENT:
             self.advance()
+            # Module-qualified type name: `mod.Foo` or `mod.Foo<T>`. The
+            # name is collapsed into a single dotted string here so the
+            # downstream typechecker can split it once and look up the
+            # qualifier in `module_aliases`.
+            full_name = t.value
+            while self.check(Tok.DOT):
+                self.advance()
+                seg = self.eat(Tok.IDENT, "type-name segment after '.'")
+                full_name = f"{full_name}.{seg.value}"
             # Generic type application: `Name<arg1, arg2>`. In type
             # position the `<` is always the type-arg-list bracket —
             # no ambiguity with less-than because type positions don't
@@ -524,8 +533,8 @@ class Parser:
                         self.advance()
                         args.append(self.parse_type())
                 self.eat(Tok.GT)
-                return _at(t, A.TypeApply(name=t.value, args=args))
-            return _at(t, A.TypeName(name=t.value))
+                return _at(t, A.TypeApply(name=full_name, args=args))
+            return _at(t, A.TypeName(name=full_name))
         if t.kind is Tok.TABLETS:
             self.advance()
             self.eat(Tok.LBRACKET)

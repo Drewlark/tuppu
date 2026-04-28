@@ -788,6 +788,85 @@ class Checker:
             return None
         return _mangle_module_name(src_mod, short_name)
 
+    def _resolve_qualified_type(
+        self, dotted: str, line: int, col: int,
+        type_args: "list[A.TypeExpr] | None" = None,
+        where: str = "",
+    ) -> "Ty | None":
+        """Resolve a dotted type name like `qual.Map` (or `qual.Map<T>`
+        when `type_args` is given) against the current module's import
+        aliases. The qualifier is the leading segment; the rest is the
+        short type name. Returns the resolved `Ty` or None if the
+        qualifier isn't a registered import alias (caller falls
+        through to the unknown-type error)."""
+        head, _, tail = dotted.partition(".")
+        if not tail:
+            return None
+        aliases = self.module_aliases.get(self.current_module, {})
+        src_mod = aliases.get(head)
+        if src_mod is None:
+            return None
+        decl = self.module_decls.get(src_mod, {}).get(tail)
+        if decl is None:
+            pretty = ".".join(src_mod) or "<root>"
+            raise CheckError(
+                f"module {pretty!r} has no public type {tail!r}",
+                line, col,
+            )
+        if isinstance(decl, A.StructDecl):
+            params = self.struct_type_params.get(tail, ())
+            if type_args is None:
+                if params:
+                    raise CheckError(
+                        f"{where or 'type'}: tablet {tail!r} expects "
+                        f"{len(params)} type argument(s); write "
+                        f"`{dotted}<...>`",
+                        line, col,
+                    )
+                return self.structs[tail]
+            if len(params) != len(type_args):
+                raise CheckError(
+                    f"{where or 'type'}: tablet {tail!r} expects "
+                    f"{len(params)} type argument(s), got "
+                    f"{len(type_args)}",
+                    line, col,
+                )
+            resolved = tuple(
+                self._resolve_type(a, f"{where or 'type'} type arg")
+                for a in type_args
+            )
+            return TyStruct(name=tail, args=resolved)
+        if isinstance(decl, A.SealDecl):
+            params = self.seal_type_params.get(tail, ())
+            if type_args is None:
+                if params:
+                    raise CheckError(
+                        f"{where or 'type'}: seal {tail!r} expects "
+                        f"{len(params)} type argument(s); write "
+                        f"`{dotted}<...>`",
+                        line, col,
+                    )
+                return self.seals[tail]
+            if len(params) != len(type_args):
+                raise CheckError(
+                    f"{where or 'type'}: seal {tail!r} expects "
+                    f"{len(params)} type argument(s), got "
+                    f"{len(type_args)}",
+                    line, col,
+                )
+            resolved = tuple(
+                self._resolve_type(a, f"{where or 'type'} type arg")
+                for a in type_args
+            )
+            return TySeal(name=tail, args=resolved)
+        # decl exists but isn't a tablet/seal — type position requires
+        # a type-bearing decl.
+        raise CheckError(
+            f"{where or 'type'}: {dotted!r} resolves to a "
+            f"{type(decl).__name__}, not a tablet or seal",
+            line, col,
+        )
+
     def _reject_import_cycles(self) -> None:
         """Reject any cycle in the module import graph. The graph
         edge `A → B` means module A has an `import B` or `from B import
@@ -1571,6 +1650,12 @@ class Checker:
             # in scope as fresh type variables.
             if t.name in self._active_type_vars:
                 return self._active_type_vars[t.name]
+            # Module-qualified type: `qual.Tablet`. Resolves through
+            # the module_aliases entry the import set up.
+            if "." in t.name:
+                resolved = self._resolve_qualified_type(t.name, t.line, t.col)
+                if resolved is not None:
+                    return resolved
             if t.name in self.type_aliases:
                 # Aliases are transparent: resolve the target in the
                 # alias's stead. Cycles surface as RecursionError —
@@ -1605,6 +1690,13 @@ class Checker:
                 f"{where}: unknown type {t.name!r}", t.line, t.col,
             )
         if isinstance(t, A.TypeApply):
+            # Module-qualified generic application: `qual.Map<T>`.
+            if "." in t.name:
+                resolved = self._resolve_qualified_type(
+                    t.name, t.line, t.col, type_args=t.args, where=where,
+                )
+                if resolved is not None:
+                    return resolved
             if t.name in self.structs:
                 params = self.struct_type_params.get(t.name, ())
                 if len(params) != len(t.args):

@@ -359,6 +359,48 @@ def test_module_qualified_call_via_wildcard_import(tmp_path):
     assert subprocess.run([str(binary)]).returncode == 42
 
 
+def test_module_qualified_type_in_annotation(tmp_path):
+    """`mod.Tablet` works as a type-position name after `import mod`,
+    parallel to expression-level `mod.foo(args)`. The struct literal
+    uses the unqualified form (wildcard import brought it into local
+    scope) — qualified-name struct literals would need parser support
+    in a follow-up."""
+    other = write(
+        tmp_path, "src/other.tpu",
+        "tablet Counter { x: i64 }\n",
+    )
+    main = write(
+        tmp_path, "src/main.tpu",
+        "import other\n"
+        "fn make() -> other.Counter { Counter { x: 7 } }\n"
+        "fn main() -> i32 {\n"
+        "  step c: other.Counter = make()\n"
+        "  c.x as i32\n"
+        "}\n",
+    )
+    binary = compile_files_to_binary([other, main], tmp_path / "build", name="prog")
+    assert subprocess.run([str(binary)]).returncode == 7
+
+
+def test_module_qualified_generic_type(tmp_path):
+    """`mod.Foo<T>` for generic tablets after `import mod`. The
+    annotation pins T; the struct literal infers from context."""
+    other = write(
+        tmp_path, "src/other.tpu",
+        "tablet Box<T> { value: T }\n",
+    )
+    main = write(
+        tmp_path, "src/main.tpu",
+        "import other\n"
+        "fn main() -> i32 {\n"
+        "  step b: other.Box<i64> = Box { value: 42 }\n"
+        "  b.value as i32\n"
+        "}\n",
+    )
+    binary = compile_files_to_binary([other, main], tmp_path / "build", name="prog")
+    assert subprocess.run([str(binary)]).returncode == 42
+
+
 def test_qualified_access_to_unknown_member_errors(tmp_path):
     """`h.no_such_fn` after `import helper as h` is a clear error
     (module exists, but the name doesn't)."""

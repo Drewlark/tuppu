@@ -22,37 +22,43 @@ class TypesMixin:
 
     def _lower_type(self, t: A.TypeExpr) -> ir.Type:
         if isinstance(t, A.TypeName):
-            if t.name in INT_WIDTH:
-                return ir.IntType(INT_WIDTH[t.name])
-            if t.name == "bool":
+            # Module-qualified type name from the parser — strip the
+            # qualifier; the typechecker has already validated it
+            # resolved to a real type, and at codegen time we just
+            # need the short name to find the LLVM type.
+            short = t.name.rsplit(".", 1)[-1] if "." in t.name else t.name
+            if short in INT_WIDTH:
+                return ir.IntType(INT_WIDTH[short])
+            if short == "bool":
                 return I1
-            if t.name == "rat":
+            if short == "rat":
                 return RAT
             # sex/dish now has a distinct digit-form representation so its
             # Babylonian identity survives to runtime. Coercion between sex
             # and rat is a real conversion, not a no-op.
-            if t.name in ("sex", "dish"):
+            if short in ("sex", "dish"):
                 return SEX
             # Generic-body type parameter in scope — resolve to the
             # current specialization's concrete LLVM type.
-            if t.name in self._type_arg_subst:
-                return self._type_arg_subst[t.name]
-            if t.name in self._struct_types:
-                return self._struct_types[t.name]
-            if t.name in self._seal_types:
-                return self._seal_types[t.name]
+            if short in self._type_arg_subst:
+                return self._type_arg_subst[short]
+            if short in self._struct_types:
+                return self._struct_types[short]
+            if short in self._seal_types:
+                return self._seal_types[short]
             # Type aliases resolve transparently: lower the target.
             if (
                 self._checker is not None
-                and t.name in self._checker.type_aliases
+                and short in self._checker.type_aliases
             ):
-                return self._lower_type(self._checker.type_aliases[t.name])
+                return self._lower_type(self._checker.type_aliases[short])
             raise CodegenError(f"type {t.name!r} not supported in this stage")
         if isinstance(t, A.TypeApply):
+            short = t.name.rsplit(".", 1)[-1] if "." in t.name else t.name
             arg_tys = tuple(self._lower_type(a) for a in t.args)
-            if t.name in self._generic_seal_decls:
-                return self._get_monomorph_seal(t.name, arg_tys)
-            return self._get_monomorph_struct(t.name, arg_tys)
+            if short in self._generic_seal_decls:
+                return self._get_monomorph_seal(short, arg_tys)
+            return self._get_monomorph_struct(short, arg_tys)
         if isinstance(t, A.TypeTablets):
             elem = self._lower_type(t.element)
             elem_is_wedge = isinstance(t.element, A.TypeHandle)
