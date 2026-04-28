@@ -49,6 +49,7 @@ class ModuleMixin:
         # colophon externs (C functions the compiler marshals to / from
         # at each call site).
         for decl in prog.decls:
+            self._codegen_current_module = prog.module_of.get(id(decl), ())
             if isinstance(decl, A.FnDecl):
                 if decl.type_params:
                     continue
@@ -76,6 +77,7 @@ class ModuleMixin:
         # globals. Done in declaration order so later tables may reference
         # earlier ones.
         for decl in prog.decls:
+            self._codegen_current_module = prog.module_of.get(id(decl), ())
             if isinstance(decl, A.TableDecl):
                 self._emit_table(decl)
 
@@ -83,6 +85,7 @@ class ModuleMixin:
         # specializations are emitted on demand when we see a call to
         # them (see `_get_monomorph_fn`).
         for decl in prog.decls:
+            self._codegen_current_module = prog.module_of.get(id(decl), ())
             if isinstance(decl, A.FnDecl):
                 if decl.type_params:
                     continue

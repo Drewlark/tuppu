@@ -26,24 +26,42 @@ class SealsMixin:
         """Phase A of seal registration: declare an empty identified
         LLVM type per concrete seal. Generic seals are stashed for on-
         demand monomorphization — their layout depends on concrete
-        type args so we can't emit one up front."""
+        type args so we can't emit one up front. Both concrete and
+        generic seals key off the typecheck-assigned flat name so two
+        modules can each declare a same-named seal."""
+        flat_for = (
+            self._checker.flat_name_for if self._checker is not None else {}
+        )
         self._generic_seal_decls = {
-            d.name: d for d in decls if d.type_params
+            flat_for.get(id(d), d.name): d for d in decls if d.type_params
         }
         for d in decls:
             if d.type_params:
                 continue
-            if d.name in self._seal_types:
+            flat = flat_for.get(id(d), d.name)
+            if flat in self._seal_types:
                 raise CodegenError(f"duplicate seal {d.name!r}")
-            ident_ty = self.module.context.get_identified_type(d.name)
-            self._seal_types[d.name] = ident_ty
+            ident_ty = self.module.context.get_identified_type(flat)
+            self._seal_types[flat] = ident_ty
 
     def _register_seals_resolve(self, decls: list["A.SealDecl"]) -> None:
-        """Phase B: compute each concrete seal's payload layout."""
+        """Phase B: compute each concrete seal's payload layout. Per-
+        decl module context drives field-type lowering."""
+        flat_for = (
+            self._checker.flat_name_for if self._checker is not None else {}
+        )
         for d in decls:
             if d.type_params:
                 continue
-            self._finalize_seal(d.name, d, arg_tys=())
+            saved_mod = self._codegen_current_module
+            if self._checker is not None:
+                self._codegen_current_module = self._checker.prog.module_of.get(
+                    id(d), (),
+                )
+            try:
+                self._finalize_seal(flat_for.get(id(d), d.name), d, arg_tys=())
+            finally:
+                self._codegen_current_module = saved_mod
 
     def _finalize_seal(
         self,

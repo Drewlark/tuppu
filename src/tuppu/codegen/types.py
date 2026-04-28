@@ -27,6 +27,19 @@ class TypesMixin:
             # resolved to a real type, and at codegen time we just
             # need the short name to find the LLVM type.
             short = t.name.rsplit(".", 1)[-1] if "." in t.name else t.name
+            # If the typecheck assigned a flat (module-mangled) name
+            # for this short, use it. The current-module context is
+            # carried in `self._codegen_current_module`, set by
+            # `_gen_fn_body` and the per-decl phases.
+            if (
+                self._checker is not None
+                and short not in INT_WIDTH
+                and short not in ("bool", "rat", "sex", "dish")
+            ):
+                scope = self._checker.module_visible.get(
+                    getattr(self, "_codegen_current_module", ()), {},
+                )
+                short = scope.get(short, short)
             if short in INT_WIDTH:
                 return ir.IntType(INT_WIDTH[short])
             if short == "bool":
@@ -55,6 +68,11 @@ class TypesMixin:
             raise CodegenError(f"type {t.name!r} not supported in this stage")
         if isinstance(t, A.TypeApply):
             short = t.name.rsplit(".", 1)[-1] if "." in t.name else t.name
+            if self._checker is not None:
+                scope = self._checker.module_visible.get(
+                    getattr(self, "_codegen_current_module", ()), {},
+                )
+                short = scope.get(short, short)
             arg_tys = tuple(self._lower_type(a) for a in t.args)
             if short in self._generic_seal_decls:
                 return self._get_monomorph_seal(short, arg_tys)
@@ -121,40 +139,76 @@ class TypesMixin:
         """Phase A of struct registration: declare every tablet as an
         empty identified LLVM type. Splitting declare from resolve lets
         us interleave with seal registration so struct fields of seal
-        type (and vice versa) can see the identified type."""
+        type (and vice versa) can see the identified type.
+
+        All struct/tablet keys use the typecheck-assigned flat name
+        (`__M_<mod>__<short>` when there's a cross-module collision,
+        else the short name) so two modules can each declare a tablet
+        with the same short name — they live as distinct LLVM types
+        keyed by their mangled forms."""
+        flat_for = (
+            self._checker.flat_name_for if self._checker is not None else {}
+        )
         self._generic_struct_decls: dict[str, A.StructDecl] = {
-            d.name: d for d in decls if d.type_params
+            flat_for.get(id(d), d.name): d for d in decls if d.type_params
         }
         concrete = [d for d in decls if not d.type_params]
         for d in concrete:
-            if d.name in self._struct_types:
+            flat = flat_for.get(id(d), d.name)
+            if flat in self._struct_types:
                 raise CodegenError(f"duplicate struct {d.name!r}")
-            ident_ty = self.module.context.get_identified_type(d.name)
-            self._struct_types[d.name] = ident_ty
+            ident_ty = self.module.context.get_identified_type(flat)
+            self._struct_types[flat] = ident_ty
 
     def _register_structs_resolve(self, decls: list[A.StructDecl]) -> None:
         """Phase B/C: cycle-check and resolve each struct's body."""
+        flat_for = (
+            self._checker.flat_name_for if self._checker is not None else {}
+        )
         concrete = [d for d in decls if not d.type_params]
-        by_name = {d.name: d for d in concrete}
+        # Cycle check uses flat names to follow the same identifiers
+        # that field-type lowering produces.
+        by_flat = {flat_for.get(id(d), d.name): d for d in concrete}
 
         # Phase B: detect direct cycles (cycle in the "inline contains"
         # graph). A field whose type is another struct by value — or an
         # array of that struct — contributes a direct edge. A field
         # that's a pointer or tablets does NOT (the recursion goes
-        # through heap indirection, so size is finite).
+        # through heap indirection, so size is finite). To follow the
+        # by-flat namespace, a field referencing a tablet by short name
+        # is resolved through the declaring module's visible scope.
+        decl_modules = {
+            id(d): (
+                self._checker.prog.module_of.get(id(d), ())
+                if self._checker is not None else ()
+            )
+            for d in concrete
+        }
+        def _resolve_short_in_scope(short: str, decl: A.StructDecl) -> "str | None":
+            if self._checker is None:
+                return short if short in by_flat else None
+            mod = decl_modules.get(id(decl), ())
+            scope = self._checker.module_visible.get(mod, {})
+            flat = scope.get(short, short)
+            return flat if flat in by_flat else None
+
         direct_deps: dict[str, set[str]] = {}
         for d in concrete:
             deps: set[str] = set()
             for _fname, ftype in d.fields:
-                if isinstance(ftype, A.TypeName) and ftype.name in by_name:
-                    deps.add(ftype.name)
+                if isinstance(ftype, A.TypeName):
+                    dep = _resolve_short_in_scope(ftype.name, d)
+                    if dep is not None:
+                        deps.add(dep)
                 elif isinstance(ftype, A.TypeArray):
                     elem = ftype.element
-                    if isinstance(elem, A.TypeName) and elem.name in by_name:
-                        deps.add(elem.name)
-            direct_deps[d.name] = deps
+                    if isinstance(elem, A.TypeName):
+                        dep = _resolve_short_in_scope(elem.name, d)
+                        if dep is not None:
+                            deps.add(dep)
+            direct_deps[flat_for.get(id(d), d.name)] = deps
 
-        color: dict[str, int] = {name: 0 for name in by_name}  # 0 white, 1 gray, 2 black
+        color: dict[str, int] = {name: 0 for name in by_flat}  # 0 white, 1 gray, 2 black
         def visit(name: str) -> None:
             if color[name] == 2:
                 return
@@ -170,18 +224,29 @@ class TypesMixin:
                 visit(dep)
             color[name] = 2
 
-        for name in by_name:
+        for name in by_flat:
             visit(name)
 
         # Phase C: resolve all bodies. Identified types support
-        # `set_body(*field_tys)` exactly once.
+        # `set_body(*field_tys)` exactly once. Field-type lowering
+        # consults the declaring module's visible scope so cross-module
+        # type references resolve to the right mangled identifier.
         for d in concrete:
-            field_tys = [self._lower_type(ftype) for _, ftype in d.fields]
-            self._struct_types[d.name].set_body(*field_tys)
-            self._struct_fields[d.name] = list(
+            flat = flat_for.get(id(d), d.name)
+            saved_mod = self._codegen_current_module
+            if self._checker is not None:
+                self._codegen_current_module = self._checker.prog.module_of.get(
+                    id(d), (),
+                )
+            try:
+                field_tys = [self._lower_type(ftype) for _, ftype in d.fields]
+            finally:
+                self._codegen_current_module = saved_mod
+            self._struct_types[flat].set_body(*field_tys)
+            self._struct_fields[flat] = list(
                 zip([n for n, _ in d.fields], field_tys)
             )
-            self._struct_wedge_idxs[d.name] = {
+            self._struct_wedge_idxs[flat] = {
                 i for i, (_n, ftype) in enumerate(d.fields)
                 if isinstance(ftype, A.TypeHandle)
             }

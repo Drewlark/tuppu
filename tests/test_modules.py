@@ -512,12 +512,6 @@ def test_two_modules_can_each_declare_same_fn_name(tmp_path):
     assert subprocess.run([str(binary)]).returncode == 42
 
 
-@pytest.mark.xfail(
-    reason="Codegen tablet-type tables are still keyed by short name; "
-    "the typecheck side mangles, but `_struct_types` and field-accessor "
-    "paths in codegen need a parallel refactor before two modules can "
-    "each declare `tablet Foo`. Tracked as a follow-up in LIMITATIONS.md."
-)
 def test_two_modules_can_each_declare_same_tablet_name(tmp_path):
     """`tablet Foo` in two different modules — typecheck accepts both
     via module-prefix mangling, but codegen rejects the second one

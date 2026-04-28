@@ -48,16 +48,9 @@ Format: each section groups by area. Bullets prefix with severity:
   per stdlib type (`tablets[16]Node<T>` in `list.tpu`,
   `tablets[64]T` in `vec.tpu`, `tablets[64]str/T` in `map.tpu`).
   A user can't write `Vec<T, 16>` vs `Vec<T, 1024>`.
-- **[gap]** Cross-module same-name decls collide. Two `src/` modules
-  can't both declare `fn helper()` or `tablet Foo` — the second one
-  is rejected with a duplicate-name error at typecheck. Module-
-  prefix LLVM mangling would let both coexist (each module's `Foo`
-  becomes `__M_modA__Foo` / `__M_modB__Foo` at the IR level).
-  Variant-name reuse across modules already works (see
-  `tests/test_modules.py::test_seals_in_different_modules_can_share_variant_names`)
-  because variants don't get standalone LLVM symbols. The fn/tablet
-  case is a real follow-up — the principled fix is to mangle every
-  non-extern decl with its declaring module path.
+- (Cross-module same-name decls coexist via module-prefix LLVM
+  mangling — see `tests/test_modules.py::test_two_modules_can_each_declare_same_fn_name`
+  and `::test_two_modules_can_each_declare_same_tablet_name`.)
 - **[gap]** Pattern matching is flat only. No nested patterns
   (`Some(Circle(r))`), no guards (`Some(x) if x > 0`), no or-patterns
   (`Some(1) | Some(2)`). Exhaustiveness for nested patterns is
@@ -137,18 +130,10 @@ Format: each section groups by area. Bullets prefix with severity:
   importer's scope literally; if downstream consumers need to see
   `x.y`'s names they import them directly. `pub use x.y` /
   `export from` is the natural follow-up.
-- **[gap]** Cross-module tablet/seal name collisions. Two modules
-  CAN both declare `fn helper()` (the typecheck + codegen both
-  mangle these now via `__M_<mod>__<name>` — see
-  `tests/test_modules.py::test_two_modules_can_each_declare_same_fn_name`).
-  But `tablet Foo` in two modules trips a `duplicate struct 'Foo'`
-  error in codegen because `_struct_types` and the field-accessor
-  paths are still keyed by short name. The typecheck side already
-  mangles tablet names; the remaining work is the parallel codegen
-  refactor — `_struct_types`, `_seal_types`, `_get_monomorph_struct`,
-  and the field-access lowering all need to route lookups through
-  the checker's `flat_name_for` sideband. See xfail
-  `test_two_modules_can_each_declare_same_tablet_name`.
+- (Cross-module same-name fns and tablets coexist via the LLVM
+  `__M_<mod>__<short>` mangle — module-prefix mangling is on for
+  `fn`, `tablet`, and `seal` decls. Duplicate-name constraints now
+  apply only within a single module.)
 - **[gap]** Qualified-name struct literals. `mod.Tablet { ... }` in
   expression position doesn't parse — the struct-lit parser doesn't
   see the dotted form as a type-position name. Wildcard `import mod`
