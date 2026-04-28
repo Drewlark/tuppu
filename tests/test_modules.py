@@ -329,6 +329,52 @@ def test_variant_unimported_seal_errors_with_hint(tmp_path):
         ])
 
 
+# --- module-qualified access (`x.foo(args)`) -----------------------------
+
+
+def test_module_qualified_call_via_import_as(tmp_path):
+    """`import x.y as z` enables qualified access `z.foo(args)`. The
+    aliased form does NOT pollute the local namespace — `foo` is only
+    reachable via `z.foo`."""
+    helper = write(tmp_path, "src/helper.tpu", "fn add(a: i64, b: i64) -> i64 { a + b }\n")
+    main = write(
+        tmp_path, "src/main.tpu",
+        "import helper as h\n"
+        "fn main() -> i32 { h.add(40, 2) as i32 }\n",
+    )
+    binary = compile_files_to_binary([helper, main], tmp_path / "build", name="prog")
+    assert subprocess.run([str(binary)]).returncode == 42
+
+
+def test_module_qualified_call_via_wildcard_import(tmp_path):
+    """`import x` (wildcard) brings public names in unprefixed AND
+    registers `x` as a qualifier so `x.foo(args)` is also valid."""
+    helper = write(tmp_path, "src/helper.tpu", "fn add(a: i64, b: i64) -> i64 { a + b }\n")
+    main = write(
+        tmp_path, "src/main.tpu",
+        "import helper\n"
+        "fn main() -> i32 { helper.add(40, 2) as i32 }\n",
+    )
+    binary = compile_files_to_binary([helper, main], tmp_path / "build", name="prog")
+    assert subprocess.run([str(binary)]).returncode == 42
+
+
+def test_qualified_access_to_unknown_member_errors(tmp_path):
+    """`h.no_such_fn` after `import helper as h` is a clear error
+    (module exists, but the name doesn't)."""
+    helper = write(tmp_path, "src/helper.tpu", "fn add(a: i64, b: i64) -> i64 { a + b }\n")
+    main = write(
+        tmp_path, "src/main.tpu",
+        "import helper as h\n"
+        "fn main() -> i32 { h.no_such_fn(1, 2) as i32 }\n",
+    )
+    with pytest.raises(CompileError, match="has no public name"):
+        check_sources([
+            (str(helper), helper.read_text()),
+            (str(main), main.read_text()),
+        ])
+
+
 # --- regression: existing single-source tests keep working ---------------
 
 

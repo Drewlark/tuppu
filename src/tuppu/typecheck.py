@@ -485,6 +485,11 @@ class Checker:
         # `mangled_name` is what's keyed in `self.fns` / `self.structs`
         # / `self.seals`. Builtins map to their unmangled form.
         self.module_visible: dict[tuple[str, ...], dict[str, str]] = {}
+        # Set of Call-node ids whose callee was rewritten by the
+        # module-qualified-access branch in `_tc_call`. The downstream
+        # `_check_module_scope` skips these — the qualifier already
+        # validated visibility against the source module's exports.
+        self._qualified_call_resolved: set[int] = set()
         # mod -> {alias: source_module_path}. Populated from
         # `import x.y as z` (so `z.foo` becomes a module-qualified
         # reference into module x.y at use sites).
@@ -2151,6 +2156,47 @@ class Checker:
         return ty
 
     def _tc_call(self, e: A.Call, expected: Ty | None = None) -> Ty:
+        # Module-qualified call: `parser.parse(x)` after `import parser`
+        # (or `import x.y.parser as parser`). Dispatches to the resolved
+        # public fn in the source module, bypassing the method-call path
+        # below. Detected before the Field-as-method case because module
+        # qualifiers shadow the same-name local-binding rule (a local
+        # named `parser` shadows the import; method dispatch then fires).
+        if (
+            isinstance(e.callee, A.Field)
+            and isinstance(e.callee.target, A.Ident)
+            and not any(e.callee.target.name in s for s in self.scopes)
+        ):
+            qualifier = e.callee.target.name
+            method = e.callee.name
+            aliases = self.module_aliases.get(self.current_module, {})
+            if qualifier in aliases:
+                src_mod = aliases[qualifier]
+                src_decls = self.module_decls.get(src_mod, {})
+                target = src_decls.get(method)
+                if target is None or method.startswith("_"):
+                    pretty = ".".join(src_mod) or "<root>"
+                    raise CheckError(
+                        f"module {pretty!r} has no public name "
+                        f"{method!r}",
+                        e.line, e.col,
+                    )
+                # Dispatch as a regular call by substituting the callee
+                # with a bare Ident pointing at the resolved name (which
+                # is in the global flat fn table because cross-module
+                # mangling isn't on yet — that's the next commit). The
+                # `_qualified_call_resolved` flag tells
+                # `_check_module_scope` to trust the qualifier-side
+                # check we just did instead of re-checking visibility
+                # against the importer's local scope (where the
+                # method name doesn't appear, by design of `import x as y`).
+                new_ident = A.Ident(name=method)
+                new_ident.line = e.callee.line
+                new_ident.col = e.callee.col
+                e.callee = new_ident
+                self._qualified_call_resolved.add(id(e))
+                # Drop through to the regular fn-call path below.
+
         # Method call on a tablets receiver. The receiver may be a bare
         # Ident (t.push) or a field chain rooted at one (buf.bytes.push);
         # _tc_method_call routes through _tc_expr on the receiver so
@@ -2242,7 +2288,11 @@ class Checker:
                 f"{_suggest(name, self.fns)}",
                 e.line, e.col,
             )
-        self._check_module_scope(name, e.line, e.col)
+        # Skip the local-scope visibility check when the call was
+        # dispatched via module-qualified access — qualifier resolution
+        # already validated the source module's exports.
+        if id(e) not in self._qualified_call_resolved:
+            self._check_module_scope(name, e.line, e.col)
         # Variadic call: split args into (fixed, tail). The fixed args
         # typecheck against the first (n-1) params; the tail becomes a
         # synthesized TabletsLit that gets typechecked against the last
