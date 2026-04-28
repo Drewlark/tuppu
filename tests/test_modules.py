@@ -375,6 +375,82 @@ def test_qualified_access_to_unknown_member_errors(tmp_path):
         ])
 
 
+# --- topological order + cycle detection --------------------------------
+
+
+def test_circular_import_rejected(tmp_path):
+    """Mutual `import` between two modules is rejected at typecheck.
+    Strategy doc lists circular imports as a non-goal for v1; the
+    rejection keeps later passes' single-traversal model honest."""
+    a = write(tmp_path, "src/a.tpu", "import b\nfn fa() -> i64 { 1 }\n")
+    b = write(tmp_path, "src/b.tpu", "import a\nfn fb() -> i64 { 2 }\n")
+    main = write(
+        tmp_path, "src/main.tpu",
+        "from a import fa\nfn main() -> i32 { fa() as i32 }\n",
+    )
+    with pytest.raises(CompileError, match="circular import"):
+        check_sources([
+            (str(a), a.read_text()),
+            (str(b), b.read_text()),
+            (str(main), main.read_text()),
+        ])
+
+
+def test_self_import_rejected(tmp_path):
+    """A module that imports itself trips the cycle detector — the
+    self-edge is the smallest cycle."""
+    a = write(
+        tmp_path, "src/a.tpu",
+        "import a\n"
+        "fn helper() -> i64 { 7 }\n"
+        "fn main() -> i32 { helper() as i32 }\n",
+    )
+    with pytest.raises(CompileError, match="circular import"):
+        check_sources([(str(a), a.read_text())])
+
+
+# --- edubba additive across files in same module ------------------------
+
+
+def test_edubba_additive_within_one_file_in_a_module():
+    """Two `edubba T { ... }` blocks in the same file merge — methods
+    from both blocks are reachable on a `T` value. This is the v1
+    additive-edubba feature; directory-as-module multi-file additive
+    edubbas would need a `mod foo;`-style module declaration syntax
+    that v1 deliberately avoids."""
+    from tuppu.driver import compile_to_ir
+    src = """
+    tablet Box { x: i64 }
+    edubba Box { fn one(self) -> i64 { self.x } }
+    edubba Box { fn two(self) -> i64 { self.x * 2 } }
+    fn main() -> i32 {
+      step b: Box = Box { x: 21 }
+      (b.one() + b.two()) as i32
+    }
+    """
+    ir = compile_to_ir(src)
+    # Both methods get materialised as fns on Box.
+    assert "Box__one" in ir
+    assert "Box__two" in ir
+
+
+def test_edubba_cannot_extend_foreign_tablet(tmp_path):
+    """An edubba block declared outside the host tablet's module is
+    rejected — modules don't get to bolt methods onto someone else's
+    tablet."""
+    host = write(tmp_path, "src/host.tpu", "tablet Foo { x: i64 }\n")
+    intruder = write(
+        tmp_path, "src/intruder.tpu",
+        "from host import Foo\n"
+        "edubba Foo { fn bad(self) -> i64 { 0 } }\n",
+    )
+    with pytest.raises(CompileError, match="can only be added in the host"):
+        check_sources([
+            (str(host), host.read_text()),
+            (str(intruder), intruder.read_text()),
+        ])
+
+
 # --- regression: existing single-source tests keep working ---------------
 
 

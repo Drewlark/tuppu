@@ -516,6 +516,11 @@ class Checker:
         # can resolve top-level names via `_resolve_top_level` and
         # `_resolve_module_qualified`.
         self._build_module_scopes()
+        # Phase 0-cycles: import graph must be acyclic. The strategy
+        # doc explicitly lists circular imports as a non-goal for v1
+        # (see `scratch/NEXT_BIG_FEATURE.md`); rejecting them now keeps
+        # later passes' single-traversal model honest.
+        self._reject_import_cycles()
         # Phase 0a: collect struct + seal names so type bodies can refer
         # to each other and to user types regardless of source order.
         # Aliases register their target AST eagerly; the target gets
@@ -609,21 +614,24 @@ class Checker:
            `module_qualified_refs` so module-qualified access (e.g.
            `parser.parse(x)` after `import parser`) can resolve.
         """
-        # Step 1: catalogue decls per module.
+        # Step 1: catalogue decls per module. First pass: every decl
+        # contributes its module path to `_known_modules` (so files that
+        # contain only edubbas / imports / gloss still get a visible-
+        # scope entry).
         for d in self.prog.decls:
-            if isinstance(d, A.ImportDecl):
+            mod = self.prog.module_of.get(id(d), ())
+            self._known_modules.add(mod)
+        # Second pass: populate `module_decls` with the user-named
+        # top-level decls. Skip imports (no decl name), gloss (mangled
+        # internally), and edubba (lowered to `<Type>__<method>` fns
+        # by phase 0c).
+        for d in self.prog.decls:
+            if isinstance(d, (A.ImportDecl, A.GlossDecl, A.EdubbaDecl)):
                 continue
             name = getattr(d, "name", None)
             if not name:
                 continue
-            # Gloss and edubba decls don't expose top-level user-named
-            # symbols — gloss is type-dispatched (mangled internally),
-            # edubba is lowered to `<Type>__<method>` fns by phase 0c.
-            # Skip them for module-scope purposes.
-            if isinstance(d, (A.GlossDecl, A.EdubbaDecl)):
-                continue
             mod = self.prog.module_of.get(id(d), ())
-            self._known_modules.add(mod)
             decls = self.module_decls.setdefault(mod, {})
             # Tolerate duplicates here — the per-decl-type registration
             # phases (`_register_fn`, `_register_struct_name`, etc.)
@@ -779,6 +787,52 @@ class Checker:
         if short_name.startswith("_"):
             return None
         return _mangle_module_name(src_mod, short_name)
+
+    def _reject_import_cycles(self) -> None:
+        """Reject any cycle in the module import graph. The graph
+        edge `A → B` means module A has an `import B` or `from B import
+        ...` decl. Cycles are detected with a depth-first traversal.
+
+        v1 doesn't need a topological order to typecheck — the existing
+        flat-namespace pass already sees all decls — but rejecting
+        cycles now keeps the door open for a real per-module-scope
+        typecheck that walks modules in dependency order. See the
+        strategy doc's explicit non-goal: 'No circular imports.
+        Reject at link time.'"""
+        edges: dict[tuple[str, ...], list[tuple[tuple[str, ...], int, int]]] = {}
+        for d in self.prog.decls:
+            if not isinstance(d, A.ImportDecl):
+                continue
+            src = self.prog.module_of.get(id(d), ())
+            dst = tuple(d.path)
+            edges.setdefault(src, []).append((dst, d.line, d.col))
+
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color: dict[tuple[str, ...], int] = {m: WHITE for m in self._known_modules}
+        stack: list[tuple[str, ...]] = []
+
+        def visit(node: tuple[str, ...]) -> None:
+            if color.get(node, WHITE) == BLACK:
+                return
+            if color.get(node) == GRAY:
+                # Cycle. Slice the stack from the recurrence point.
+                idx = stack.index(node)
+                cycle = stack[idx:] + [node]
+                pretty = " -> ".join(".".join(m) or "<root>" for m in cycle)
+                raise CheckError(
+                    f"circular import detected: {pretty}",
+                    0, 0,
+                )
+            color[node] = GRAY
+            stack.append(node)
+            for tgt, _line, _col in edges.get(node, []):
+                visit(tgt)
+            stack.pop()
+            color[node] = BLACK
+
+        for mod in list(self._known_modules):
+            if color.get(mod, WHITE) == WHITE:
+                visit(mod)
 
     def _build_module_visible_variants(self) -> None:
         """Populate `self.module_visible_variants[mod]` for every known
@@ -1013,6 +1067,31 @@ class Checker:
             if d.type_name not in self.structs:
                 raise CheckError(
                     f"edubba {d.type_name!r}: no tablet by that name",
+                    d.line, d.col,
+                )
+            # An edubba block can only extend a tablet declared in the
+            # same module — outside modules can't bolt methods onto
+            # someone else's tablet (that's both a module-pollution
+            # vector and an evolution-trap for the host module's
+            # invariants). Multiple edubba blocks for the same tablet
+            # within one module are fine and additive — the existing
+            # method registry below catches duplicate method names.
+            edubba_mod = self.prog.module_of.get(id(d), ())
+            host_mod = None
+            for mod, decls in self.module_decls.items():
+                if d.type_name in decls and isinstance(
+                    decls[d.type_name], A.StructDecl,
+                ):
+                    host_mod = mod
+                    break
+            if host_mod is not None and host_mod != edubba_mod:
+                here = ".".join(edubba_mod) or "<root>"
+                there = ".".join(host_mod) or "<root>"
+                raise CheckError(
+                    f"edubba {d.type_name!r}: tablet is declared in "
+                    f"module {there!r}, but this edubba block lives in "
+                    f"{here!r}; methods can only be added in the host "
+                    f"tablet's own module",
                     d.line, d.col,
                 )
             host_params = self.struct_type_params.get(d.type_name, ())
