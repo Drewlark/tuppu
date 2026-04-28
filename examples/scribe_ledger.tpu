@@ -1,13 +1,17 @@
 // Scribe ledger: Vec<T> holds an insertion-ordered roll of items,
 // Map<i64> totals their amounts by item name. Demonstrates the
 // stdlib generic containers cooperating with raw stdlib helpers.
+//
+// `Map<T>` exposes its operations through an `edubba` block, so
+// updates spell as `tally.set(item, n)` rather than the older
+// `map_set(mut tally, item, n)` free-function form.
 
 // One day's grain offerings: (item_name, amount) pairs accumulated
 // into the roll plus a per-item tally on the side.
 fn record(mut roll: Vec<str>, mut tally: Map<i64>, item: str, amount: i64) {
   vec_push(roll, item)
-  step prev: i64 = map_get(tally, item, 0)
-  map_set(tally, item, prev + amount)
+  step prev: i64 = tally.get(item, 0)
+  tally.set(item, prev + amount)
 }
 
 fn main() -> i32 {
@@ -30,12 +34,12 @@ fn main() -> i32 {
 
   println("tally:")
   i = 0
-  while i < map_len(tally) {
+  while i < tally.len() {
     println("  ", tally.keys[i], " = ", tally.values[i])
     i += 1
   }
 
-  println("found barley: ", map_has(tally, "barley"))
-  println("found wheat:  ", map_has(tally, "wheat"))
+  println("found barley: ", tally.has("barley"))
+  println("found wheat:  ", tally.has("wheat"))
   0
 }

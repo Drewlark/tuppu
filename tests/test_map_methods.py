@@ -1,9 +1,9 @@
-"""Method-call dispatch for `Map<T>`. The stdlib `map_set` /
-`map_get` / `map_has` / `map_len` / `map_index` free functions are
-exposed through method syntax (`m.set(k, v)`, etc.) so receivers can
-be any lvalue path — Field, Index, or Ident — without forcing the
-caller to bind the map to a mut Ident first. Each test runs in both
-normal and GC-stress mode."""
+"""Method-call dispatch for `Map<T>`. Operations on Map live in its
+`edubba` block (stdlib/map.tpu) and are called as methods —
+`m.set(k, v)`, `m.get(k, fb)`, etc. — with receivers free to be any
+lvalue path: Field (`bag.items.set(...)`), Index
+(`slots[i].m.set(...)`), or Ident. Each test runs in both normal and
+GC-stress mode."""
 from __future__ import annotations
 
 import os
@@ -176,28 +176,24 @@ fn main() -> i32 {
     assert out == b"len=2\nname=Tuppu\nver=1\n"
 
 
-def test_map_methods_coexist_with_free_fns(tmp_path, stress):
-    # The free-function forms must keep working — this slice is purely
-    # additive. Mix method calls and `map_set` / `map_get` on the same
-    # binding to prove there's no shadowing or release double-up.
+def test_map_free_fn_form_no_longer_exists(tmp_path, stress):
+    # The old `map_set(mut m, k, v)` free-function form was removed
+    # when stdlib/map.tpu migrated to an edubba block. Calling it
+    # produces an unknown-fn error, not silent success.
     src = """
 fn main() -> i32 {
   mut m: Map<i64>
-  m.set("a", 1)
-  map_set(m, "b", 2)
-  m.set("c", 3)
-  println(map_get(m, "a", -1))
-  println(m.get("b", -1))
-  println(map_has(m, "c"))
-  println(m.has("c"))
-  println(map_len(m))
-  println(m.len())
+  map_set(m, "a", 1)
   0
 }
 """
-    rc, out = run(src, tmp_path, stress)
-    assert rc == 0
-    assert out == b"1\n2\ntrue\ntrue\n3\n3\n"
+    user = tmp_path / "main.tpu"
+    user.write_text(src)
+    with pytest.raises(Exception) as excinfo:
+        compile_files_to_binary(
+            stdlib_files() + [user], tmp_path, name="prog",
+        )
+    assert "map_set" in str(excinfo.value)
 
 
 def test_map_unknown_method_rejected(tmp_path, stress):
@@ -223,8 +219,8 @@ fn main() -> i32 {
 
 def test_map_method_arity_mismatch_rejected(tmp_path, stress):
     # Wrong number of args at a method site goes through the same
-    # generic-fn unification as the free-function form, so the error
-    # path is shared. Also compile-time only.
+    # generic-fn unification as a regular call, so the error mentions
+    # the underlying mangled fn name.
     src = """
 fn main() -> i32 {
   mut m: Map<i64>
@@ -238,4 +234,171 @@ fn main() -> i32 {
         compile_files_to_binary(
             stdlib_files() + [user], tmp_path, name="prog",
         )
-    assert "map_set" in str(excinfo.value)
+    assert "Map__set" in str(excinfo.value)
+
+
+def test_user_edubba_block(tmp_path, stress):
+    # User-defined tablet with its own edubba — proves the mechanism
+    # is general, not Map-specific.
+    src = """
+tablet Counter {
+  hits: i64,
+  misses: i64,
+}
+
+edubba Counter {
+  fn total(self) -> i64 { self.hits + self.misses }
+  fn record_hit(mut self) { self.hits = self.hits + 1 }
+  fn record_miss(mut self) { self.misses = self.misses + 1 }
+  fn ratio(self, fb: i64) -> i64 {
+    step t: i64 = self.total()
+    if t == 0 { yield fb }
+    self.hits * 100 / t
+  }
+}
+
+fn main() -> i32 {
+  mut c: Counter
+  c.record_hit()
+  c.record_hit()
+  c.record_hit()
+  c.record_miss()
+  println("hits=",   c.hits)
+  println("misses=", c.misses)
+  println("total=",  c.total())
+  println("ratio=",  c.ratio(-1))
+  0
+}
+"""
+    rc, out = run(src, tmp_path, stress)
+    assert rc == 0
+    assert out == b"hits=3\nmisses=1\ntotal=4\nratio=75\n"
+
+
+def test_user_generic_edubba_block(tmp_path, stress):
+    # Generic edubba — the receiver type is `Box<T>`, the method
+    # honors T at the call site. Proves type-param inference flows
+    # from the receiver into the method's body.
+    src = """
+tablet Box<T> {
+  items: tablets[16]T,
+}
+
+edubba Box<T> {
+  fn add(mut self, v: T) { self.items.push(v) }
+  fn at(self, i: i64) -> T { self.items[i] }
+  fn count(self) -> i64 { self.items.len }
+}
+
+fn main() -> i32 {
+  mut bi: Box<i64>
+  bi.add(11)
+  bi.add(22)
+  bi.add(33)
+  println(bi.count(), " ", bi.at(0), " ", bi.at(1), " ", bi.at(2))
+
+  mut bs: Box<str>
+  bs.add("alpha")
+  bs.add("beta")
+  println(bs.count(), " ", bs.at(0), " ", bs.at(1))
+  0
+}
+"""
+    rc, out = run(src, tmp_path, stress)
+    assert rc == 0
+    assert out == b"3 11 22 33\n2 alpha beta\n"
+
+
+def test_multiple_edubba_blocks_on_same_tablet(tmp_path, stress):
+    # Multiple edubba blocks on one tablet — different scribes
+    # writing on the same tablet. Both contribute to the method
+    # registry; calling either method works.
+    src = """
+tablet Tally {
+  n: i64,
+}
+
+edubba Tally {
+  fn bump(mut self) { self.n = self.n + 1 }
+}
+
+edubba Tally {
+  fn read(self) -> i64 { self.n }
+}
+
+fn main() -> i32 {
+  mut t: Tally
+  t.bump()
+  t.bump()
+  t.bump()
+  println(t.read())
+  0
+}
+"""
+    rc, out = run(src, tmp_path, stress)
+    assert rc == 0
+    assert out == b"3\n"
+
+
+def test_edubba_duplicate_method_rejected(tmp_path, stress):
+    # Two methods of the same short name on one tablet (whether in
+    # one block or split across two) is a hard error.
+    src = """
+tablet Tally { n: i64 }
+
+edubba Tally {
+  fn bump(mut self) { self.n = self.n + 1 }
+}
+
+edubba Tally {
+  fn bump(mut self) { self.n = self.n + 2 }
+}
+
+fn main() -> i32 { 0 }
+"""
+    user = tmp_path / "main.tpu"
+    user.write_text(src)
+    with pytest.raises(Exception) as excinfo:
+        compile_files_to_binary(
+            stdlib_files() + [user], tmp_path, name="prog",
+        )
+    assert "duplicate method" in str(excinfo.value)
+
+
+def test_edubba_unknown_tablet_rejected(tmp_path, stress):
+    # Edubba on a name that isn't a tablet is a clear error.
+    src = """
+edubba NoSuchTablet {
+  fn foo(self) -> i64 { 0 }
+}
+
+fn main() -> i32 { 0 }
+"""
+    user = tmp_path / "main.tpu"
+    user.write_text(src)
+    with pytest.raises(Exception) as excinfo:
+        compile_files_to_binary(
+            stdlib_files() + [user], tmp_path, name="prog",
+        )
+    assert "no tablet" in str(excinfo.value)
+
+
+def test_edubba_self_must_be_named_self(tmp_path, stress):
+    # The receiver param has to be spelled `self` (or `mut self`).
+    # Anything else is a parse error.
+    src = """
+tablet Tally { n: i64 }
+
+edubba Tally {
+  fn bump(mut me) { me.n = me.n + 1 }
+}
+
+fn main() -> i32 { 0 }
+"""
+    user = tmp_path / "main.tpu"
+    user.write_text(src)
+    with pytest.raises(Exception) as excinfo:
+        compile_files_to_binary(
+            stdlib_files() + [user], tmp_path, name="prog",
+        )
+    assert "self" in str(excinfo.value).lower()

@@ -10,58 +10,65 @@
 // are in place; both are tracked in LIMITATIONS.md.
 //
 // Removal isn't supported yet — tablets are append-only at the
-// runtime level, so a real `map_delete` needs tombstone slots and
+// runtime level, so a real `delete` needs tombstone slots and
 // a compaction story. Rebuild the map if removal becomes essential.
 //
 // Keys are `str`. Comparison goes through `str_eq` from
 // `stdlib/str.tpu`, which is loaded ahead of this file by the
 // glob-sorted bundler.
+//
+// Operations live in the `edubba` block below — call them as methods
+// on a Map<T> value (`m.set(k, v)`, `m.get(k, fb)`). The receiver may
+// be any lvalue path: `bag.items.set(k, v)`, `slots[i].m.set(k, v)`.
+// No `mut` Ident binding required.
 
 tablet Map<T> {
   keys:   tablets[64]str,
   values: tablets[64]T,
 }
 
-// Internal: index of `k`'s slot, or -1 if absent. Used by every
-// public lookup so the search stays in one place.
-fn map_index<T>(m: Map<T>, k: str) -> i64 {
-  mut i: i64 = 0
-  while i < m.keys.len {
-    if str_eq(m.keys[i], k) { yield i }
-    i += 1
+edubba Map<T> {
+  // O(1). Number of distinct keys in the map.
+  fn len(self) -> i64 {
+    self.keys.len
   }
-  -1
-}
 
-// Number of distinct keys in the map. O(1).
-fn map_len<T>(m: Map<T>) -> i64 {
-  m.keys.len
-}
-
-// True iff `k` is present.
-fn map_has<T>(m: Map<T>, k: str) -> bool {
-  map_index(m, k) >= 0
-}
-
-// Lookup with caller-supplied default. Returns the stored value when
-// `k` is present, otherwise `fallback`. The fallback is always
-// evaluated — design tradeoff for a langauge without sum-typed
-// Option in the stdlib yet.
-fn map_get<T>(m: Map<T>, k: str, fallback: T) -> T {
-  step idx: i64 = map_index(m, k)
-  if idx < 0 { yield fallback }
-  m.values[idx]
-}
-
-// Insert or update. If `k` already exists, the existing value slot
-// is overwritten in place. Otherwise a fresh (k, v) pair is appended
-// to the end of both backing tablets. Insertion order is preserved.
-fn map_set<T>(mut m: Map<T>, k: str, v: T) {
-  step idx: i64 = map_index(m, k)
-  if idx >= 0 {
-    m.values[idx] = v
-    yield
+  // Index of `k`'s slot in the parallel keys/values tablets, or -1
+  // if absent. Used internally by `get`, `has`, and `set`.
+  fn index(self, k: str) -> i64 {
+    mut i: i64 = 0
+    while i < self.keys.len {
+      if str_eq(self.keys[i], k) { yield i }
+      i += 1
+    }
+    -1
   }
-  m.keys.push(k)
-  m.values.push(v)
+
+  // True iff `k` is present.
+  fn has(self, k: str) -> bool {
+    self.index(k) >= 0
+  }
+
+  // Lookup with caller-supplied default. Returns the stored value when
+  // `k` is present, otherwise `fallback`. The fallback is always
+  // evaluated — design tradeoff for a langauge without sum-typed
+  // Option in the stdlib yet.
+  fn get(self, k: str, fallback: T) -> T {
+    step idx: i64 = self.index(k)
+    if idx < 0 { yield fallback }
+    self.values[idx]
+  }
+
+  // Insert or update. If `k` already exists, the existing value slot
+  // is overwritten in place. Otherwise a fresh (k, v) pair is appended
+  // to the end of both backing tablets. Insertion order is preserved.
+  fn set(mut self, k: str, v: T) {
+    step idx: i64 = self.index(k)
+    if idx >= 0 {
+      self.values[idx] = v
+      yield
+    }
+    self.keys.push(k)
+    self.values.push(v)
+  }
 }

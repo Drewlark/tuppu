@@ -239,20 +239,6 @@ INTRINSIC_NAMES = {
     "bytes_to_str", "buffer_to_str",
 }
 
-# Stdlib `Map<T>` exposes its free functions through method-call syntax.
-# `m.set(k, v)` becomes a call to `map_set` with `m` as the first arg —
-# the only mut method, lowered with the receiver as an lvalue pointer so
-# Field/Index receivers (`objs[o].items.set(k, v)`) work without binding
-# the map to a mut Ident. The other entries are pure reads. New stdlib
-# methods land here; the underlying free fn must already exist in
-# stdlib/map.tpu.
-_MAP_METHODS = {
-    "set":   "map_set",
-    "get":   "map_get",
-    "has":   "map_has",
-    "len":   "map_len",
-    "index": "map_index",
-}
 
 # The fixed set of operator-overload op names users may declare with
 # `gloss <op>(...)`. Each maps to the operator symbol it implements,
@@ -391,12 +377,15 @@ class Checker:
         self.dvec_elem_at_call: dict[int, "Ty"] = {}
         self.dvec_elem_at_index: dict[int, "Ty"] = {}
         self.dvec_elem_at_for: dict[int, "Ty"] = {}
-        # Method-call dispatch: when a stdlib tablet (e.g. `Map<T>`)
-        # exposes its free functions through method-call syntax, the
-        # checker resolves the receiver's type, picks the underlying
-        # free fn, and records the source name here for codegen. The
-        # mono args (if any) ride along on `mono_call_args` like a
-        # regular generic call.
+        # Method-call dispatch: when a tablet exposes operations through
+        # `edubba T<...> { fn ... }`, each method becomes a regular
+        # mangled fn (`<TypeName>__<method>`) and lands in this registry
+        # under its short name. `_tc_method_call` resolves a receiver's
+        # type to its method table, picks the mangled fn name, and
+        # records both the dispatch target on `method_dispatch_target`
+        # and the mono args (if any) on `mono_call_args` so codegen can
+        # emit the call exactly like a regular generic free fn call.
+        self.tablet_methods: dict[str, dict[str, str]] = {}
         self.method_dispatch_target: dict[int, str] = {}  # Call → fn name
         # Variadic calls: Call node id → synthesized TabletsLit holding
         # the collected trailing arguments. Codegen consults this to
@@ -456,6 +445,14 @@ class Checker:
                 self._resolve_struct_fields(d)
             elif isinstance(d, A.SealDecl):
                 self._resolve_seal_variants(d)
+        # Phase 0c: lower edubba blocks to flat FnDecls. By the time we
+        # reach the fn-signature phase, methods need to look like regular
+        # generic fns, so we splice them into `self.prog.decls` here and
+        # populate the method registry. The host tablet must exist (we
+        # validate against `self.structs` collected in 0a). The
+        # EdubbaDecl is dropped — every later phase iterates the new
+        # flat fns directly and never sees the wrapper.
+        self._lower_edubbas()
         # Phase 1: function signatures (parameter and return types can now
         # reference any struct). Colophons declare externs and join the
         # same fn table so call sites resolve uniformly. Gloss decls
@@ -514,6 +511,61 @@ class Checker:
             )
         self.structs[s.name] = TyStruct(name=s.name)
         self.struct_type_params[s.name] = tuple(s.type_params)
+
+    def _lower_edubbas(self) -> None:
+        """Splice each `edubba T<...> { fn ... }` block's methods into
+        the program's top-level decl list as flat FnDecls (with type
+        params copied from the host edubba) and register them in
+        `self.tablet_methods`. The EdubbaDecl wrapper is dropped — by
+        the time later phases iterate `self.prog.decls`, methods look
+        like ordinary generic free fns. Validation here:
+        - Host tablet must exist (registered in phase 0a).
+        - Edubba arity matches the tablet's type-param count.
+        - No two methods on the same tablet share a name.
+        - `mut self` is only allowed when the host tablet is itself
+          a struct codegen lowers to a mut-pointer parameter. (All
+          tablets currently qualify; the check is here so a future
+          built-in-only tablet shape gets a clear error.)
+        """
+        new_decls: list[A.Decl] = []
+        for d in self.prog.decls:
+            if not isinstance(d, A.EdubbaDecl):
+                new_decls.append(d)
+                continue
+            if d.type_name not in self.structs:
+                raise CheckError(
+                    f"edubba {d.type_name!r}: no tablet by that name",
+                    d.line, d.col,
+                )
+            host_params = self.struct_type_params.get(d.type_name, ())
+            if len(d.type_params) != len(host_params):
+                raise CheckError(
+                    f"edubba {d.type_name}: type-param arity {len(d.type_params)} "
+                    f"does not match tablet arity {len(host_params)}",
+                    d.line, d.col,
+                )
+            methods = self.tablet_methods.setdefault(d.type_name, {})
+            for m in d.methods:
+                # The parser mangled the method name as `<Type>__<name>`.
+                # Recover the short name for the registry.
+                if not m.name.startswith(f"{d.type_name}__"):
+                    raise CheckError(
+                        f"edubba {d.type_name}: malformed method name "
+                        f"{m.name!r} (compiler bug — parser should have "
+                        f"mangled this)",
+                        m.line, m.col,
+                    )
+                short = m.name[len(d.type_name) + 2:]
+                if short in methods:
+                    raise CheckError(
+                        f"edubba {d.type_name}: duplicate method "
+                        f"{short!r}",
+                        m.line, m.col,
+                    )
+                m.type_params = list(d.type_params)
+                methods[short] = m.name
+                new_decls.append(m)
+        self.prog.decls[:] = new_decls
 
     def _register_seal_name(self, s: A.SealDecl) -> None:
         if s.name in PRIM_TYPES:
@@ -1990,22 +2042,28 @@ class Checker:
                 f"dvec has no method {method!r}", e.line, e.col,
             )
 
-        # Stdlib `Map<T>` method dispatch — `m.set(k, v)`, `m.get(k, fb)`,
-        # `m.has(k)`, `m.len()`, `m.index(k)` route to the corresponding
-        # `map_*` free function. Receiver becomes the first arg; for the
-        # one mut method (`set`), codegen lowers the receiver as an lvalue
-        # pointer so `objs[o].items.set(k, v)` works without forcing the
-        # caller to bind the map to a mut Ident first.
-        if isinstance(recv_ty, TyStruct) and recv_ty.name == "Map":
-            if method in _MAP_METHODS:
+        # Method dispatch on a tablet receiver — `m.set(k, v)` resolves
+        # through `tablet_methods`, populated when the tablet's
+        # `edubba T { ... }` block was lowered. Receiver becomes the
+        # first arg; for mut methods codegen passes the lvalue pointer
+        # so receivers can be Field/Index paths without forcing the
+        # caller to bind to a mut Ident.
+        if (
+            isinstance(recv_ty, TyStruct)
+            and recv_ty.name in self.tablet_methods
+        ):
+            methods = self.tablet_methods[recv_ty.name]
+            if method in methods:
                 return self._tc_struct_method_dispatch(
-                    e, recv_ty, _MAP_METHODS[method],
+                    e, recv_ty, methods[method],
                 )
-            available = ", ".join(sorted(_MAP_METHODS))
-            raise CheckError(
-                f"Map has no method {method!r}; available: {available}",
-                e.line, e.col,
-            )
+            if methods:
+                available = ", ".join(sorted(methods))
+                raise CheckError(
+                    f"{recv_ty.name} has no method {method!r}; "
+                    f"available: {available}",
+                    e.line, e.col,
+                )
 
         # Struct field that happens to be a fn value — `obj.run(x)` is
         # not a method dispatch but a field-access-then-indirect-call.

@@ -53,6 +53,7 @@ class Tok(Enum):
     LOST = auto()
     COLOPHON = auto()    # reserved; no semantics yet (see NEXT.md)
     GLOSS = auto()       # emitted by `gloss` keyword — operator overload decl
+    EDUBBA = auto()      # emitted by `edubba` keyword — methods block
     COPY = auto()        # emitted by `copy` keyword — deep-clone prefix op
     TYPE_ALIAS = auto()  # emitted by `type` keyword — alias decl
 
@@ -155,6 +156,14 @@ KEYWORDS: dict[str, Tok] = {
     # for user types, mirroring the ancient scribal practice of
     # writing a gloss above a word to explain its reading.
     "gloss": Tok.GLOSS,
+    # `edubba T<...> { fn ... }` declares a methods block on a tablet.
+    # E2-DUB-BA-A was the Sumerian/Akkadian scribal school — literally
+    # "tablet-house" — where students learned to read, write, and
+    # operate on tablets. Methods on a type are the teachings of its
+    # edubba: a tablet holds the data, the edubba records what you
+    # can do with it. Multiple edubba blocks may be declared on the
+    # same tablet (different scribes, same tablet).
+    "edubba": Tok.EDUBBA,
     # `copy x` deep-clones a cleanup-bearing value into independent
     # ownership. Assyriological use: archival scribes made "copies" of
     # originals. Syntactic escape hatch under the freeze-while-borrow
