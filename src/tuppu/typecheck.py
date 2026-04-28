@@ -239,6 +239,30 @@ INTRINSIC_NAMES = {
     "bytes_to_str", "buffer_to_str",
 }
 
+# Names that are universally visible regardless of module context.
+# These are language-level: the built-in `str` tablet that the driver
+# auto-prepends, plus the keywords-but-actually-names like `lost`. The
+# primitive types (i64, bool, ...) are handled separately in
+# `_resolve_type` because they aren't stored in `self.structs`.
+BUILTIN_NAMES: set[str] = {"str"}
+
+
+def _mangle_module_name(module: tuple[str, ...], short: str) -> str:
+    """Compose a module-qualified flat name for the global symbol
+    tables. Built-in names (universally visible) and decls in the
+    root module are not mangled — they keep their short form so
+    single-source compiles, the auto-prepended `str` tablet, and
+    LLVM-level intrinsic / extern symbols all remain unambiguous.
+
+    Module segments are joined with `__` so the resulting symbol is a
+    valid C / LLVM identifier; the leading `__M_` distinguishes
+    compiler-mangled names from user-chosen ones (which can't start
+    with `__M_` because lex disallows the prefix? no — they can, but
+    by convention the user-namespace doesn't collide here)."""
+    if not module or short in BUILTIN_NAMES:
+        return short
+    return "__M_" + "__".join(module) + "__" + short
+
 
 # The fixed set of operator-overload op names users may declare with
 # `gloss <op>(...)`. Each maps to the operator symbol it implements,
@@ -430,39 +454,52 @@ class Checker:
         # phrasing in a few error messages; no longer load-bearing for
         # any escape rule (smart wedges trace through GC instead).
         self._fn_params: set[str] = set()
-        # Module support. Each top-level decl is associated with a
-        # dotted module path via `Program.module_of`. v1 keeps the
-        # global flat namespace (decls still must be uniquely named
-        # across the whole program) and uses module info for two
-        # things only: validating import paths against discovered
-        # modules, and checking visibility of `_`-prefixed names
-        # across module boundaries. v2 will move to per-module
-        # namespaces with module-prefixed mangling.
-        self._top_decl_module: dict[str, tuple[str, ...]] = {}
-        self._known_modules: set[tuple[str, ...]] = set()
-        # Updated at every top-level decl visit (signature registration
-        # and body checking). Reads of `_`-prefixed top-level names
-        # outside their declaring module raise a visibility error.
+
+        # --- module support --------------------------------------------
+        # Each top-level decl is tagged with its declaring module path
+        # via `Program.module_of`. Phase 0 builds per-module tables and
+        # all subsequent lookups go through them.
+
+        # All module paths that contributed at least one decl. The root
+        # module `()` is included implicitly so single-source compiles
+        # still resolve the auto-prepended `str` tablet.
+        self._known_modules: set[tuple[str, ...]] = {()}
+        # mod -> {short_name: decl}. Decls declared IN that module,
+        # by their parser-given short name. Includes `_`-prefixed
+        # private decls (visibility filtering happens at use-site).
+        self.module_decls: dict[tuple[str, ...], dict[str, A.Decl]] = {}
+        # mod -> {short_name: mangled_name}. The visible scope of each
+        # module: own decls + imports + universally-visible builtins.
+        # Lookups for top-level user names route through this table.
+        # `mangled_name` is what's keyed in `self.fns` / `self.structs`
+        # / `self.seals`. Builtins map to their unmangled form.
+        self.module_visible: dict[tuple[str, ...], dict[str, str]] = {}
+        # mod -> {alias: source_module_path}. Populated from
+        # `import x.y as z` (so `z.foo` becomes a module-qualified
+        # reference into module x.y at use sites).
+        self.module_aliases: dict[tuple[str, ...], dict[str, tuple[str, ...]]] = {}
+        # mod -> set of source modules referenced by wildcard `import x`
+        # (so `x.foo` works as a module-qualified reference). The
+        # wildcard form also pulls every public name into the local
+        # visible scope; this set just records that the prefix `x`
+        # itself is also valid as a qualifier.
+        self.module_qualified_refs: dict[tuple[str, ...], set[tuple[str, ...]]] = {}
+        # Updated at every top-level decl visit so name resolution
+        # knows whose visible scope to consult. Body-checking phases
+        # set this at the start of each fn / gloss; phase-0 already
+        # sets it per-decl.
         self.current_module: tuple[str, ...] = ()
 
     def _warn(self, message: str, line: int = 0, col: int = 0) -> None:
         self.warnings.append(CompileWarning(message=message, line=line, col=col))
 
     def check(self) -> None:
-        # Phase 0-pre: catalogue every module path that contributed at
-        # least one decl. This is the universe of valid `import` targets.
-        # Decls without a module entry (built-in injections, single-source
-        # tests) belong to the root module (empty tuple).
-        for d in self.prog.decls:
-            mod = self.prog.module_of.get(id(d), ())
-            self._known_modules.add(mod)
-        # Phase 0-imports: validate `import` / `from ... import` decls.
-        # Both forms must reference a known module. The `from x import y`
-        # form additionally requires `y` to be a top-level decl of `x`,
-        # and not private (`_`-prefixed). Names visible at this point
-        # via the current flat namespace satisfy v1; v2 will populate
-        # per-module local scopes from these decls.
-        self._validate_imports()
+        # Phase 0-modules: catalogue all module paths, validate imports,
+        # build per-module visible scopes (own decls + imports +
+        # universally-visible builtins). After this every later phase
+        # can resolve top-level names via `_resolve_top_level` and
+        # `_resolve_module_qualified`.
+        self._build_module_scopes()
         # Phase 0a: collect struct + seal names so type bodies can refer
         # to each other and to user types regardless of source order.
         # Aliases register their target AST eagerly; the target gets
@@ -472,13 +509,10 @@ class Checker:
             self.current_module = self.prog.module_of.get(id(d), ())
             if isinstance(d, A.StructDecl):
                 self._register_struct_name(d)
-                self._top_decl_module[d.name] = self.current_module
             elif isinstance(d, A.SealDecl):
                 self._register_seal_name(d)
-                self._top_decl_module[d.name] = self.current_module
             elif isinstance(d, A.AliasDecl):
                 self._register_alias(d)
-                self._top_decl_module[d.name] = self.current_module
         # Phase 0b: resolve fields (structs) and variants (seals) now
         # that all user type names are in scope.
         for d in self.prog.decls:
@@ -504,10 +538,8 @@ class Checker:
             self.current_module = self.prog.module_of.get(id(d), ())
             if isinstance(d, A.FnDecl):
                 self._register_fn(d)
-                self._top_decl_module[d.name] = self.current_module
             elif isinstance(d, A.ColophonDecl):
                 self._register_colophon(d)
-                self._top_decl_module[d.name] = self.current_module
             elif isinstance(d, A.GlossDecl):
                 self._register_gloss(d)
                 # Gloss decls don't expose a user-named top-level slot;
@@ -517,7 +549,6 @@ class Checker:
             self.current_module = self.prog.module_of.get(id(d), ())
             if isinstance(d, A.TableDecl):
                 self._register_table(d)
-                self._top_decl_module[d.name] = self.current_module
         for d in self.prog.decls:
             self.current_module = self.prog.module_of.get(id(d), ())
             if isinstance(d, A.FnDecl):
@@ -529,77 +560,201 @@ class Checker:
         # instance) start from a clean slate.
         self.current_module = ()
 
-    def _validate_imports(self) -> None:
-        """Walk every `ImportDecl` and check it points at a real module.
-        For `from x import y` form, also check `y` is a top-level decl
-        in module `x`, and that `y` isn't private (`_`-prefixed).
+    def _build_module_scopes(self) -> None:
+        """Build the per-module decl tables and visible scopes.
 
-        Per-module module-table assembly is deferred to v2; v1 keeps
-        the global flat namespace, so this validation is the only
-        semantic effect of an import for now. The visibility check on
-        `_`-prefixed names is enforced separately at every name
-        resolution site, so a missing import doesn't silently let
-        private names through."""
-        # Build module → set of public top-level decl names. Built-in
-        # injections (str) live in the root module and are always
-        # visible — the import system isn't gating them.
-        public_by_module: dict[tuple[str, ...], set[str]] = {}
+        Phase 0 of the checker. After this, every later phase can
+        consult `self.module_visible[mod]` to translate a short name
+        into the global mangled name keyed in `self.fns` /
+        `self.structs` / `self.seals` / etc.
+
+        Steps:
+
+        1. Catalogue every (module, short_name) pair from the program's
+           non-import top-level decls. This is `module_decls`.
+        2. Validate import paths and selected names. Unknown modules,
+           unknown names, and private (`_`-prefixed) names referenced
+           in `from ... import` forms are rejected here.
+        3. Build `module_visible` per module:
+             - own decls (including private)
+             - explicit imports (`from x import a [as b]`)
+             - explicit wildcard imports (`import x.y` — every public
+               name of x.y in scope; AND `y` registered as a qualifier
+               for module-qualified access)
+             - aliased imports (`import x.y as z` — only `z` registered
+               as a qualifier; no flat-name pollution)
+             - the universally-visible builtin `str`
+        4. Record module-qualifier aliases in `module_aliases` and
+           `module_qualified_refs` so module-qualified access (e.g.
+           `parser.parse(x)` after `import parser`) can resolve.
+        """
+        # Step 1: catalogue decls per module.
         for d in self.prog.decls:
-            mod = self.prog.module_of.get(id(d), ())
-            name = getattr(d, "name", None)
-            if not name or isinstance(d, (A.ImportDecl, A.GlossDecl, A.EdubbaDecl)):
+            if isinstance(d, A.ImportDecl):
                 continue
-            public_by_module.setdefault(mod, set()).add(name)
+            name = getattr(d, "name", None)
+            if not name:
+                continue
+            # Gloss and edubba decls don't expose top-level user-named
+            # symbols — gloss is type-dispatched (mangled internally),
+            # edubba is lowered to `<Type>__<method>` fns by phase 0c.
+            # Skip them for module-scope purposes.
+            if isinstance(d, (A.GlossDecl, A.EdubbaDecl)):
+                continue
+            mod = self.prog.module_of.get(id(d), ())
+            self._known_modules.add(mod)
+            decls = self.module_decls.setdefault(mod, {})
+            # Tolerate duplicates here — the per-decl-type registration
+            # phases (`_register_fn`, `_register_struct_name`, etc.)
+            # raise their own typed error messages that callers depend
+            # on for diagnostics. We just record the first one we see
+            # so module_visible has something to point at.
+            decls.setdefault(name, d)
 
+        # Initialize each known module's visible scope with its own
+        # decls. Mangled names route to global tables. Private decls
+        # (`_`-prefixed) are visible only within their declaring
+        # module — their entry lands here but not in any other
+        # module's scope.
+        for mod in self._known_modules:
+            scope = {}
+            for short in self.module_decls.get(mod, {}):
+                scope[short] = _mangle_module_name(mod, short)
+            # Builtins always visible.
+            for b in BUILTIN_NAMES:
+                scope.setdefault(b, b)
+            self.module_visible[mod] = scope
+            self.module_aliases[mod] = {}
+            self.module_qualified_refs[mod] = set()
+
+        # Step 2 + 3 + 4: process imports.
         for d in self.prog.decls:
             if not isinstance(d, A.ImportDecl):
                 continue
-            mod = tuple(d.path)
-            if mod not in self._known_modules:
+            importer = self.prog.module_of.get(id(d), ())
+            src_mod = tuple(d.path)
+            if src_mod not in self._known_modules:
                 pretty = ".".join(d.path)
                 raise CheckError(
                     f"unknown module {pretty!r} in import",
                     d.line, d.col,
                 )
+            src_decls = self.module_decls.get(src_mod, {})
+
             if d.names is None:
-                # Wildcard `import x.y` — nothing to validate per-name.
-                continue
-            exports = public_by_module.get(mod, set())
-            for src_name, _alias in d.names:
-                if src_name.startswith("_"):
-                    raise CheckError(
-                        f"cannot import private name {src_name!r} from "
-                        f"{'.'.join(d.path)!r} (names beginning with "
-                        f"'_' are private to their module)",
-                        d.line, d.col,
-                    )
-                if src_name not in exports:
-                    pretty = ".".join(d.path)
-                    raise CheckError(
-                        f"module {pretty!r} has no export named "
-                        f"{src_name!r}",
-                        d.line, d.col,
-                    )
+                # Wildcard `import x.y` (or `import x.y as z`).
+                if d.wildcard_alias is None:
+                    # Bring every public name into local scope.
+                    for short, _decl in src_decls.items():
+                        if short.startswith("_"):
+                            continue
+                        existing = self.module_visible[importer].get(short)
+                        new_mangled = _mangle_module_name(src_mod, short)
+                        if existing is not None and existing != new_mangled:
+                            raise CheckError(
+                                f"import of {short!r} from {pretty!r} "
+                                f"conflicts with an existing name in "
+                                f"this file",
+                                d.line, d.col,
+                            )
+                        self.module_visible[importer][short] = new_mangled
+                    # The last segment of the path is also registered
+                    # as a module-qualifier so `<seg>.foo` works at use
+                    # sites.
+                    last = src_mod[-1]
+                    self.module_aliases[importer][last] = src_mod
+                    self.module_qualified_refs[importer].add(src_mod)
+                else:
+                    # `import x.y as z` — alias-only. No flat-name
+                    # pollution; access is exclusively via `z.foo`.
+                    alias = d.wildcard_alias
+                    if alias in self.module_aliases[importer]:
+                        raise CheckError(
+                            f"duplicate import alias {alias!r}",
+                            d.line, d.col,
+                        )
+                    self.module_aliases[importer][alias] = src_mod
+                    self.module_qualified_refs[importer].add(src_mod)
+            else:
+                # `from x.y import a, b as c` — selective.
+                pretty = ".".join(d.path)
+                for src_name, alias in d.names:
+                    if src_name.startswith("_"):
+                        raise CheckError(
+                            f"cannot import private name {src_name!r} "
+                            f"from {pretty!r} (names beginning with "
+                            f"'_' are private to their module)",
+                            d.line, d.col,
+                        )
+                    if src_name not in src_decls:
+                        raise CheckError(
+                            f"module {pretty!r} has no export named "
+                            f"{src_name!r}",
+                            d.line, d.col,
+                        )
+                    local = alias or src_name
+                    new_mangled = _mangle_module_name(src_mod, src_name)
+                    existing = self.module_visible[importer].get(local)
+                    if existing is not None and existing != new_mangled:
+                        raise CheckError(
+                            f"import of {local!r} from {pretty!r} "
+                            f"conflicts with an existing name in this "
+                            f"file",
+                            d.line, d.col,
+                        )
+                    self.module_visible[importer][local] = new_mangled
+
+    def _resolve_top_level(self, short_name: str) -> str | None:
+        """Map a short name to its mangled global form via the current
+        module's visible scope. Returns None when the name isn't
+        visible — callers either fall back to other tables (locals,
+        intrinsics, primitives) or raise."""
+        scope = self.module_visible.get(self.current_module)
+        if scope is None:
+            return None
+        return scope.get(short_name)
+
+    def _resolve_module_qualified(
+        self, qualifier: str, short_name: str,
+    ) -> str | None:
+        """Resolve `qualifier.short_name` against the current module's
+        registered module aliases. Returns the mangled global name if
+        `qualifier` matches an `import x.y` (last segment) or
+        `import x.y as qualifier` entry AND `short_name` is a public
+        decl of that source module. Returns None otherwise."""
+        aliases = self.module_aliases.get(self.current_module, {})
+        src_mod = aliases.get(qualifier)
+        if src_mod is None:
+            return None
+        src_decls = self.module_decls.get(src_mod, {})
+        if short_name not in src_decls:
+            return None
+        if short_name.startswith("_"):
+            return None
+        return _mangle_module_name(src_mod, short_name)
 
     def _check_visibility(self, name: str, line: int, col: int) -> None:
-        """If `name` is a `_`-prefixed top-level decl declared in a
-        module other than `self.current_module`, raise. Names without
-        a module entry (built-ins, intrinsics, locals) are always
-        visible — only top-level user decls are subject to this check."""
+        """Cross-module visibility for `_`-prefixed names while the full
+        scope refactor is in progress. Once every lookup site routes
+        through `_resolve_top_level`, this becomes redundant — a private
+        name simply isn't in any other module's visible scope, so
+        resolution naturally fails. Until then this gate keeps the
+        contract explicit."""
         if not name.startswith("_"):
             return
-        decl_mod = self._top_decl_module.get(name)
-        if decl_mod is None:
-            return
-        if decl_mod == self.current_module:
-            return
-        here = ".".join(self.current_module) or "<root>"
-        there = ".".join(decl_mod) or "<root>"
-        raise CheckError(
-            f"name {name!r} is private to module {there!r} and not "
-            f"visible from module {here!r}",
-            line, col,
-        )
+        # Find which module declared this name (if any). The new module
+        # tables are the source of truth.
+        for mod, decls in self.module_decls.items():
+            if name in decls:
+                if mod != self.current_module:
+                    here = ".".join(self.current_module) or "<root>"
+                    there = ".".join(mod) or "<root>"
+                    raise CheckError(
+                        f"name {name!r} is private to module {there!r} "
+                        f"and not visible from module {here!r}",
+                        line, col,
+                    )
+                return
 
     # --- registration ------------------------------------------------
 

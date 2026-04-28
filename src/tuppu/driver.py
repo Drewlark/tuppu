@@ -90,11 +90,15 @@ def _module_path_for_label(label: str) -> tuple[str, ...]:
         /repo/stdlib/sub/foo.tpu           -> ('stdlib', 'sub', 'foo')
         /repo/src/parser.tpu               -> ('parser',)
         /repo/src/sema/typecheck.tpu       -> ('sema', 'typecheck')
-        /tmp/scratch.tpu                   -> ('scratch',)
-        <source>                           -> ()    (root module)
+        /tmp/a.tpu                         -> ()    (root — no anchor)
+        /tmp/b.tpu                         -> ()    (root — same)
+        <source>                           -> ()    (root)
 
-    Files outside any recognized root fall back to the file's stem as a
-    single-segment module."""
+    Files outside any recognized root (`stdlib/` or `src/`) all collapse
+    to the root module so multi-file scripts in tmp_path behave like
+    one program (matching the existing single-namespace expectation
+    test_multifile depends on). Project-shaped code that wants
+    real module isolation lives under `src/` or `stdlib/`."""
     if not label or label == "<source>":
         return ()
     p = Path(label)
@@ -113,8 +117,9 @@ def _module_path_for_label(label: str) -> tuple[str, ...]:
             return tuple(parts[i:])
         if seg == "src":
             return tuple(parts[i + 1:])
-    # No recognized root — use the file's stem as a single-segment module.
-    return (stem,)
+    # No recognized root — root module. Multi-file ad-hoc scripts share
+    # one namespace.
+    return ()
 
 
 def compile_sources_to_ir(sources: list[tuple[str, str]]) -> str:

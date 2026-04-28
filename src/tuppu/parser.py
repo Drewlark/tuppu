@@ -253,21 +253,25 @@ class Parser:
         ))
 
     def parse_import(self) -> A.ImportDecl:
-        """`import x.y.z` — wildcard form. Brings every public top-level
-        name from module `x.y.z` into the current file's scope. The
-        `import x as y` aliasing form is reserved for a future qualified-
-        access design and rejected here."""
+        """`import x.y.z` — wildcard form: every public top-level name
+        from `x.y.z` is brought into the current file's scope, AND the
+        last segment `z` becomes a module-qualifier (`z.foo` works at
+        use sites for module-qualified access).
+
+        `import x.y.z as w` — same as above but `w` (rather than `z`)
+        is the qualifier alias, and the wildcard names are NOT brought
+        into local scope (the alias is the only access path).
+        """
         start = self.eat(Tok.IMPORT)
         path = self._parse_module_path()
+        alias: str | None = None
         if self.check(Tok.AS):
-            t = self.peek()
-            raise ParseError(
-                "`import x as y` is not yet supported; use "
-                "`from x import name [as alias]` to rename individual "
-                "imports",
-                t.line, t.col,
-            )
-        return _at(start, A.ImportDecl(path=path, names=None))
+            self.advance()
+            alias_tok = self.eat(Tok.IDENT, "alias name after 'as'")
+            alias = alias_tok.value
+        return _at(start, A.ImportDecl(
+            path=path, names=None, wildcard_alias=alias,
+        ))
 
     def parse_from_import(self) -> A.ImportDecl:
         """`from x.y import a, b as c` — selective form. Brings only the

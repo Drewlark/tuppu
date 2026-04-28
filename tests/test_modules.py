@@ -68,10 +68,14 @@ def test_parser_from_import_with_aliases():
     assert imp.names == [("Map", None), ("get", "map_get")]
 
 
-def test_parser_rejects_import_as_alias():
-    # `import x as y` is reserved for future qualified-access design.
-    with pytest.raises(Exception):
-        parse(lex("import stdlib.list as l\nfn main() -> i32 { 0 }\n"))
+def test_parser_import_as_alias():
+    # `import x.y as z` parses and stores the alias on the ImportDecl.
+    prog = parse(lex("import stdlib.list as l\nfn main() -> i32 { 0 }\n"))
+    imp = prog.decls[0]
+    assert isinstance(imp, A.ImportDecl)
+    assert imp.path == ["stdlib", "list"]
+    assert imp.names is None
+    assert imp.wildcard_alias == "l"
 
 
 def test_parser_dotted_module_path():
@@ -105,9 +109,13 @@ def test_module_path_for_synthetic_source():
     assert _module_path_for_label("") == ()
 
 
-def test_module_path_unrooted_fallback():
-    # No 'src' or 'stdlib' anchor — fall back to the file stem.
-    assert _module_path_for_label("/tmp/scratch.tpu") == ("scratch",)
+def test_module_path_unrooted_falls_to_root():
+    # No 'src' or 'stdlib' anchor — collapse to root module so multi-
+    # file scripts in tmp_path share one namespace (matches the
+    # existing test_multifile expectations).
+    assert _module_path_for_label("/tmp/scratch.tpu") == ()
+    assert _module_path_for_label("/tmp/a.tpu") == ()
+    assert _module_path_for_label("/tmp/b.tpu") == ()
 
 
 # --- import validation ----------------------------------------------------
