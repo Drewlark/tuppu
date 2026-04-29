@@ -668,3 +668,33 @@ fn main() -> i32 {
     rc, stdout = run(src, tmp_path, stress)
     assert rc == 0
     assert stdout == b"999\n"
+
+
+def test_ivec_indexed_through_struct_field(tmp_path, stress):
+    """Indexing an `ivec<T>` accessed via a struct field used to error
+    with 'indexing is only supported on tables, tablets, and str' —
+    `_gen_index`'s Ident fast path didn't fire for Field targets, and
+    the SSA-value fallback only had branches for tablets and str.
+    Same gap fired inside an `edubba` method (`self.v[i]`)."""
+    src = """
+tablet Box {
+  v: ivec<i64>
+}
+
+edubba Box {
+  fn first(self) -> i64 { self.v[0] }
+  fn at(self, i: i64) -> i64 { self.v[i] }
+}
+
+fn main() -> i32 {
+  mut b: Box
+  b.v.push(40)
+  b.v.push(2)
+  step a: i64 = b.first()       // through edubba method
+  step c: i64 = b.v[1]          // direct field-routed index
+  step d: i64 = b.at(1)         // edubba method with index expr
+  (a + c + d) as i32
+}
+"""
+    rc, stdout = run(src, tmp_path, stress)
+    assert rc == 44

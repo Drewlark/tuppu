@@ -413,8 +413,32 @@ class AccessMixin:
                     self._get_tablets_get(info), [slot, idx],
                 )
                 return self._read_borrow(val)
+            # ivec / dvec value flowing in as a Field load (e.g.
+            # `self.v[0]` inside an edubba method, or `b.v[i]` from
+            # the outside). The dispatched helpers handle the SSA-
+            # input case internally (spill to a stack slot when the
+            # incoming `var.ir_ref` isn't already a pointer); we just
+            # need to wrap the value in a `Variable` shape. The elem
+            # type comes from the typecheck sideband stamped at
+            # `_tc_index`.
+            if self._is_ivec_value(target.type):
+                elem_ty = self._ivec_elem_for_index(e)
+                if elem_ty is not None:
+                    iv_info = self._get_ivec(elem_ty)
+                    fake_var = Variable(
+                        is_mut=False, ir_ref=target, value_ty=target.type,
+                    )
+                    return self._gen_ivec_index(iv_info, fake_var, e.index)
+            if self._is_dvec_value(target.type):
+                elem_ty = self._dvec_elem_for_index(e)
+                if elem_ty is not None:
+                    dv_info = self._get_dvec(elem_ty)
+                    fake_var = Variable(
+                        is_mut=False, ir_ref=target, value_ty=target.type,
+                    )
+                    return self._gen_dvec_index(dv_info, fake_var, e.index)
 
-        raise CodegenError("indexing is only supported on tables, tablets, and str")
+        raise CodegenError("indexing is only supported on tables, tablets, str, ivec, and dvec")
 
     def _gen_slice(self, e: A.Slice) -> ir.Value:
         """Lower `s[lo:hi]` (and its elided variants) to a call into
