@@ -1,0 +1,23 @@
+// Edubba method-dispatch microbench. Counter.bump() is a tiny leaf
+// method; under -O2 it should fully inline once the gcroot blockage
+// is gone, leaving a counter-increment loop with no call overhead.
+// 1M iterations gives us ~ms-resolution timing.
+
+tablet Counter { n: i64 }
+
+edubba Counter {
+  fn bump(mut self) {
+    self.n = self.n + 1
+  }
+}
+
+fn main() -> i32 {
+  mut c = Counter { n: 0 }
+  mut i: i64 = 0
+  while i < 1000000 {
+    c.bump()
+    i = i + 1
+  }
+  println(c.n)
+  0
+}

@@ -1,0 +1,25 @@
+// Edubba inline target with GC-bearing field. The Counter from
+// inline.tpu has only an i64 — no GC roots emitted, so the
+// shadow-vs-llvm comparison only measures call-overhead. This
+// version adds a str field so each `bump` would, under shadow mode,
+// pay for push_root + pop_roots per call. Under llvm mode the
+// gcroot lives in the entry block and the body inlines.
+
+tablet Tagged { count: i64, label: str }
+
+edubba Tagged {
+  fn bump(mut self) {
+    self.count = self.count + 1
+  }
+}
+
+fn main() -> i32 {
+  mut t = Tagged { count: 0, label: "ticker" }
+  mut i: i64 = 0
+  while i < 1000000 {
+    t.bump()
+    i = i + 1
+  }
+  println(t.count)
+  0
+}

@@ -1,0 +1,14 @@
+// Recursion microbench. fib(35) = 9_227_465. Used as the call-overhead
+// reference: every call goes through stack-frame setup + ret. The
+// migration target is whatever opt does to the leaf path once the
+// gcroot-vs-push/pop blockage is removed.
+
+fn fib(n: i64) -> i64 {
+  if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+fn main() -> i32 {
+  // Print so dead-code-elim can't fold the call away.
+  println(fib(35))
+  0
+}

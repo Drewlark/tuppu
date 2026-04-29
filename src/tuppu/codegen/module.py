@@ -469,6 +469,14 @@ class ModuleMixin:
         entry = llvm_fn.append_basic_block("entry")
         self.builder = ir.IRBuilder(entry)
         self.scopes = [{}]
+        # Save outer fn's pending-gcroot state and start fresh; mono
+        # specializations call `_gen_fn_body` re-entrantly from inside
+        # an outer fn's body, and we must not let inner pending entries
+        # leak into the outer fn's entry-block emission.
+        saved_pending_gcroots = self._pending_gcroots
+        saved_per_frame_slots = self._gc_root_slots_per_frame
+        self._pending_gcroots = []
+        self._gc_root_slots_per_frame = []
 
         # Params live in a dedicated cleanup frame that wraps the fn body.
         # A mut str param needs release at scope exit so a reassignment
@@ -589,6 +597,12 @@ class ModuleMixin:
                 self.builder.ret(coerced)
         finally:
             self._pop_cleanup_frame()
+            # Emit any queued @llvm.gcroot calls into the entry block
+            # — must happen BEFORE we restore the outer pending list,
+            # since `_finalize_pending_gcroots` reads from `self`.
+            self._finalize_pending_gcroots(llvm_fn)
+            self._pending_gcroots = saved_pending_gcroots
+            self._gc_root_slots_per_frame = saved_per_frame_slots
 
     def _block_tail_expr(self, e: "A.Expr") -> "A.Expr | None":
         """Find the source expression for a fn/block's tail value, if

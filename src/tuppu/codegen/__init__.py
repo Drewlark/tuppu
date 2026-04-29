@@ -21,12 +21,27 @@ from .. import ast as A
 from ..comptime import Comptime, ComptimeError
 from ._common import (
     CodegenError,
+    get_gc_framework,
     I1, I8, I16, I32, I64,
     INTRINSICS, INT_WIDTH,
     RAT, SEX, SEX_MAX_DIGITS,
     SEX_IDX_DIGITS, SEX_IDX_RADIX, SEX_IDX_COUNT, SEX_IDX_SIGN,
     TabletsInfo, Variable,
 )
+
+
+# Sentinel tag value for empty / cleared seal slots in `llvm` GC
+# framework mode. Any slot rooted via `@llvm.gcroot` is rooted for
+# the function's full lifetime; we mark a slot as "empty — do not
+# trace" by writing this byte at the tag offset, and the codegen-
+# emitted seal trace fns short-circuit on it. The choice of 0xFF
+# is structural: no real seal in the language can have 256 variants
+# (variant indexing is i8, but we'd run out of space long before),
+# so 0xFF can't collide with a live tag. Using a sentinel rather
+# than zero-clearing keeps slot-clear cost at one store while
+# being safe regardless of the per-seal "is variant 0 trace-safe
+# under zero payload" property that zero-clearing would rely on.
+GC_SEAL_EMPTY_TAG = 0xFF
 from .access import AccessMixin
 from .dvec import DVecMixin
 from .expr import ExprMixin
@@ -117,8 +132,47 @@ class Codegen(
         # Mirrors the scope stack — same push/pop cadence.
         self._cleanup_frames: list[list[tuple[ir.Function, ir.Value, str]]] = []
         # Parallel to _cleanup_frames: count of GC roots pushed into
-        # the innermost frame, popped at frame exit.
+        # the innermost frame, popped at frame exit. Used in `shadow`
+        # GC mode to balance push_root / pop_roots; in `llvm` mode
+        # it counts the same per-frame roots, but the pop site emits
+        # slot-clear stores instead (see `_gc_root_slots_per_frame`).
         self._gc_root_counts: list[int] = []
+        # Parallel to _cleanup_frames in `llvm` GC mode: each frame
+        # carries the list of (slot, kind, value_ty) tuples whose
+        # contents must be sentinel-cleared at frame exit. `kind`
+        # is one of "seal" / "scalar" / "wedge" — drives whether we
+        # write the 0xFF tag, zero-fill the slot, or null the wedge
+        # ptr. Empty in `shadow` mode (the count is sufficient there).
+        self._gc_root_slots_per_frame: list[list[tuple[ir.Value, str, ir.Type]]] = []
+        # GC mode (frozen at codegen construction time — set via the
+        # TUPPU_GC_FRAMEWORK env var). `shadow` keeps the legacy
+        # push/pop array; `llvm` switches to @llvm.gcroot + shadow-
+        # stack strategy. Read by `_register_gc_root` and
+        # `_emit_gc_frame_pop` to dispatch. See _common.py for
+        # rationale. Re-read per-instance so a single test process
+        # can sweep both modes by toggling env var between compiles.
+        self._gc_mode = get_gc_framework()
+        # `llvm` mode: pending @llvm.gcroot calls to emit at the
+        # entry block once the fn body is fully generated. Each entry
+        # is (shadow_slot, real_slot, descriptor_global, kind, value_ty).
+        # `shadow_slot` is an i8* alloca whose stored value is the
+        # i8*-cast address of the real (struct-shaped) slot — that's
+        # what gcroot wants. The runtime sees `*shadow_slot ==
+        # &real_slot` and dispatches via the descriptor's trace_fn.
+        # Reset at fn-entry; finalized by `_finalize_pending_gcroots`.
+        self._pending_gcroots: list[tuple[
+            ir.Value, ir.Value, ir.GlobalVariable, str, ir.Type,
+        ]] = []
+        # Set of LLVM fn objects that need the `gc "shadow-stack"`
+        # attribute injected during the IR-text post-process pass
+        # (llvmlite doesn't expose Function.gc directly). Populated
+        # by `_finalize_pending_gcroots` only for fns that actually
+        # registered at least one gcroot — fns without roots get no
+        # attribute so the strategy emitter doesn't insert empty
+        # StackEntries. See driver._inject_gc_strategy.
+        self._fns_needing_gc_attr: set[str] = set()
+        # `llvm` mode: lazy-declared @llvm.gcroot intrinsic.
+        self._llvm_gcroot: ir.Function | None = None
         # Tracks the slot the most recent `_force_root_cleanup_value`
         # call registered (or None if it didn't register one — borrow
         # source, helper-fn emission, no descriptor). Reset on entry to
@@ -970,29 +1024,254 @@ class Codegen(
         return desc
 
     def _emit_gc_push_root(self, slot: ir.Value, value_ty: ir.Type) -> bool:
-        """Emit a `__tuppu_gc_push_root(slot, type_desc)` call if the
-        type has pointer fields to trace. Returns True on emit so the
-        caller can count how many pops are needed at frame exit."""
+        """Register a stack slot as a GC root.
+
+        In `shadow` mode: emits an inline `__tuppu_gc_push_root(slot,
+        &type_desc)` call at the current builder position. The matching
+        pop_roots(n) at frame exit balances out — see `_emit_gc_pop_roots`.
+
+        In `llvm` mode: queues an `@llvm.gcroot(shadow_slot,
+        descriptor_meta)` for emission in the fn's entry block. Also
+        emits an inline "safe-state" store at the current builder
+        position so the slot is trace-safe before any subsequent GC
+        trigger. The slot is rooted for the fn's full lifetime; clearing
+        at the original pop site is handled by `_emit_gc_pop_roots`.
+
+        Returns True if a root was registered (the type had traceable
+        pointer fields), False otherwise so the caller skips
+        bookkeeping."""
         desc = self._get_type_desc(value_ty)
         if desc is None:
             return False
         b = self.builder
         assert b is not None
-        b.call(
-            self._get_gc_push_root(),
-            [
-                b.bitcast(slot, I8.as_pointer()),
-                b.bitcast(desc, I8.as_pointer()),
-            ],
-        )
+        if self._gc_mode == "shadow":
+            b.call(
+                self._get_gc_push_root(),
+                [
+                    b.bitcast(slot, I8.as_pointer()),
+                    b.bitcast(desc, I8.as_pointer()),
+                ],
+            )
+            return True
+        kind = "seal" if (
+            isinstance(value_ty, ir.IdentifiedStructType)
+            and self._seal_key_for_ty(value_ty) is not None
+        ) else "scalar"
+        self._queue_gcroot(slot, desc, kind, value_ty)
         return True
 
     def _emit_gc_pop_roots(self, n: int) -> None:
+        """Mark the most recently rooted N slots as no-longer-live.
+
+        In `shadow` mode: emits the matching `__tuppu_gc_pop_roots(n)`
+        call so the runtime's flat array stops scanning them.
+
+        In `llvm` mode: emits a slot-clear store for each — `tag = 0xFF`
+        for seal slots, zero-fill for everything else. The gcroot
+        intrinsic still keeps the slot rooted for the fn lifetime, but
+        the trace fns short-circuit on the sentinel so a stale entry
+        contributes nothing to the mark phase."""
         if n <= 0:
             return
         b = self.builder
         assert b is not None
-        b.call(self._get_gc_pop_roots(), [ir.Constant(I64, n)])
+        if self._gc_mode == "shadow":
+            b.call(self._get_gc_pop_roots(), [ir.Constant(I64, n)])
+            return
+        # `llvm` mode: walk the innermost frame's slot list, peel off
+        # the last n entries (in registration order — outermost first),
+        # and emit a sentinel-clear for each. We iterate the per-frame
+        # list in reverse so the most-recent registration clears first.
+        if not self._gc_root_slots_per_frame:
+            return
+        slots = self._gc_root_slots_per_frame[-1]
+        if not slots:
+            return
+        to_clear = slots[-n:] if n <= len(slots) else slots[:]
+        for slot, kind, value_ty in to_clear:
+            self._emit_slot_clear(slot, kind, value_ty)
+
+    # ------------------------------------------------------------------
+    # `llvm` GC mode helpers
+    # ------------------------------------------------------------------
+
+    def _get_llvm_gcroot(self) -> ir.Function:
+        """`@llvm.gcroot(i8** %ptrloc, i8* %metadata)` — the LLVM
+        framework intrinsic. The slot must be an `i8**`-typed alloca
+        the strategy emitter rewrites to a slot inside the fn's
+        StackEntry; metadata is opaque (we pass our type descriptor's
+        i8*-cast address) and ends up in `FrameMap::Meta[]` for the
+        runtime walker to dispatch on."""
+        if self._llvm_gcroot is None:
+            fty = ir.FunctionType(
+                ir.VoidType(), [I8.as_pointer().as_pointer(), I8.as_pointer()],
+            )
+            self._llvm_gcroot = self._get_or_declare_libc(
+                "llvm.gcroot", fty,
+            )
+        return self._llvm_gcroot
+
+    def _queue_gcroot(
+        self, real_slot: ir.Value, desc: ir.GlobalVariable,
+        kind: str, value_ty: ir.Type,
+    ) -> None:
+        """Queue a `@llvm.gcroot` for fn-entry emission, alongside the
+        shadow slot setup and cleanup-frame bookkeeping. The actual
+        gcroot intrinsic call AND the init slot-clear are deferred
+        to `_finalize_pending_gcroots` so they both land at the start
+        of the entry block — before any user store could observe the
+        slot. Emitting the init-clear at the current builder position
+        (which is mid-body, AFTER the chokepoint's store-to-slot)
+        would overwrite live data; that was the v0.4.2-prerelease bug.
+
+        `kind` ∈ {seal, scalar, wedge} drives the matching slot-clear
+        at every pop site. The shadow slot store DOES happen at the
+        current position — we need `*shadow_slot = &real_slot` to be
+        true by the time the first GC could fire after registration,
+        which is here. The fn-entry init-clear handles the "GC fires
+        before this point" hazard separately."""
+        b = self.builder
+        assert b is not None
+        # Allocate the shadow i8* slot in the entry block and stash the
+        # real slot's address there. The strategy emitter rewrites this
+        # alloca to point into the fn's StackEntry — that's how the
+        # runtime walker reads the value out at mark time.
+        shadow_slot = self._alloca_entry(I8.as_pointer(), "gc.shadow")
+        b.store(b.bitcast(real_slot, I8.as_pointer()), shadow_slot)
+        self._pending_gcroots.append(
+            (shadow_slot, real_slot, desc, kind, value_ty),
+        )
+        # Per-frame slot list: each `_emit_gc_pop_roots(n)` site walks
+        # this to know which slots to sentinel-clear.
+        if self._gc_root_slots_per_frame:
+            self._gc_root_slots_per_frame[-1].append(
+                (real_slot, kind, value_ty),
+            )
+
+    def _emit_slot_clear(
+        self, slot: ir.Value, kind: str, value_ty: ir.Type,
+    ) -> None:
+        """Write the sentinel "no-trace" state into a rooted slot.
+        Drives the always-rooted-hazard strategy: in `llvm` mode every
+        slot stays rooted for the fn lifetime, so we need the *contents*
+        to read as empty whenever the fn isn't actively using it.
+
+        - `seal`: store 0xFF at the tag byte (offset 0). Generated
+          seal trace fns dispatch on tag and short-circuit on this
+          sentinel (see seals.py:_get_seal_trace_fn).
+        - `wedge`: store NULL at the slot. `mark_wedge(NULL)` no-ops.
+        - `scalar`: zero-fill the whole slot via memset. Pointer fields
+          read as NULL, which is null-safe for `mark_ptr`."""
+        b = self.builder
+        assert b is not None
+        if kind == "seal":
+            # Tag byte at slot offset 0. The seal type is
+            # `{i8 tag, [N x i64] payload}`; we write only the tag.
+            tag_ptr = b.bitcast(slot, I8.as_pointer())
+            b.store(ir.Constant(I8, GC_SEAL_EMPTY_TAG), tag_ptr)
+            return
+        if kind == "wedge":
+            # The slot holds a `T*` (the wedge value); store a null of
+            # the same pointee type so llvmlite's type-checker is
+            # happy. mark_wedge(NULL) is a no-op.
+            null = ir.Constant(slot.type.pointee, None)
+            b.store(null, slot)
+            return
+        # `scalar`: zero-fill the whole slot. memset is the simplest
+        # path — doing one store per pointer field would also work
+        # but adds codegen complexity for marginal IR savings.
+        size = self._size_of(value_ty)
+        if size == 0:
+            return
+        slot_i8 = b.bitcast(slot, I8.as_pointer())
+        b.call(
+            self._get_memset(),
+            [slot_i8, ir.Constant(I8, 0), ir.Constant(I64, size),
+             ir.Constant(I1, False)],
+        )
+
+    def _get_memset(self) -> ir.Function:
+        """`@llvm.memset.p0i8.i64(i8* dst, i8 val, i64 len, i1 isvolatile)`
+        — used by `_emit_slot_clear` to zero a rooted slot at every
+        pop site in `llvm` GC mode."""
+        existing = self.module.globals.get("llvm.memset.p0i8.i64")
+        if isinstance(existing, ir.Function):
+            return existing
+        fty = ir.FunctionType(
+            ir.VoidType(),
+            [I8.as_pointer(), I8, I64, I1],
+        )
+        return ir.Function(self.module, fty, "llvm.memset.p0i8.i64")
+
+    def _finalize_pending_gcroots(self, llvm_fn: ir.Function) -> None:
+        """Emit all queued `@llvm.gcroot` calls into the entry block,
+        immediately after the alloca prologue. Called at fn body end
+        once the full pending set is known. Also marks `llvm_fn` for
+        the IR-text post-processor's `gc "shadow-stack"` attribute
+        injection if any roots were queued — fns without roots get no
+        attribute so the strategy emitter skips per-call StackEntry
+        bookkeeping for them."""
+        if self._gc_mode != "llvm":
+            self._pending_gcroots = []
+            return
+        if not self._pending_gcroots:
+            return
+        # Mark the fn for the gc-attribute post-process.
+        self._fns_needing_gc_attr.add(llvm_fn.name)
+        # Position at the end of the entry block, before its terminator
+        # (if any — usually the entry block just falls through to the
+        # next, so it has no terminator yet at the point this runs).
+        entry = llvm_fn.entry_basic_block
+        b = ir.IRBuilder(entry)
+        # Position the builder right after the entry block's last
+        # alloca. We walk forwards until we hit the first non-alloca
+        # instruction — that's where gcroot calls go. (The strategy
+        # emitter requires gcroot calls to dominate every use; emitting
+        # in the entry block satisfies this.)
+        insert_pos = None
+        for inst in entry.instructions:
+            if not isinstance(inst, ir.AllocaInstr):
+                insert_pos = inst
+                break
+        if insert_pos is None:
+            # Entry block is all-allocas (or empty) — append at the end.
+            b.position_at_end(entry)
+        else:
+            b.position_before(insert_pos)
+        intrinsic = self._get_llvm_gcroot()
+        # Save / restore self.builder so callees in the loop (notably
+        # `_emit_slot_clear`'s memset path) emit at the entry-block
+        # position, not whatever stale position the body finalize
+        # left. We're about to be torn down anyway, but keeping the
+        # mutation contained makes the code less fragile.
+        saved_builder = self.builder
+        self.builder = b
+        try:
+            for shadow_slot, real_slot, desc, kind, value_ty in self._pending_gcroots:
+                # @llvm.gcroot's metadata operand must be a constant —
+                # using `b.bitcast(desc, ...)` would emit a runtime
+                # cast and trip the verifier. `desc.bitcast(...)`
+                # returns a ConstantExpr which the verifier accepts.
+                b.call(
+                    intrinsic,
+                    [
+                        shadow_slot,
+                        desc.bitcast(I8.as_pointer()),
+                    ],
+                )
+                # Init-clear the real slot at fn entry so the slot's
+                # contents read as "empty / no-trace" before any user
+                # code runs. Without this, the slot is undef-memory
+                # (alloca semantics) and a GC firing before the
+                # chokepoint's store would see garbage. The user's
+                # actual store later overwrites the zero/sentinel —
+                # one wasted store per rooted slot, paid once per
+                # fn entry. Cheap.
+                self._emit_slot_clear(real_slot, kind, value_ty)
+        finally:
+            self.builder = saved_builder
+        self._pending_gcroots = []
 
     def _get_write(self) -> ir.Function:
         if self._write is None:
