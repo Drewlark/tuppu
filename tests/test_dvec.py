@@ -241,3 +241,33 @@ fn main() -> i32 {
     rc, stdout = run(src, tmp_path, stress)
     assert rc == 0
     assert stdout == b"42\n"
+
+
+def test_dvec_indexed_through_struct_field(tmp_path):
+    """Parallel to the ivec field-routed-index regression: a `dvec<T>`
+    accessed via a struct field (or `self.v` in an edubba method)
+    used to error in the `_gen_index` fallback because only tablets
+    and str had SSA-value branches there."""
+    import os, subprocess
+    from tuppu.driver import compile_files_to_binary, stdlib_files
+    src = """
+tablet Box {
+  v: dvec<i64>
+}
+
+edubba Box {
+  fn first(self) -> i64 { self.v[0] }
+}
+
+fn main() -> i32 {
+  mut b: Box
+  b.v.push(40)
+  b.v.push(2)
+  (b.first() + b.v[1]) as i32
+}
+"""
+    user = tmp_path / "main.tpu"
+    user.write_text(src)
+    binary = compile_files_to_binary(stdlib_files() + [user], tmp_path, name="prog")
+    r = subprocess.run([str(binary)], capture_output=True)
+    assert r.returncode == 42
