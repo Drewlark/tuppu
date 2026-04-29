@@ -1243,6 +1243,113 @@ rough edge. File as a medium-priority cleanup.
   arg. Blocked on having some pointer-to-primitive story.
 
 
+## 8. GC framework migration — the inlining unlock
+
+**Forcing function** (2026-04-29 community report): edubba methods
+are markedly slower than the previous free-fn implementation
+because no LLVM optimization passes run on Tuppu-emitted IR.
+Every method call pays for: function prologue, GC-root push for
+each cleanup-bearing param, the body, GC-root pops, return.
+Locals that cross any GC-trigger point stay as alloca'd slots
+because mem2reg can't promote a slot that's been handed to
+`__tuppu_gc_push_root`.
+
+This migration was always Phase 3 of the original GC plan
+(`0bb32b8` GC migration plan: restage as 3 phases). Edubba's
+per-call cost is what's making it the next milestone instead of
+a later one — methods amplify the overhead because each call
+closes over `mut self` plus arguments, and the spill pattern
+multiplies through every dispatch.
+
+**Headline shape.** Replace our hand-rolled `__tuppu_gc_push_root`
+/ `__tuppu_gc_pop_roots` shadow stack with LLVM's first-class GC
+framework: `gc "shadow-stack"` fn attribute + `@llvm.gcroot`
+intrinsic. Once LLVM knows which allocas are roots, the
+optimization passes preserve them automatically. Then `-O2` on
+in `emit_object` and the spill goes away — fns inline, mem2reg
+promotes locals to registers, TCO fires on tail calls, instcombine
+runs.
+
+**Phases (atomic — must land together):**
+
+1. **Codegen — replace push/pop with `@llvm.gcroot`.** Queue
+   `(slot, typedesc)` pairs at `_register_gc_root` instead of
+   emitting push_root at the production site; flush them at the
+   entry block right after the matching alloca during fn-body
+   finalize. Drop pop_roots calls; replace with slot-clearing
+   stores at scope-exit boundaries (the always-rooted hazard,
+   below). ~130 lines.
+
+2. **Codegen — `gc "shadow-stack"` attribute.** Set on every
+   emitted Tuppu fn (user fns + helper-emit paths). Colophon
+   externs don't get it. ~10 lines.
+
+3. **Runtime — walk `llvm_gc_root_chain`** instead of our shadow
+   stack. `tuppu_gc_mark_roots` rewritten to iterate LLVM's
+   linked list; the `(slot, typedesc)` shape is preserved. The
+   custom shadow-stack push/pop helpers become callable-but-no-op
+   (or get deleted entirely). ~80 lines net (more deleted than
+   added).
+
+4. **Verification + benchmarks.** Full suite under `-O0`, then
+   `-O2`. `TUPPU_GC_STRESS=1 -O2 lua_interp` is the canary.
+   New edubba-specific benchmark (1M `Counter.bump()` calls in
+   a tight loop) for the community-reported regression.
+
+**Always-rooted hazard.** With push/pop, the GC saw a slot only
+during the push-pop window. With `@llvm.gcroot`, the slot is
+rooted from fn entry to fn exit unconditionally — including
+before the first store, between loop iterations after a logical
+"consume," and past the last logical use. For str/tablets/struct
+this is fine (zero-init traces no pointers). **For seals it's
+not** — the payload is a `[N x i64]` blob and tracing dispatches
+on the tag; a stale tag from a prior iteration combined with
+garbage in the payload mis-dispatches. Fix: zero the slot
+(`{tag=0, payload=[0]*N}`) at every scope-exit boundary that
+today emits `pop_roots`. Variant 0 of every seal traces no
+pointers (or exactly the pointer fields the zero payload would
+have), so this is sound regardless of the seal's actual variant
+set. Cost: one struct-zero store per slot per logical-end-of-life.
+
+**The codegen is already mem2reg-friendly.** Audit on 2026-04-29
+confirmed every GC-traced slot in user-fn-body lowering goes
+through `_alloca_entry` (entry-block hoist). All 20 raw
+`b.alloca(...)` calls live inside helper-fn emitters that open
+with their own `entry = fn.append_basic_block("entry")` /
+`b = ir.IRBuilder(entry)`. So the "hoist mid-body allocas"
+worry from earlier framings is mostly air — the real Phase 1
+lift is the gcroot-annotation side.
+
+**Estimate.** ~220 lines net (130 + 10 + 80). 2-3 focused days
+for the migration plus 0-3 days of `-O2` shake-out for any
+SROA-class hazards that surface beyond the seal one (none
+currently expected, but the prior SROA experiment proved one
+exists, so plan for sibling cases). Pessimistic ceiling: one
+focused week.
+
+**Expected wins** (educated guesses; the point of doing the
+work is to measure them):
+
+- fib(35): 30-50% cycle reduction from inlining + register
+  promotion + tail-call optim.
+- str concat loop: 10-20% from instcombine / loop simplification.
+- lua_interp: 30-50% from inlining the hot eval/exec paths.
+- struct copy: 20-40% from SROA splitting structs into registers.
+- **Edubba method calls (the forcing function):** 2-5× on tight
+  loops. Trivial leaves (`first`, `bump`) inline to near-zero
+  cost; large bodies (`Map::set`) get less.
+
+**Closes** the LIMITATIONS.md "no LLVM optimization passes can
+run" blocker. Unblocks every other perf story that depends on
+opt passes — closures (with capture inlining), region
+allocation, the existing root-elision and stack-alloc Stage-3
+opt items.
+
+**Owner / status:** unassigned; planned, not started. Source of
+truth for the implementation lives in the gitignored `GC_REQS.md`
+working doc.
+
+
 ## Common pitfalls users hit
 
 Notes for future-self (or future-user) reading scratch files:
