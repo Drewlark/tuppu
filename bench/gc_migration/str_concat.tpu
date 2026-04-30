@@ -1,0 +1,16 @@
+// Heap-pressure microbench. 100K str concats; each iter allocates a
+// fresh GC buffer and registers / unregisters its slot. The migration
+// targets per-call gcroot fixed-cost — pre/post lets us isolate that
+// from the (unchanged) allocator path.
+
+fn main() -> i32 {
+  mut s: str = ""
+  mut i: i64 = 0
+  while i < 100000 {
+    s = s + "x"
+    i = i + 1
+  }
+  // Print so dead-code elim can't fold the accumulator.
+  println(s.len)
+  0
+}

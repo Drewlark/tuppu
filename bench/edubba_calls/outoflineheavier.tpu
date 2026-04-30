@@ -1,0 +1,64 @@
+// Edubba out-of-line target: a heavier method whose body inlining
+// is marginal — a hash-style routine on a Map<i64> equivalent. We
+// want to see mem2reg promote self/args and SROA split the value
+// type out of the param slot once gcroot doesn't block it. 100K
+// iterations.
+//
+// Uses a hand-rolled kv tablet so the bench source doesn't depend
+// on stdlib map; the call overhead pattern is the same.
+
+tablet KV { k: str, v: i64 }
+tablet Bag { items: tablets[64]KV }
+
+edubba Bag {
+  fn set(mut self, key: str, value: i64) {
+    mut i: i64 = 0
+    mut found: bool = false
+    while i < self.items.len {
+      if self.items[i].k == key {
+        // Reassignment rebuilds the entry — exercises the str-clone
+        // / cleanup-frame path heavily.
+        self.items[i].v = value
+        found = true
+        i = self.items.len
+      } else {
+        i = i + 1
+      }
+    }
+    if !found {
+      self.items.push(KV { k: copy key, v: value })
+    }
+  }
+
+  fn get(self, key: str) -> i64 {
+    mut i: i64 = 0
+    mut hit: i64 = -1
+    while i < self.items.len {
+      if self.items[i].k == key {
+        hit = self.items[i].v
+        i = self.items.len
+      } else {
+        i = i + 1
+      }
+    }
+    hit
+  }
+}
+
+fn main() -> i32 {
+  mut items: tablets[64]KV
+  mut b: Bag = Bag { items: items }
+  // Seed with a few keys so set() exercises the "key exists" path
+  // sometimes.
+  b.set("alpha", 0)
+  b.set("beta", 0)
+  b.set("gamma", 0)
+
+  mut i: i64 = 0
+  while i < 100000 {
+    b.set("alpha", i)
+    i = i + 1
+  }
+  println(b.get("alpha"))
+  0
+}

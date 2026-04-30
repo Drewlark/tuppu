@@ -124,11 +124,65 @@ def _module_path_for_label(label: str) -> tuple[str, ...]:
 
 def compile_sources_to_ir(sources: list[tuple[str, str]]) -> str:
     """Generate LLVM IR text from a list of (label, source_text) pairs.
-    Any non-fatal warnings from the type checker are written to stderr."""
+    Any non-fatal warnings from the type checker are written to stderr.
+
+    In `TUPPU_GC_FRAMEWORK=llvm` mode also injects the
+    `gc "shadow-stack"` attribute into every Tuppu-emitted fn that
+    queued at least one `@llvm.gcroot` — see `_inject_gc_strategy`."""
     prog = _parse_labeled(sources)
     checker = check(prog)
     _emit_warnings(checker.warnings)
-    return str(codegen(prog, checker))
+    cg = _gen_module(prog, checker)
+    text = str(cg.module)
+    if cg._gc_mode == "llvm" and cg._fns_needing_gc_attr:
+        text = _inject_gc_strategy(text, cg._fns_needing_gc_attr)
+    return text
+
+
+def _gen_module(prog: A.Program, checker):
+    """Run codegen and return the Codegen instance (not just its IR
+    module) so the driver can read post-codegen state — currently the
+    set of fns that need `gc "shadow-stack"` injected into IR text.
+    Mirrors `codegen()` but exposes the holder."""
+    from .codegen import Codegen
+    cg = Codegen(checker=checker)
+    cg.gen(prog)
+    return cg
+
+
+# Pre-compiled regex catches `define <type> @"<name>"(...)` lines, with
+# or without the leading `internal`/`linkonce_odr`/etc. linkage marker.
+# llvmlite always emits in the `define <linkage?> <ret> @"<name>"(<args>)`
+# form so the trailing `\s*$|\s*\{` lets us match before either the
+# block opening brace or end-of-line (some llvmlite versions wrap).
+import re as _re
+
+_DEFINE_LINE_RE = _re.compile(
+    r'^(define\b[^@]*@"(?P<name>[^"]+)"\([^)]*\))(?P<rest>.*)$',
+    _re.MULTILINE,
+)
+
+
+def _inject_gc_strategy(ir_text: str, fns: set[str]) -> str:
+    """Inject `gc "shadow-stack"` into the `define ...` line for every
+    fn in `fns`. llvmlite (as of 0.47) doesn't expose `Function.gc` on
+    its IR builder, so we post-process the textual IR before handoff to
+    the LLVM lowering machinery. The attribute lives between the
+    closing `)` of the param list and the opening `{` of the body — or
+    at end-of-line if the body opens on the next line.
+
+    Idempotent: if the attribute is already present (e.g. driver was
+    re-run on the same text) we don't double-inject. Externs (`declare
+    ...`) don't match the regex so they're left alone — the attribute
+    only applies to defined fns."""
+    def repl(m: _re.Match[str]) -> str:
+        prefix, name, rest = m.group(1), m.group("name"), m.group("rest")
+        if name not in fns:
+            return m.group(0)
+        if 'gc "shadow-stack"' in rest:
+            return m.group(0)
+        return f'{prefix} gc "shadow-stack"{rest}'
+    return _DEFINE_LINE_RE.sub(repl, ir_text)
 
 
 def check_sources(sources: list[tuple[str, str]]) -> None:

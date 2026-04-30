@@ -1,0 +1,27 @@
+// Edubba inline target: a tiny leaf method on a struct with no
+// cleanup-bearing fields. Under -O2 + the LLVM gc framework, the
+// optimizer should fully inline `bump` into the loop, leaving the
+// counter increment with no call overhead.
+//
+// 1M iters chosen so wall-clock lands in the millisecond range —
+// enough resolution to see the inline win without making every
+// test cycle painful.
+
+tablet Counter { n: i64 }
+
+edubba Counter {
+  fn bump(mut self) {
+    self.n = self.n + 1
+  }
+}
+
+fn main() -> i32 {
+  mut c = Counter { n: 0 }
+  mut i: i64 = 0
+  while i < 1000000 {
+    c.bump()
+    i = i + 1
+  }
+  println(c.n)
+  0
+}

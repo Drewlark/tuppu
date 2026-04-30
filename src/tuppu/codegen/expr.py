@@ -155,9 +155,11 @@ class ExprMixin:
             self.builder.branch(merge_bb)
         # Reset the Python counter so the else arm starts at the same
         # baseline as the then arm did. Otherwise else_val's chokepoint
-        # would stack on top of then's accumulated push count.
-        if self._gc_root_counts:
-            self._gc_root_counts[-1] = counter_before
+        # would stack on top of then's accumulated push count. Also
+        # truncates the parallel `_gc_root_slots_per_frame` entry in
+        # `llvm` GC mode so the else arm's slot-clear math sees a clean
+        # slate.
+        self._truncate_innermost_gc_state_to(counter_before)
 
         self.builder.position_at_end(else_bb)
         else_val = self._gen_expr(e.else_)
@@ -171,8 +173,7 @@ class ExprMixin:
             if else_delta > 0:
                 self._emit_gc_pop_roots(else_delta)
             self.builder.branch(merge_bb)
-        if self._gc_root_counts:
-            self._gc_root_counts[-1] = counter_before
+        self._truncate_innermost_gc_state_to(counter_before)
 
         self.builder.position_at_end(merge_bb)
 

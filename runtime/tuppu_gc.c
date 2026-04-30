@@ -6,11 +6,24 @@
  * floor that validates the architecture; grows only if profiles
  * demand it.
  *
- * Root discovery: shadow stack. Codegen emits
- *   __tuppu_gc_push_root(&my_local, &my_type_desc)
- * at every fn entry for each cleanup-bearing local, and
- *   __tuppu_gc_pop_roots(n)
- * on every fn exit path. The GC scans this stack at mark time.
+ * Root discovery: dual-mode during the GC-framework migration
+ * (issue #8). Mark-time root walking covers both:
+ *
+ *   1. The legacy `shadow` array — populated by inline
+ *      `__tuppu_gc_push_root` / `__tuppu_gc_pop_roots` calls codegen
+ *      emits in `TUPPU_GC_FRAMEWORK=shadow` mode. Opaque to LLVM's
+ *      optimizer; safe at -O0 only.
+ *
+ *   2. The LLVM-managed `llvm_gc_root_chain` linked list — populated
+ *      by per-fn StackEntry push/pop the LLVM strategy emitter
+ *      generates around `@llvm.gcroot` intrinsics in
+ *      `TUPPU_GC_FRAMEWORK=llvm` mode. opt understands this scheme
+ *      so optimizations preserve roots; -O2 starts being safe here.
+ *
+ * Both paths populate the same single set of live roots from the
+ * runtime's perspective; mark walks both lists every collection.
+ * After the migration soaks, the shadow array (and its push/pop
+ * fns) gets deleted in a one-line cleanup PR.
  *
  * Allocation: `__tuppu_gc_alloc(size, type)` for typed objects whose
  * layout has a descriptor, `__tuppu_gc_alloc_bytes(n)` for raw
@@ -107,6 +120,36 @@ typedef struct {
 
 static tuppu_root_t shadow[SHADOW_MAX];
 static size_t       shadow_top = 0;
+
+/* --- LLVM gc-framework root chain ----------------------------------
+ *
+ * Layout pinned to LLVM's shadow-stack strategy emitter
+ * (`llvm/lib/CodeGen/ShadowStackGCLowering.cpp`). The per-fn StackEntry
+ * is emitted as a stack-local struct; on fn entry the strategy code
+ * links it into `llvm_gc_root_chain` and on exit it unlinks. Each
+ * Roots[i] slot is the value the user code stored — for our shadow_slot
+ * scheme that's the i8*-cast address of the real (struct-shaped)
+ * binding slot.
+ *
+ * This layout has been stable in LLVM since 3.x; the runtime version
+ * pin in pyproject.toml ties us to LLVM 18-20, both of which use this
+ * shape. If a future LLVM upgrade reshapes it, the assertion below
+ * ABI-trips at startup.
+ */
+struct tuppu_frame_map {
+    int32_t     num_roots;   /* total entries in Roots[] */
+    int32_t     num_meta;    /* first num_meta entries have metadata */
+    const void* meta[];      /* length: num_meta (FAM) */
+};
+
+struct tuppu_stack_entry {
+    struct tuppu_stack_entry*    next;
+    const struct tuppu_frame_map* map;
+    void*                         roots[];  /* length: map->num_roots */
+};
+
+/* The LLVM strategy emitter expects this exact symbol name and type. */
+struct tuppu_stack_entry* llvm_gc_root_chain = NULL;
 
 void __tuppu_gc_push_root(void* slot, const tuppu_type_t* type) {
     if (shadow_top >= SHADOW_MAX) {
@@ -216,6 +259,7 @@ static void mark_ptr(void* p) {
 }
 
 static void mark_all(void) {
+    /* Path 1: legacy shadow array (codegen `shadow` mode). */
     for (size_t i = 0; i < shadow_top; i++) {
         tuppu_root_t r = shadow[i];
         if (gc_debug) {
@@ -236,6 +280,43 @@ static void mark_all(void) {
         } else {
             mark_ptr(*(void**)r.slot);
         }
+    }
+    /* Path 2: LLVM-managed `llvm_gc_root_chain` (codegen `llvm` mode).
+     * Each entry holds N roots whose stored value is the i8*-cast of
+     * the real binding slot — see codegen `_queue_gcroot`. The first
+     * map->num_meta entries carry our type-descriptor metadata; we
+     * always pass metadata, so num_meta == num_roots in practice. */
+    size_t llvm_n = 0;
+    for (struct tuppu_stack_entry* e = llvm_gc_root_chain; e; e = e->next) {
+        if (!e->map) continue;
+        int32_t n_roots = e->map->num_roots;
+        int32_t n_meta = e->map->num_meta;
+        for (int32_t i = 0; i < n_roots; i++) {
+            void* slot_value = e->roots[i];
+            if (!slot_value) continue;  /* sentinel-cleared / never-stored */
+            const tuppu_type_t* type =
+                (i < n_meta) ? (const tuppu_type_t*)e->map->meta[i] : NULL;
+            if (gc_debug) {
+                fprintf(stderr,
+                        "gc: chain entry=%p root[%d] slot=%p type=%s\n",
+                        (void*)e, i, slot_value,
+                        type ? type->name : "(bytes)");
+            }
+            if (type) {
+                /* slot_value is the address of the real struct; the
+                 * descriptor's trace fn (or flat ptr_offsets) walks
+                 * its interior. */
+                trace_struct((char*)slot_value, type);
+            } else {
+                mark_ptr(slot_value);
+            }
+            llvm_n++;
+        }
+    }
+    if (gc_debug) {
+        fprintf(stderr,
+                "gc: mark walked shadow=%zu llvm_chain=%zu\n",
+                shadow_top, llvm_n);
     }
 }
 
@@ -286,11 +367,25 @@ static void gc_fini(void) {
      * silent leak today, deterministic memory bug later. Abort so
      * it's caught in testing. Suppress in production builds if
      * ever needed, but during the migration this check is the
-     * cheapest correctness oracle we have. */
+     * cheapest correctness oracle we have.
+     *
+     * Mirror check on `llvm_gc_root_chain`: every fn that opens a
+     * StackEntry must close it before returning. A non-NULL chain
+     * at process exit means a fn returned without unlinking — the
+     * strategy emitter handles this automatically when the fn
+     * returns normally, but a pthread_exit / longjmp / asm-trap
+     * shortcut could bypass it. Same treatment: abort.
+     */
     if (shadow_top != 0) {
         fprintf(stderr,
                 "tuppu: GC shadow-stack leak at exit: %zu roots still pushed\n",
                 shadow_top);
+        abort();
+    }
+    if (llvm_gc_root_chain != NULL) {
+        fprintf(stderr,
+                "tuppu: GC llvm_gc_root_chain leak at exit: chain head=%p\n",
+                (void*)llvm_gc_root_chain);
         abort();
     }
 }
@@ -301,6 +396,36 @@ static void gc_init(void) {
     gc_debug = (dbg && dbg[0] == '1');
     const char* str = getenv("TUPPU_GC_STRESS");
     gc_stress = (str && str[0] == '1');
+    /* ABI sanity for the LLVM strategy layout. The strategy emitter
+     * lays out per-fn StackEntry instances with this exact shape; if
+     * a future LLVM reshapes it, this assertion trips before anything
+     * silently miscompiles. Both fields are FAMs so we only assert
+     * the prefix layout (next + map pointers); the trailing roots[]
+     * is sized per-fn and not addressable here. */
+    if (offsetof(struct tuppu_stack_entry, next) != 0) {
+        fprintf(stderr,
+                "tuppu: GC strategy ABI mismatch: StackEntry::next at %zu, expected 0\n",
+                offsetof(struct tuppu_stack_entry, next));
+        abort();
+    }
+    if (offsetof(struct tuppu_stack_entry, map) != sizeof(void*)) {
+        fprintf(stderr,
+                "tuppu: GC strategy ABI mismatch: StackEntry::map at %zu, expected %zu\n",
+                offsetof(struct tuppu_stack_entry, map), sizeof(void*));
+        abort();
+    }
+    if (offsetof(struct tuppu_frame_map, num_roots) != 0) {
+        fprintf(stderr,
+                "tuppu: GC strategy ABI mismatch: FrameMap::num_roots at %zu, expected 0\n",
+                offsetof(struct tuppu_frame_map, num_roots));
+        abort();
+    }
+    if (offsetof(struct tuppu_frame_map, num_meta) != sizeof(int32_t)) {
+        fprintf(stderr,
+                "tuppu: GC strategy ABI mismatch: FrameMap::num_meta at %zu, expected %zu\n",
+                offsetof(struct tuppu_frame_map, num_meta), sizeof(int32_t));
+        abort();
+    }
 }
 
 static void* raw_alloc(size_t obj_size, const tuppu_type_t* type) {

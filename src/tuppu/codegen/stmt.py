@@ -271,7 +271,7 @@ class StmtMixin:
         )
         if cond_delta > 0:
             self._emit_gc_pop_roots(cond_delta)
-            self._gc_root_counts[-1] = cond_before
+            self._truncate_innermost_gc_state_to(cond_before)
         self.builder.cbranch(cond, body, exit_)
 
         self.builder.position_at_end(body)
@@ -346,27 +346,69 @@ class StmtMixin:
         one descriptor regardless of element type — `mark_wedge` does
         the chunk lookup itself — and the LLVM type at the slot is
         plain `*T` so the standard `_get_type_desc` path returns None.
-        Counts toward the same frame pop tally."""
+        Counts toward the same frame pop tally.
+
+        Mode dispatch matches `_register_gc_root`:
+
+        - `shadow`: emit an inline `__tuppu_gc_push_root(slot, &wedge_desc)`.
+        - `llvm`: queue the gcroot for entry-block emission and emit
+          a NULL-clear at the current builder position so the slot is
+          mark_wedge-safe before any body store fires."""
         if not self._cleanup_frames:
             return
         b = self.builder
         assert b is not None
         desc = self._get_wedge_descriptor()
-        b.call(
-            self._get_gc_push_root(),
-            [
-                b.bitcast(slot, I8.as_pointer()),
-                b.bitcast(desc, I8.as_pointer()),
-            ],
-        )
+        if self._gc_mode == "shadow":
+            b.call(
+                self._get_gc_push_root(),
+                [
+                    b.bitcast(slot, I8.as_pointer()),
+                    b.bitcast(desc, I8.as_pointer()),
+                ],
+            )
+        else:
+            # `llvm` mode: queue gcroot. The wedge slot is already
+            # i8*-shaped (it's a `wedge T` ptr), so there's no struct
+            # contents to memset — kind="wedge" makes
+            # `_emit_slot_clear` write NULL.
+            self._queue_gcroot(slot, desc, "wedge", I8.as_pointer())
         while len(self._gc_root_counts) < len(self._cleanup_frames):
             self._gc_root_counts.append(0)
         self._gc_root_counts[-1] += 1
 
+    def _truncate_innermost_gc_state_to(self, target_count: int) -> None:
+        """Reset the innermost frame's GC-root bookkeeping to a prior
+        snapshot. Used by partial-pop sites (if-then-else arm boundary,
+        while-cond) where N roots were emitted, popped at runtime, and
+        the compile-time counter needs to revert so subsequent code
+        starts from the right baseline.
+
+        In `shadow` mode that's just `_gc_root_counts[-1] = target`.
+        In `llvm` mode we ALSO truncate `_gc_root_slots_per_frame[-1]`
+        so the next `_emit_gc_pop_roots` slice picks the right slots.
+        Skipping the slot-list truncation isn't a correctness bug
+        (sentinel-clears are idempotent and the dropped entries' slots
+        are already cleared), but it grows the per-frame list
+        unnecessarily and bills future pop-slice math for slots that
+        no longer count."""
+        if self._gc_root_counts:
+            self._gc_root_counts[-1] = target_count
+        if (
+            self._gc_mode == "llvm"
+            and self._gc_root_slots_per_frame
+            and len(self._gc_root_slots_per_frame[-1]) > target_count
+        ):
+            del self._gc_root_slots_per_frame[-1][target_count:]
+
     def _push_cleanup_frame(self) -> None:
-        """Push a fresh cleanup frame + GC-root counter in lockstep."""
+        """Push a fresh cleanup frame + GC-root counter in lockstep.
+        The parallel `_gc_root_slots_per_frame` entry collects the
+        per-slot identities the `llvm` GC-mode pop site uses to emit
+        sentinel-clears; in `shadow` mode it stays empty."""
         self._cleanup_frames.append([])
         self._gc_root_counts.append(0)
+        self._gc_root_slots_per_frame.append([])
 
     def _emit_gc_frame_pop(self) -> None:
         """Emit `__tuppu_gc_pop_roots(n)` for the innermost cleanup
@@ -374,7 +416,12 @@ class StmtMixin:
         Python-side counter. Callers emit this just before closing
         the basic block (branch / ret) so the pop lands in the live
         control-flow path. The subsequent `_pop_cleanup_frame` still
-        tears down the Python-side bookkeeping."""
+        tears down the Python-side bookkeeping.
+
+        In `llvm` GC mode this still fires; `_emit_gc_pop_roots`
+        translates `n` to per-slot sentinel-clears using the parallel
+        slot list, so the slot is marked empty for the rest of the fn
+        even though its gcroot intrinsic stays live."""
         if (
             self._gc_root_counts
             and self._gc_root_counts[-1] > 0
@@ -387,9 +434,9 @@ class StmtMixin:
         """Tear down the innermost cleanup frame's Python-side state.
         If the current block is still open and no matching
         `_emit_gc_frame_pop` call has landed, also emit the
-        balancing `pop_roots(n)` IR. Already-terminated blocks skip
-        the emit; the caller was responsible for placing the pop
-        inline before the terminator."""
+        balancing `pop_roots(n)` (or sentinel-clears in `llvm` mode)
+        IR. Already-terminated blocks skip the emit; the caller was
+        responsible for placing the pop inline before the terminator."""
         if self._gc_root_counts:
             n = self._gc_root_counts.pop()
             if (
@@ -399,6 +446,8 @@ class StmtMixin:
             ):
                 self._emit_gc_pop_roots(n)
         self._cleanup_frames.pop()
+        if self._gc_root_slots_per_frame:
+            self._gc_root_slots_per_frame.pop()
 
     def _emit_all_gc_root_pops_for_early_return(self) -> None:
         """At an early-return site, unwind every currently-active
@@ -406,10 +455,27 @@ class StmtMixin:
         Python-side bookkeeping is still needed to satisfy the
         normal per-frame pops that fire when the (now-dead) body
         code path is still walked by codegen. LLVM optimizes the
-        dead post-ret IR away."""
-        total = sum(self._gc_root_counts)
-        if total > 0 and self.builder is not None:
-            self._emit_gc_pop_roots(total)
+        dead post-ret IR away.
+
+        `shadow` mode: emits a single `pop_roots(total)` for the
+        cumulative count across all live frames.
+        `llvm` mode: walks every frame's slot list and emits a
+        sentinel-clear per slot. The LLVM gcroot intrinsics stay
+        live (per-fn lifetime) — clearing the contents is what
+        marks them empty for the runtime walker."""
+        if self.builder is None:
+            return
+        if self._gc_mode == "shadow":
+            total = sum(self._gc_root_counts)
+            if total > 0:
+                self._emit_gc_pop_roots(total)
+            return
+        # `llvm` mode: walk every frame's slots and emit a sentinel
+        # clear for each. Order doesn't matter — each store is
+        # independent.
+        for frame_slots in self._gc_root_slots_per_frame:
+            for slot, kind, value_ty in frame_slots:
+                self._emit_slot_clear(slot, kind, value_ty)
 
     def _deep_clone_if_cleanup_bearing(
         self, val: ir.Value, *, for_transfer: bool = False,

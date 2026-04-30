@@ -7,11 +7,48 @@ tablets.py) can import these without pulling in the full Codegen
 class — avoids circular-import pain."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from llvmlite import ir
 
 from ..errors import CompileError
+
+
+# GC framework selection — see issue #8 for the migration plan.
+#
+# `shadow` (default during the migration window): codegen emits
+# explicit `__tuppu_gc_push_root` / `__tuppu_gc_pop_roots` calls, the
+# runtime walks a Python-allocator-style flat array of roots. This is
+# what the codebase shipped pre-migration; `opt -O1`+ silently elides
+# the externs and de-roots live values, so we hold at `-O0`.
+#
+# `llvm`: codegen emits `@llvm.gcroot` intrinsics in the entry block
+# of each Tuppu fn, attaches `gc "shadow-stack"` so LLVM's strategy
+# emitter inserts the per-fn linked-list push/pop around them, and
+# the runtime walks `llvm_gc_root_chain`. `opt` understands this
+# scheme so optimizations preserve roots correctly.
+#
+# Both runtime paths (the array AND the linked list) coexist in the
+# bundled GC runtime so a single `runtime/tuppu_gc.c` build serves
+# either codegen mode. The flag flips by default at the merge commit;
+# `shadow` mode gets deleted in a one-line cleanup PR after a soak.
+_GC_FRAMEWORK_VALID = ("shadow", "llvm")
+
+
+def get_gc_framework() -> str:
+    """Read TUPPU_GC_FRAMEWORK from the environment, returning the
+    default (`llvm`) when unset. Called at every Codegen instantiation
+    so a single Python process can compile under multiple frameworks
+    by toggling the env var between calls — the test suite uses this
+    to verify both modes against the same source corpus."""
+    val = os.environ.get("TUPPU_GC_FRAMEWORK", "llvm")
+    if val not in _GC_FRAMEWORK_VALID:
+        raise CompileError(
+            f"TUPPU_GC_FRAMEWORK={val!r} is not valid; "
+            f"choose one of {_GC_FRAMEWORK_VALID}",
+        )
+    return val
 
 
 class CodegenError(CompileError):
